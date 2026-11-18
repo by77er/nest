@@ -162,6 +162,26 @@ describe("the manager's routine tools (README.md#routines)", () => {
   });
 });
 
+describe("the manager's reviewer tools (README.md#reviewers)", () => {
+  const board = (cat.capabilities[`${NAMESPACE}/board`] as { mcp: { tools: string[]; read_only: string[]; idempotent: string[] } }).mcp;
+  const TOOLS = ["list_reviewers", "create_reviewer", "update_reviewer", "delete_reviewer"];
+  it("the board's capability names them, list_reviewers read-only, a change and a delete idempotent, a create neither", () => {
+    expect(board.tools).toEqual(expect.arrayContaining(TOOLS));
+    expect(board.read_only.filter((t) => TOOLS.includes(t))).toEqual(["list_reviewers"]);
+    expect(board.idempotent).toEqual(expect.arrayContaining(["list_reviewers", "update_reviewer", "delete_reviewer"]));
+    expect(board.idempotent).not.toContain("create_reviewer");
+  });
+
+  it("the manager's prompt says in one sentence they're its own, but not the owner's once its session is tainted, and to tell the owner", () => {
+    const line = PROMPTS.manager.split("\n").find((l) => l.includes("list_reviewers"))!;
+    for (const tool of TOOLS) expect(line).toContain(tool);
+    expect(line).toMatch(/yours to list, add, change and remove/);
+    expect(line).toMatch(/once your session is tainted you can't change or remove ones the owner/);
+    expect(line).toMatch(/tell the owner what you made or changed\.$/);
+    expect(line.slice(0, -1)).not.toContain(". ");
+  });
+});
+
 describe("the reviewer: one template for every reviewer", () => {
   it("its prompt names no dimension: it reviews as the reviewer its brief names, each dimension apart, and submits once", () => {
     const p = PROMPTS.reviewer.toLowerCase();

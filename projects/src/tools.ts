@@ -4,7 +4,8 @@
 
 import { z } from "zod";
 import { MAX_NOTES, NOTE_MAX } from "./memory";
-import { ROUTINE_PRESETS, UpdateRoutine } from "./requests";
+import { REVIEWER_PRESETS, ROUTINE_PRESETS, UpdateReviewer, UpdateRoutine } from "./requests";
+import { MAX_REVIEWERS } from "./reviewers";
 import { MAX_ROUTINES } from "./routines";
 import { TASK_STATES } from "./tasks";
 
@@ -98,6 +99,38 @@ const ROUTINES: ToolDef[] = [
   { name: "delete_routine", description: "Delete a routine and its runs' history (the tasks it proposed stay). Refused while a run of it is going.", inputSchema: obj({ routine: fromBody(routineId) }, ["routine"]), idempotent: true },
 ];
 
+const reviewerId = z.string().regex(/^[a-z0-9_-]+$/).max(64).describe("The reviewer's id (rvw_…, or code-review for the built-in).");
+
+/**
+ * The manager's reviewer tools (README.md#reviewers): the owner's API, by its schemas and ReviewDO's own
+ * methods, as the routine tools are. One rule more, ReviewDO's (`mayChangeReviewer`): a tainted session
+ * changes or deletes only a tainted reviewer.
+ */
+const REVIEWERS: ToolDef[] = [
+  {
+    name: "list_reviewers",
+    description: "The project's reviewers, in the order each PR head's review runs them: each with its name, instructions, dimensions, whether it's enabled, who last wrote it (source) and whether its text is tainted. The review check passes only if every enabled reviewer passes; with none enabled, it is neutral (passing).",
+    inputSchema: obj({}), readOnly: true, idempotent: true,
+  },
+  {
+    name: "create_reviewer",
+    description: `Add a reviewer, last in the order: a preset alone ({preset: "code"}, the built-in Code review, once per project), or every other field. At most ${MAX_REVIEWERS} per project. It reviews heads whose review starts from now on. Tell the owner what you made.`,
+    inputSchema: fromBody(UpdateReviewer.extend({ preset: z.enum(REVIEWER_PRESETS).optional().describe("A built-in reviewer, with nothing else: code.") })),
+  },
+  {
+    name: "update_reviewer",
+    description: "Change a reviewer: any of its fields; the others stay. enabled: false turns it off, true on again. Reviews already started keep what they started with. Once your session is tainted, you may change only a tainted reviewer (the ones the owner or an untainted session wrote are refused). Tell the owner what you changed.",
+    inputSchema: fromBody(UpdateReviewer.extend({ reviewer: reviewerId })),
+    idempotent: true,
+  },
+  {
+    name: "delete_reviewer",
+    description: "Delete a reviewer, the last one too (with none enabled, the check is neutral). A review running it finishes with it. Once your session is tainted, you may delete only a tainted reviewer. Tell the owner what you deleted.",
+    inputSchema: obj({ reviewer: fromBody(reviewerId) }, ["reviewer"]),
+    idempotent: true,
+  },
+];
+
 export const TOOLS: Record<Server, readonly ToolDef[]> = {
   board: [
     { name: "list_tasks", description: "The project's board: every task in board order with its state, assignee and PR, and the project's settings.", inputSchema: obj({}), readOnly: true, idempotent: true },
@@ -167,6 +200,7 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     { name: "cancel_wait", description: "Drop a pending wait (aw_…): no message comes for it.", inputSchema: obj({ wait: str("The wait's id.", 64) }, ["wait"]), idempotent: true },
     { name: "list_waits", description: "Your pending waits, each with its deadline.", inputSchema: obj({}), readOnly: true, idempotent: true },
     ...ROUTINES,
+    ...REVIEWERS,
     ...MEMORY_READ,
     ...MEMORY_WRITE,
   ],

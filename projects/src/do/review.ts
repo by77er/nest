@@ -29,7 +29,7 @@ import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { toolOf } from "../tools";
 import {
-  CODE_REVIEW, freeze, type FrozenReviewer, frozenOf, legacySubmit, MAX_REVIEWERS, parseVerdict, type ProjectReviewer, type Review,
+  CODE_REVIEW, freeze, type FrozenReviewer, frozenOf, legacySubmit, MAX_REVIEWERS, mayChangeReviewer, parseVerdict, type ProjectReviewer, type Review,
   type Reviewer, type ReviewerFields, type ReviewerSource, reviewOf, reviewPassed, storedVerdict, type Submitted, type Verdict,
 } from "../reviewers";
 import { randomId } from "./directory";
@@ -360,7 +360,8 @@ export class ReviewDO extends DurableObject<Env> {
 
   /**
    * A new reviewer, last in the order: the writer's fields, or a preset's (under its own id, so once). At most
-   * MAX_REVIEWERS. Jobs already started keep the reviewers they froze.
+   * MAX_REVIEWERS. Jobs already started keep the reviewers they froze. A tainted writer's text is tainted; a
+   * preset's is the app's, whoever adds it.
    */
   async createReviewer(f: ReviewerFields, o: { preset?: Reviewer; by?: Writer } = {}): Promise<Result<ProjectReviewer>> {
     const by = o.by ?? OWNER;
@@ -372,18 +373,21 @@ export class ReviewDO extends DurableObject<Env> {
     const now = Date.now();
     this.sql.exec(
       "INSERT INTO reviewers (id, name, instructions, dimensions, enabled, source, tainted, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      id, f.name, f.instructions, JSON.stringify(f.dimensions), f.enabled ? 1 : 0, by.source, by.tainted ? 1 : 0, now, now,
+      id, f.name, f.instructions, JSON.stringify(f.dimensions), f.enabled ? 1 : 0, by.source, by.tainted && !o.preset ? 1 : 0, now, now,
     );
     return ok(this.reviewerRow(id)!);
   }
 
   /**
    * Change a reviewer: only jobs that start later (and re-runs) see it. Disabling the last enabled one is allowed.
-   * The writer is recorded (`source`); its taint as the comment below says.
+   * The writer is recorded (`source`); its taint as the comment below says. The manager's tainted session
+   * changes only a tainted reviewer (`mayChangeReviewer`); the owner's API is never refused by that.
    */
   async updateReviewer(id: string, u: Partial<ReviewerFields>, by: Writer = OWNER): Promise<Result<ProjectReviewer>> {
     const before = this.reviewerRow(id);
     if (!before) return fail(404, "unknown reviewer");
+    const may = by.source === "manager" ? mayChangeReviewer(before, by) : null;
+    if (may && !may.ok) return fail(403, may.error);
     const f: ReviewerFields = {
       name: u.name ?? before.name, instructions: u.instructions ?? before.instructions, dimensions: u.dimensions ?? before.dimensions, enabled: u.enabled ?? before.enabled,
     };
@@ -401,8 +405,12 @@ export class ReviewDO extends DurableObject<Env> {
     return ok(this.reviewerRow(id)!);
   }
 
-  /** Delete a reviewer, the last one included: a job running it keeps its frozen copy. */
-  async deleteReviewer(id: string): Promise<Result<{ deleted: string }>> {
+  /** Delete a reviewer, the last one included: a job running it keeps its frozen copy. The manager's as in `updateReviewer`. */
+  async deleteReviewer(id: string, by: Writer = OWNER): Promise<Result<{ deleted: string }>> {
+    const before = this.reviewerRow(id);
+    if (!before) return fail(404, "unknown reviewer");
+    const may = by.source === "manager" ? mayChangeReviewer(before, by) : null;
+    if (may && !may.ok) return fail(403, may.error);
     if (!this.sql.exec("DELETE FROM reviewers WHERE id = ?", id).rowsWritten) return fail(404, "unknown reviewer");
     return ok({ deleted: id });
   }
@@ -1322,8 +1330,8 @@ function fieldsProblem(f: ReviewerFields): string | null {
   return r.success ? null : problems(r.error);
 }
 
-/** Who writes a reviewer: the owner (the API) for now, untainted. */
-interface Writer {
+/** Who writes a reviewer: the owner (the API), untainted, or the manager (its tools) with its session's taint. */
+export interface Writer {
   source: ReviewerSource;
   tainted: boolean;
 }

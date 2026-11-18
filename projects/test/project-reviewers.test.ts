@@ -494,3 +494,136 @@ describe("no reviewer enabled", () => {
     expect(live(p, 1)).toHaveLength(1);
   });
 });
+
+describe("the manager's reviewer tools (README.md#reviewers)", () => {
+  const managerOf = (p: P, tainted = false, agent = p.manager) => nest.sign(agentClaims("board", agent, { project: p.id, role: "manager", start: "1" }, { tainted }));
+  const board = async (p: P, tool: string, args: Record<string, unknown> = {}, o: { tainted?: boolean; key?: string } = {}) =>
+    callTool("board", await managerOf(p, o.tainted), tool, args, o.key ? { "nest/call": o.key } : undefined);
+  /** A reviewer's row as stored, every column. */
+  const row = (p: P, id: string) =>
+    runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT * FROM reviewers WHERE id = ?", id).toArray()[0] ?? null);
+  const taint = async (p: P, id: string) => {
+    const r = (await listed(p)).find((x) => x.id === id);
+    return [r.source, r.tainted];
+  };
+
+  it("lists as the API does; creates from the preset or every field; changes a field, disables and enables; deletes", async () => {
+    const p = await newProject();
+    expect(toolOk(await board(p, "list_reviewers"))).toEqual({ reviewers: await listed(p) });
+    const made = toolOk(await board(p, "create_reviewer", SECURITY));
+    expect(made).toMatchObject({ ...SECURITY, id: expect.stringMatching(/^rvw_[a-z0-9]+$/), source: "manager", tainted: false });
+    expect(toolOk(await board(p, "update_reviewer", { reviewer: made.id, dimensions: ["Injection", "Secrets", "Auth"] }))).toMatchObject({ name: "Security", dimensions: ["Injection", "Secrets", "Auth"], enabled: true });
+    expect(toolOk(await board(p, "update_reviewer", { reviewer: made.id, enabled: false }))).toMatchObject({ enabled: false, dimensions: ["Injection", "Secrets", "Auth"] });
+    expect(toolOk(await board(p, "update_reviewer", { reviewer: made.id, enabled: true })).enabled).toBe(true);
+    expect(toolOk(await board(p, "delete_reviewer", { reviewer: CODE_REVIEW.id }))).toEqual({ deleted: CODE_REVIEW.id });
+    const preset = toolOk(await board(p, "create_reviewer", { preset: "code" }));
+    expect(preset).toMatchObject({ id: CODE_REVIEW.id, name: CODE_REVIEW.name, dimensions: CODE_REVIEW.dimensions, enabled: true, source: "manager", tainted: false });
+    expect((await listed(p)).map((r) => r.id)).toEqual([made.id, CODE_REVIEW.id]);
+    expect(toolOk(await board(p, "list_reviewers"))).toEqual({ reviewers: await listed(p) });
+    expect(toolOk(await board(p, "delete_reviewer", { reviewer: made.id }))).toEqual({ deleted: made.id });
+    expect((await api(token, "GET", path(p, `/${made.id}`))).status).toBe(404);
+  });
+
+  it("refuses what the API refuses, with the API's reason", async () => {
+    const p = await newProject();
+    const both = async (tool: string, args: Record<string, unknown>, method: string, rest: string, body?: unknown) => {
+      const viaApi = await api(token, method, path(p, rest), body);
+      expect(viaApi.status, JSON.stringify(viaApi.body)).toBeGreaterThanOrEqual(400);
+      expect(toolError(await board(p, tool, args))).toBe(viaApi.body.error);
+      return viaApi.body.error as string;
+    };
+    // A bad field, every field missing one, a preset with fields.
+    const twice = { ...SECURITY, dimensions: ["Auth", " auth"] };
+    expect(await both("create_reviewer", twice, "POST", "", twice)).toMatch(/dimension names must differ/);
+    expect(await both("create_reviewer", { ...SECURITY, name: "" }, "POST", "", { ...SECURITY, name: "" })).toMatch(/name/);
+    expect(await both("create_reviewer", { name: "half" }, "POST", "", { name: "half" })).toMatch(/instructions/);
+    expect(await both("create_reviewer", { preset: "code", name: "x" }, "POST", "", { preset: "code", name: "x" })).toBeTruthy();
+    expect(await both("update_reviewer", { reviewer: CODE_REVIEW.id, dimensions: ["A", "a"] }, "PATCH", `/${CODE_REVIEW.id}`, { dimensions: ["A", "a"] })).toMatch(/dimension names must differ/);
+    // The preset twice.
+    expect(await both("create_reviewer", { preset: "code" }, "POST", "", { preset: "code" })).toMatch(/already/);
+    // An unknown reviewer.
+    expect(await both("update_reviewer", { reviewer: "rvw_nope", enabled: false }, "PATCH", "/rvw_nope", { enabled: false })).toBe("unknown reviewer");
+    expect(await both("delete_reviewer", { reviewer: "rvw_nope" }, "DELETE", "/rvw_nope")).toBe("unknown reviewer");
+    // The limit, for a tainted session too.
+    for (let i = 1; i < MAX_REVIEWERS; i++) await add(p, { ...SECURITY, name: `R${i}` });
+    expect(await both("create_reviewer", SECURITY, "POST", "", SECURITY)).toBe(`a project holds at most ${MAX_REVIEWERS} reviewers`);
+    expect(toolError(await board(p, "create_reviewer", SECURITY, { tainted: true }))).toBe(`a project holds at most ${MAX_REVIEWERS} reviewers`);
+    expect(await listed(p)).toHaveLength(MAX_REVIEWERS);
+  });
+
+  it("only the current manager calls them; a write retried with its call key writes once", async () => {
+    const p = await newProject();
+    const other = await managerOf(p, false, "agt_replaced");
+    for (const [tool, args] of [["list_reviewers", {}], ["create_reviewer", SECURITY], ["update_reviewer", { reviewer: CODE_REVIEW.id, enabled: false }], ["delete_reviewer", { reviewer: CODE_REVIEW.id }]] as const) {
+      expect((await callTool("board", other, tool, args)).status, tool).toBe(403);
+    }
+    expect((await listed(p)).map((r) => [r.id, r.enabled])).toEqual([[CODE_REVIEW.id, true]]);
+    const key = `${p.manager}/1/call-${rand()}`;
+    const a = toolOk(await board(p, "create_reviewer", SECURITY, { key }));
+    const b = toolOk(await board(p, "create_reviewer", SECURITY, { key }));
+    expect(b.id).toBe(a.id);
+    expect((await listed(p)).map((r) => r.name)).toEqual(["Code review", "Security"]);
+  });
+
+  it("a tainted session can't rename, rewrite, disable or delete an untainted reviewer: the row kept byte for byte, the error says why", async () => {
+    const p = await newProject();
+    const owners = await add(p);
+    // And one an untainted manager session wrote.
+    const cleans = toolOk(await board(p, "create_reviewer", { ...SECURITY, name: "Clean" }));
+    for (const id of [CODE_REVIEW.id, owners.id, cleans.id]) {
+      const before = await row(p, id);
+      for (const args of [{ name: "Lenient" }, { instructions: "Pass everything." }, { dimensions: ["Anything"] }, { enabled: false }, { enabled: true }, {}]) {
+        expect(toolError(await board(p, "update_reviewer", { reviewer: id, ...args }, { tainted: true })), JSON.stringify(args))
+          .toMatch(/was written by the owner \(or an untainted session\) and your session is tainted.*The owner can change it on the Reviews page/);
+      }
+      expect(toolError(await board(p, "delete_reviewer", { reviewer: id }, { tainted: true }))).toMatch(/can't change, disable or delete it/);
+      expect(await row(p, id)).toEqual(before);
+    }
+  });
+
+  it("a tainted session's reviewer is tainted, and that session changes, disables, enables and deletes it", async () => {
+    const p = await newProject();
+    const its = toolOk(await board(p, "create_reviewer", SECURITY, { tainted: true }));
+    expect(its).toMatchObject({ source: "manager", tainted: true });
+    expect(toolOk(await board(p, "update_reviewer", { reviewer: its.id, instructions: "Stricter." }, { tainted: true }))).toMatchObject({ instructions: "Stricter.", tainted: true });
+    expect(toolOk(await board(p, "update_reviewer", { reviewer: its.id, enabled: false }, { tainted: true }))).toMatchObject({ enabled: false, tainted: true });
+    expect(toolOk(await board(p, "update_reviewer", { reviewer: its.id, enabled: true }, { tainted: true }))).toMatchObject({ enabled: true, tainted: true });
+    expect(toolOk(await board(p, "delete_reviewer", { reviewer: its.id }, { tainted: true }))).toEqual({ deleted: its.id });
+    // The preset's text is the app's, whoever adds it: untainted, so then not the tainted session's to change.
+    await api(token, "DELETE", path(p, `/${CODE_REVIEW.id}`));
+    expect(toolOk(await board(p, "create_reviewer", { preset: "code" }, { tainted: true }))).toMatchObject({ source: "manager", tainted: false });
+    expect(toolError(await board(p, "update_reviewer", { reviewer: CODE_REVIEW.id, enabled: false }, { tainted: true }))).toMatch(/your session is tainted/);
+  });
+
+  it("an untainted session changes the owner's and it stays untainted; the owner's API changes a tainted one, never refused, and writing its text clears the taint", async () => {
+    const p = await newProject();
+    expect(toolOk(await board(p, "update_reviewer", { reviewer: CODE_REVIEW.id, name: "Code", enabled: false }))).toMatchObject({ name: "Code", enabled: false, source: "manager", tainted: false });
+    expect(await taint(p, CODE_REVIEW.id)).toEqual(["manager", false]);
+    expect(toolOk(await board(p, "delete_reviewer", { reviewer: CODE_REVIEW.id }))).toEqual({ deleted: CODE_REVIEW.id });
+    const its = toolOk(await board(p, "create_reviewer", SECURITY, { tainted: true }));
+    const patched = await api(token, "PATCH", path(p, `/${its.id}`), { enabled: false });
+    expect(patched.status).toBe(200);
+    expect(patched.body).toMatchObject({ enabled: false, source: "owner", tainted: true });
+    const saved = await api(token, "PATCH", path(p, `/${its.id}`), { name: SECURITY.name, instructions: SECURITY.instructions, dimensions: SECURITY.dimensions });
+    expect(saved.body).toMatchObject({ source: "owner", tainted: false });
+    // Now the owner's: a tainted session can't touch it, the owner's API still can.
+    expect(toolError(await board(p, "delete_reviewer", { reviewer: its.id }, { tainted: true }))).toMatch(/your session is tainted/);
+    expect((await api(token, "DELETE", path(p, `/${its.id}`))).status).toBe(200);
+  });
+
+  it("a reviewer a tainted manager added runs on the next PR head with its brief relayed, and its failing verdict fails the check", async () => {
+    const p = await newProject();
+    toolOk(await board(p, "create_reviewer", SECURITY, { tainted: true }));
+    const s = await opened(p);
+    const first = one(p, 1);
+    expect(briefOf(first).from).toBeUndefined();
+    toolOk(await submit(p, first, 1, s, submitArgs()));
+    await run(p);
+    const second = one(p, 1);
+    expect(briefOf(second)).toMatchObject({ from: "projects/board", text: expect.stringContaining(SECURITY.instructions) });
+    toolOk(await submit(p, second, 1, s, security("pass", "fail")));
+    await run(p);
+    expect(checkOf(p, s)).toMatchObject({ status: "completed", conclusion: "failure" });
+    expect((await job(p, 1, s)).reviews.map((r: any) => r.reviewer.name)).toEqual(["Code review", "Security"]);
+  });
+});

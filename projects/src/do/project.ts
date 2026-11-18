@@ -13,7 +13,7 @@ import { DEFAULT_MODEL, modelLabel, type ModelRole, modelProblem } from "../mode
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, GitHubError, githubFor, ownInstallation, PERMISSIONS, requireReviewCheck } from "../github";
-import { reviewPassed, type Verdict, verdictPassed } from "../reviewers";
+import { reviewPassed, toCreate, type Verdict, verdictPassed } from "../reviewers";
 import type { AgentCaller } from "../identity";
 import { type AgentView, backoff, clientIdOf, HOSTS_WAIT, NestError, nestFrom, type Nest, type SandboxExtras, type SpawnOverrides, stopRefused } from "../nest";
 import { envName, MAX_BINDINGS, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
@@ -27,7 +27,7 @@ import type { NestEvent } from "../webhook";
 import { asBinding, type ClientLayer, clientLayerFor, type GithubFeed, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
 import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type Wait, type WaitKind, waitKey, waitMessage, type WaitOutcome } from "../waits";
 import { MAX_NOTES, mayWriteMemory, NOTE_KEY, NOTE_MAX, type Note, preview } from "../memory";
-import { CreateRoutine, problems, type RoutineKind, type RoutinePreset, UpdateRoutine } from "../requests";
+import { CreateRoutine, problems, type RoutineKind, type RoutinePreset, UpdateReviewer, UpdateRoutine } from "../requests";
 import { type Created, firedTrigger, MAX_PROPOSALS_PER_RUN, MAX_ROUTINES, MAX_START_ATTEMPTS, MAX_UNTRIAGED_PROPOSALS, nextTimerFire, PRESETS, type RoutineFields, routineSpawnExtras, runBrief, type RunOutcome, type RunState, startVerdict, type TriggerKind, type Triggers } from "../routines";
 import { EARLY_EXITS_KEEP_MS, ENDED_RUNS_KEEP_MS, ERRORS_KEEP_MS, PR_TOLD_KEEP_MS, PRUNE_EVERY_MS, RUN_TURNS_KEEP_MS, TRIAGED_PROPOSALS_KEEP_MS } from "../retention";
 import { type PrNow, readPrs } from "../pr-read";
@@ -4470,6 +4470,23 @@ export class ProjectDO extends DurableObject<Env> {
         }
         case "delete_routine":
           return this.deleteRoutine(a.routine as string);
+        // The reviewers (README.md#reviewers), ReviewDO's, by the API's own bodies and methods, written as the
+        // manager with its session's taint: a tainted session changes or deletes only a tainted one there.
+        case "list_reviewers":
+          return ok({ reviewers: await review(this.env, this.settings()!.id).reviewers() });
+        case "create_reviewer": {
+          const c = toCreate(a);
+          if (!c.ok) return fail(400, c.error);
+          return review(this.env, this.settings()!.id).createReviewer(c.fields, { preset: c.preset, by: { source: "manager", tainted: caller.tainted } });
+        }
+        case "update_reviewer": {
+          const { reviewer, ...fields } = a;
+          const b = UpdateReviewer.safeParse(fields);
+          if (!b.success) return fail(400, problems(b.error));
+          return review(this.env, this.settings()!.id).updateReviewer(reviewer as string, b.data, { source: "manager", tainted: caller.tainted });
+        }
+        case "delete_reviewer":
+          return review(this.env, this.settings()!.id).deleteReviewer(a.reviewer as string, { source: "manager", tainted: caller.tainted });
       }
     }
     if (server === "task") {

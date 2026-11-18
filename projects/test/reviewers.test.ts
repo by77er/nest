@@ -2,7 +2,7 @@
 // either release's form. The release before's form is written out here as it stored and read it.
 import { describe, expect, it } from "vitest";
 import { reviewConclusion } from "../src/do/project";
-import { CODE_REVIEW, legacySubmit, parseVerdict, type Review, reviewOf, storedVerdict, type Verdict, verdictPassed } from "../src/reviewers";
+import { CODE_REVIEW, legacySubmit, mayChangeReviewer, parseVerdict, type Review, reviewOf, storedVerdict, type Verdict, verdictPassed } from "../src/reviewers";
 
 const by = { agent: "agt_r", tainted: false };
 const sub = (dimension: string, verdict: "pass" | "fail" = "pass") => ({ dimension, verdict, notes: `${dimension} notes` });
@@ -108,5 +108,22 @@ describe("a review job's end in a word (await_pr)", () => {
     // No reviewer was enabled: done, with no verdict, and not failed.
     expect(reviewConclusion({ state: "done", verdict: null })).toBe("no reviewer enabled");
     expect(verdictPassed({ reviews: [] })).toBe(false);
+  });
+});
+
+describe("who may change a reviewer through the manager's tools (`mayChangeReviewer`)", () => {
+  it("a tainted session only a tainted reviewer; an untainted session any; refused with why and where the owner changes it", () => {
+    const table: [reviewer: boolean, session: boolean, may: boolean][] = [
+      [false, false, true],
+      [true, false, true],
+      [true, true, true],
+      [false, true, false],
+    ];
+    for (const [reviewer, session, may] of table) {
+      const r = mayChangeReviewer({ name: "Code review", tainted: reviewer }, { tainted: session });
+      expect(r.ok, `reviewer tainted ${reviewer}, session tainted ${session}`).toBe(may);
+    }
+    const no = mayChangeReviewer({ name: "Code review", tainted: false }, { tainted: true });
+    expect(no.ok ? "" : no.error).toMatch(/^"Code review" was written by the owner \(or an untainted session\) and your session is tainted.*can't change, disable or delete it.*on the Reviews page\.$/);
   });
 });

@@ -5,7 +5,7 @@ import { env } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { resetAccessKeys } from "../src/access";
-import { CreateRoutine, UpdateRoutine } from "../src/requests";
+import { CreateRoutine, NewReviewer, ReviewerFromPreset, UpdateReviewer, UpdateRoutine } from "../src/requests";
 import { toolOf } from "../src/tools";
 import { AccessTeam, agentClaims, api, callTool, eventually, FakeNest, installFetch, mcp, Signer } from "./fake-nest";
 
@@ -213,6 +213,25 @@ describe("the routine tools' inputs (README.md#routines)", () => {
     const p = await newProject();
     const listed = ((await (await mcp("board", await managerToken(p), "tools/list")).json()) as any).result.tools as { name: string; inputSchema: unknown }[];
     for (const name of ["list_routines", "create_routine", "update_routine", "delete_routine"]) {
+      expect(listed.find((t) => t.name === name)?.inputSchema, name).toEqual(toolOf("board", name)!.inputSchema);
+    }
+  });
+});
+
+describe("the reviewer tools' inputs (README.md#reviewers)", () => {
+  const props = (schema: Record<string, unknown>) => schema.properties as Record<string, unknown>;
+  it("are the API's bodies: create_reviewer's fields are POST …/reviewers's, update_reviewer's are PATCH's, as the server lists them", async () => {
+    const { preset, ...create } = props(toolOf("board", "create_reviewer")!.inputSchema);
+    expect(create).toEqual(props(z.toJSONSchema(NewReviewer.partial())));
+    expect(preset).toEqual(expect.objectContaining({ enum: ReviewerFromPreset.shape.preset.options }));
+    const { reviewer, ...update } = props(toolOf("board", "update_reviewer")!.inputSchema);
+    expect(update).toEqual(props(z.toJSONSchema(UpdateReviewer)));
+    expect(reviewer).toEqual(expect.objectContaining({ type: "string", pattern: "^[a-z0-9_-]+$" }));
+    expect(toolOf("board", "update_reviewer")!.inputSchema.required).toEqual(["reviewer"]);
+    expect(toolOf("board", "delete_reviewer")!.inputSchema.required).toEqual(["reviewer"]);
+    const p = await newProject();
+    const listed = ((await (await mcp("board", await managerToken(p), "tools/list")).json()) as any).result.tools as { name: string; inputSchema: unknown }[];
+    for (const name of ["list_reviewers", "create_reviewer", "update_reviewer", "delete_reviewer"]) {
       expect(listed.find((t) => t.name === name)?.inputSchema, name).toEqual(toolOf("board", name)!.inputSchema);
     }
   });
