@@ -50,6 +50,16 @@ A host's kind (nestd's config `role`: `burst` or `controller` this release, `san
 
 **Instance metadata service (IMDS):** require IMDSv2 with hop limit 1. nest-proxy blocks link-local and private ranges for sandboxes, so a guest can never reach IMDS or the instance role's credentials. A kernel rule on nest-proxy's uid rejects non-public destinations too, so a proxy bug can't reach them either ([kernel backstop](../../sandbox/networking/egress/steering/#kernel-backstop)).
 
+## Host logs
+
+- **Sandbox hosts ship their journal to the cell's bucket.** Nothing else reaches a host's logs: there is no SSH, SSM or serial console access, and the EC2 console keeps only its last 64 KB. `nest-logship` (written by `install.sh`, enabled by the sandbox role's bootstrap) uploads what the journal gained each minute as `logs/<instance id>/<date>/<time>.log.gz`: the services' lines, each guest's serial console (Firecracker's output, in nestd's) and the kernel's, an OOM kill included. FleetDO's fleet view maps a host to its instance id.
+- **Kept 14 days, never for good.** The bucket's lifecycle expires `logs/` after 14 days; the bucket is versioned, so the expiry leaves a delete marker, the bucket-wide rule deletes the noncurrent version a day later, and a third rule removes the marker. The stack's `logs-expire` policy fails without an enabled expiry of that prefix within 30 days, or without the bucket-wide noncurrent rule.
+- **Cost:** S3 Standard storage for a few MB a day per host and one PUT a minute per host (about $0.007 a day); no ingestion fee.
+- **Delivery:** the journal cursor moves only once an upload landed, so a failed upload goes again with the next batch (rewritten whole each minute until it lands, bounded by the journal's size); a stop sends what is left (the unit is ordered before nest's services, so it stops after them); a cursor file journalctl can't read starts over from the current boot, which repeats lines and loses none.
+- **What is lost:** up to a minute before a host dies without an OS shutdown (a reclaim that skips it, a panic, a hang); a host whose bootstrap fails before its last line, which enables the service; hosts launched before this was deployed, until they are replaced.
+- **Not built: brain hosts.** A brain host's role reads `releases/*` and nothing else, so it ships nothing.
+- **Trust:** a sandbox host's role already reads, writes and deletes the whole bucket, so a compromised host can read, forge or delete any host's logs. They are evidence for operating the cell, not an audit trail.
+
 ## Upgrades
 
 Hosts are replaced, never updated in place. The two host kinds roll separately, brain hosts before sandbox hosts, and the [gateway protocol](../../interfaces/gateway/) lets a brain host and a sandbox host be one release apart in either direction. **Not built:** desired versions, canaries, probes and gentle drains. Today every host installs `releases/current` at boot, so a release reaches each kind as its hosts are next launched, and the ordering constraints of a release are its rollout rule in [deploy](../../../dev/deploy.md).

@@ -120,6 +120,13 @@ def brainEgress : List (String × Nat) := [("tcp", 443)]
 
 def bucketName (spec : CellSpec) : String := s!"nest-{spec.name}-{spec.accountId}"
 
+/-- Where sandbox hosts put their journals in the cell's bucket (`nest-logship`, deploy/host/install.sh,
+which gets it as `@LOG_PREFIX@`). -/
+def logPrefix : String := "logs/"
+
+/-- How long host logs are kept: long enough to look into last week's failure, never for good. -/
+def logRetentionDays : Nat := 14
+
 /-- The only size sandbox hosts launch in. -/
 def sandboxSize : String := ".large"
 
@@ -278,7 +285,7 @@ def installTemplate : String := include_str "../../host/install.sh"
 
 /-- The host install script with this cell's values: baked into the host AMI and rerun at boot. -/
 def install (spec : CellSpec) : String :=
-  (installTemplate.replace "@BUCKET@" (bucketName spec)).replace "@REGION@" spec.region
+  ((installTemplate.replace "@BUCKET@" (bucketName spec)).replace "@REGION@" spec.region).replace "@LOG_PREFIX@" logPrefix
 
 /-- A host's kind, written into its nestd config by its launch template's user data: the role
 comes from which template FleetDO launched (and FleetDO's launch record binds the enrollment to
@@ -433,7 +440,9 @@ def cell (spec : CellSpec) : Infra Unit := do
   let _ ← VpcSecurityGroupEgressRule.create "brain_https"
     { securityGroupId := brainSg.id, ipProtocol := "tcp", fromPort := 443, toPort := 443, cidrIpv4 := "0.0.0.0/0" }
 
-  -- The cell's bucket: versioned Standard; noncurrent versions expire after a day.
+  -- The cell's bucket: versioned Standard; noncurrent versions expire after a day. Host logs
+  -- (`logs/`, deploy/host/install.sh) expire after `logRetentionDays`; the bucket being versioned,
+  -- that leaves a delete marker, which goes once its noncurrent version has (a day later).
   let bucket ← S3Bucket.createWith "cell" { bucket := lit (bucketName spec) }
     (resourceOptions |>.preventDestroy true)
   let _ ← S3BucketVersioning.create "cell" { bucket := bucket.id, versioningConfiguration := { status := "Enabled" } }
@@ -447,7 +456,11 @@ def cell (spec : CellSpec) : Infra Unit := do
     { bucket := bucket.id
       rule := [{ id := "expire-noncurrent", status := "Enabled", filter := [{}]
                  noncurrentVersionExpiration := [{ noncurrentDays := 1 }]
-                 abortIncompleteMultipartUpload := [{ daysAfterInitiation := 1 }] }] }
+                 abortIncompleteMultipartUpload := [{ daysAfterInitiation := 1 }] },
+               { id := "expire-logs", status := "Enabled", filter := [{ prefix_ := some (lit logPrefix) }]
+                 expiration := [{ days := some (lit (Lean.JsonNumber.fromNat logRetentionDays)) }] },
+               { id := "expire-log-delete-markers", status := "Enabled", filter := [{ prefix_ := some (lit logPrefix) }]
+                 expiration := [{ expiredObjectDeleteMarker := some (lit true) }] }] }
 
   -- Sandbox hosts: the cell's bucket only, and only through the endpoint (the bucket policy).
   let hostRole ← IamRole.create "host"
