@@ -150,7 +150,7 @@ const NEAR = 24;
 const OLDER_AT = 80;
 const PAGE = 50;
 /** The longest a finished turn's stream is held waiting for its message. */
-const HOLD_MAX_MS = 30_000;
+export const HOLD_MAX_MS = 30_000;
 
 function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (text: string) => void; onRetry?: () => void }) {
   return (

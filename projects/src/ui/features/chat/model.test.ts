@@ -170,6 +170,8 @@ describe("timeline", () => {
     // the last one's place, and what comes after the reply (a note, a message from elsewhere) never splits it again.
     const landed = { ...turn([call("a", T0 + 1_000), said("b", T0 + 3_000)], false), landed: 3 };
     expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "manager", T0 + 4_000), msg(4, "app", T0 + 6_000), msg(5, "owner", T0 + 7_000)], landed, NOW))).toEqual(["owner 1", "stream a", "owner 2", "manager 3", "app 4", "owner 5"]);
+    // A note filed between the turn's end and its reply (reported late) doesn't bring the last part back either.
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "app", T0 + 4_000), msg(4, "manager", T0 + 5_000)], { ...landed, landed: 4 }, NOW))).toEqual(["owner 1", "stream a", "owner 2", "app 3", "manager 4"]);
   });
 });
 

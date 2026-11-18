@@ -7,7 +7,7 @@ import { exact } from "../../common/time";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 import { theme } from "../../theme";
-import { InFlightMark, SPINNER_AFTER_MS } from "./ChatView";
+import { HOLD_MAX_MS, InFlightMark, SPINNER_AFTER_MS } from "./ChatView";
 
 const chat = () => screen.findByRole("tabpanel", { name: "Chat" });
 
@@ -770,15 +770,52 @@ describe("the chat", () => {
     // Reading back: the reader opens the row.
     await user.click(within(c).getByRole("button", { name: "Read a.ts, done" }));
     await trace.push(ev("assistant_text", { ...t("trn_a", 3_000), text: "Tidied." }), ev("turn_completed", t("trn_a", 3_500)));
-    api.chat.push({ seq: 3, at_ms: AT + 3_000, sender: "manager", text: "Tidied.", delivered: true, status: "done" as const, error: null });
-    await queryClient.refetchQueries();
-    await within(c).findByRole("button", { name: "Used 1 tool" });
-    expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(1);
+    // Landed while reading back, it's kept past the hold's 30 s (which is only for a reply that never comes).
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      api.chat.push({ seq: 3, at_ms: AT + 3_000, sender: "manager", text: "Tidied.", delivered: true, status: "done" as const, error: null });
+      await queryClient.refetchQueries();
+      await within(c).findByRole("button", { name: "Used 1 tool" });
+      expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(1);
+      act(() => void vi.advanceTimersByTime(HOLD_MAX_MS + 1_000));
+      expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
     // The next turn starts (and ends with nothing to show): the kept part doesn't come back.
     await trace.push(ev("turn_started", t("trn_b", 10_000)));
     await waitFor(() => expect(within(c).queryByRole("button", { name: "Read a.ts, done" })).toBeNull());
     await trace.push(ev("turn_completed", { ...t("trn_b", 11_000), stop_reason: "end_turn" }));
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
     expect(within(c).queryByRole("button", { name: "Read a.ts, done" })).toBeNull();
+  });
+
+  it("a held turn waits at most 30 s for its reply, the reader scrolling away or not", async () => {
+    const AT = Date.UTC(2026, 10, 2, 9, 0, 0);
+    const trace = drivenTraceSocket();
+    vi.stubGlobal("WebSocket", trace.Socket);
+    const api = new FakeApi();
+    api.chat = [{ seq: 1, at_ms: AT - 120_000, sender: "owner", text: "Tidy the board.", delivered: true, status: "done" as const, error: null }];
+    renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await within(c).findByText("Tidy the board.");
+    const t = (ms: number) => ({ turn: "trn_h", ts_ms: AT + ms });
+    await trace.push({ type: "live" }, ev("turn_started", t(-60_000)), ev("tool_call", { ...t(-40_000), call_id: "h1", name: "Read", input: { file_path: "a.ts" } }), ev("tool_result", { ...t(-39_000), call_id: "h1", is_error: false, summary: "ok" }));
+    await within(c).findByRole("button", { name: "Read a.ts, done" });
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // Ended; its reply never comes.
+      await trace.push(ev("assistant_text", { ...t(1_000), text: "Never told." }), ev("turn_completed", t(1_500)));
+      expect(c.querySelector("[data-sender=stream]")).not.toBeNull();
+      act(() => void vi.advanceTimersByTime(20_000));
+      // The reader opens a row (no longer following): the 30 s don't start again.
+      fireEvent.click(within(c).getByRole("button", { name: "Read a.ts, done" }));
+      act(() => void vi.advanceTimersByTime(HOLD_MAX_MS - 20_000 - 1_000));
+      expect(c.querySelector("[data-sender=stream]")).not.toBeNull();
+      act(() => void vi.advanceTimersByTime(2_000));
+      expect(c.querySelector("[data-sender=stream]")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -246,7 +246,7 @@ export function stepsBySeq(messages: ChatMessage[], turns: FinishedTurn[]): Map<
  * last, after the stream. Only the last part is live: it carries the working line (`running` and no call
  * running); a part with nothing to show is left out. A turn whose reply has landed (`landed`: its seq; the
  * turn kept while the reader reads back) shows only its earlier parts: the last one's place is its reply's,
- * and nothing after the reply splits it again.
+ * whatever comes before or after the reply.
  */
 export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: boolean; landed?: number }) | null, now = Date.now()): LogItem[] {
   if (!turn) return groupLog(messages, now);
@@ -264,9 +264,8 @@ export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: b
   for (const m of kept) {
     // Never back before a message already placed: the messages keep their order.
     const after = steps.findIndex((s) => s.ts_ms > m.at_ms);
-    const late = turn.landed !== undefined && (m.seq < 0 || m.seq > turn.landed);
-    const at = m.sender === "manager" || late ? cut : m.seq < 0 ? steps.length : after < 0 ? steps.length : after;
-    if (at > cut) {
+    const at = m.sender === "manager" ? cut : m.seq < 0 ? steps.length : after < 0 ? steps.length : after;
+    if (at > cut && !(turn.landed !== undefined && at === steps.length)) {
       part(cut, at, false);
       cut = at;
     }
