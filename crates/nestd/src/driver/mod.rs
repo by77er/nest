@@ -66,10 +66,18 @@ pub trait Pauser: Send + Sync {
     async fn pause(&self) -> io::Result<()>;
 }
 
+/// [`Vm::exited`]'s future.
+pub type ExitFuture = std::pin::Pin<Box<dyn Future<Output = supervise::Exit> + Send>>;
+
 #[async_trait]
 pub trait Vm: Send + Sync {
     /// Lock-free pause handle (available once started).
     fn pauser(&self) -> Option<Arc<dyn Pauser>> {
+        None
+    }
+    /// A future that ends when the VM's process has exited, with how (available once started).
+    /// It ends for a stop too: the caller tells its own stops apart.
+    fn exited(&self) -> Option<ExitFuture> {
         None
     }
     /// Host-side hybrid-vsock unix socket (`CONNECT <port>` handshake).

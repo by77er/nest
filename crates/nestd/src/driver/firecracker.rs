@@ -77,6 +77,7 @@ impl Driver for FirecrackerDriver {
             gateway_gid: self.gateway_gid,
             spec,
             child: None,
+            exit: None,
             jail,
         }))
     }
@@ -140,6 +141,9 @@ pub struct FirecrackerVm {
     gateway_gid: Option<u32>,
     spec: VmSpec,
     child: Option<std::process::Child>,
+    /// The child's exit watch. The jailer execs Firecracker in place (no `--daemonize`, no new pid
+    /// namespace), so the child is the VMM whether jailed or not.
+    exit: Option<super::supervise::ExitWatch>,
     jail: Option<Jail>,
 }
 
@@ -269,6 +273,9 @@ impl Vm for FirecrackerVm {
     fn pauser(&self) -> Option<Arc<dyn Pauser>> {
         Some(Arc::new(ApiPauser(self.api_sock())))
     }
+    fn exited(&self) -> Option<super::ExitFuture> {
+        self.exit.as_ref().and_then(|e| e.exited().ok())
+    }
     fn vsock_uds_path(&self) -> PathBuf {
         self.host_path(&self.fc_paths().vsock)
     }
@@ -301,8 +308,10 @@ impl Vm for FirecrackerVm {
         let netns = if self.jail.is_none() { self.spec.netns.clone() } else { None };
         let child = super::supervise::spawn(cmd, netns)?;
         let pid = child.id();
+        let exit = super::supervise::ExitWatch::of(&child);
         // Held first: on any error below, stop or drop reaps it.
         self.child = Some(child);
+        self.exit = Some(exit?);
         super::supervise::write_pidfile(&self.spec.vm_dir, pid)?;
         // Wait for the API socket (the jailer first copies Firecracker into the chroot).
         for _ in 0..500 {

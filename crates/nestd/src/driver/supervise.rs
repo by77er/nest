@@ -107,6 +107,78 @@ fn start_time(pid: u32) -> Option<u64> {
     stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// How a VM process ended, read without reaping it (`waitid` with `WNOWAIT`): the driver's own
+/// `wait` still collects it at stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Exit {
+    /// It exited with this status (a guest that halted or rebooted: Firecracker exits 0).
+    Status(i32),
+    /// A signal killed it (9 from the kernel's OOM killer, among others).
+    Signal(i32),
+    /// It is gone, and how was not readable.
+    Unknown,
+}
+
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Exit::Status(s) => write!(f, "exited with status {s}"),
+            Exit::Signal(s) => write!(f, "killed by signal {s}"),
+            Exit::Unknown => write!(f, "exited"),
+        }
+    }
+}
+
+/// A handle on a VM process that tells when it has exited. A pidfd, opened while the driver holds
+/// the unreaped child, so it is that process and never a reused pid.
+pub struct ExitWatch(std::os::fd::OwnedFd);
+
+impl ExitWatch {
+    pub fn of(child: &Child) -> io::Result<ExitWatch> {
+        // SAFETY: a plain syscall on our own child's pid; a non-negative result is a new fd.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, libc::PIDFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by pidfd_open and is owned by nothing else.
+        Ok(ExitWatch(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd as i32) }))
+    }
+
+    /// A future that ends when the process has exited (a stopped process has not), with how. It
+    /// owns a duplicate of the pidfd, so it outlives this handle and the driver's VM.
+    pub fn exited(&self) -> io::Result<std::pin::Pin<Box<dyn Future<Output = Exit> + Send>>> {
+        // SAFETY: the AsyncFd takes ownership of an `OwnedFd` (a duplicate of the pidfd): the
+        // descriptor stays open and refers to the same process until the AsyncFd drops it
+        // (RUSTSEC-2026-0386).
+        let fd = unsafe { tokio::io::unix::AsyncFd::register_with_interest(self.0.try_clone()?, tokio::io::Interest::READABLE) }.map_err(io::Error::from)?;
+        Ok(Box::pin(async move {
+            // A pidfd turns readable when its process terminates, and stays so. An error says
+            // nothing about the process (the runtime is going down): never an exit.
+            match fd.readable().await {
+                Ok(_) => exit_of(fd.get_ref()),
+                Err(_) => std::future::pending().await,
+            }
+        }))
+    }
+}
+
+fn exit_of(fd: &std::os::fd::OwnedFd) -> Exit {
+    // SAFETY: zeroed is a valid siginfo_t for waitid to fill.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: a pidfd we own; WNOWAIT leaves the child for its owner to reap.
+    let r = unsafe { libc::waitid(libc::P_PIDFD, fd.as_raw_fd() as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+    if r != 0 {
+        return Exit::Unknown;
+    }
+    // SAFETY: waitid filled a SIGCHLD siginfo, whose status field this reads.
+    let status = unsafe { info.si_status() };
+    match info.si_code {
+        libc::CLD_EXITED => Exit::Status(status),
+        libc::CLD_KILLED | libc::CLD_DUMPED => Exit::Signal(status),
+        _ => Exit::Unknown,
+    }
+}
+
 /// Record a VM process in `<vm_dir>/pid`.
 pub fn write_pidfile(vm_dir: &Path, pid: u32) -> io::Result<()> {
     let start = start_time(pid).ok_or_else(|| io::Error::other(format!("no /proc entry for pid {pid}")))?;
@@ -160,7 +232,35 @@ fn alive(pid: u32, start: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    /// The exit watch ends when the child exits, with how, and leaves it for its owner to reap.
+    #[tokio::test]
+    async fn an_exit_watch_ends_with_how_the_child_ended_and_does_not_reap_it() {
+        for (script, want) in [("exit 7", super::Exit::Status(7)), ("kill -9 $$", super::Exit::Signal(9))] {
+            let mut child = Command::new("/bin/sh").args(["-c", script]).spawn().unwrap();
+            let watch = super::ExitWatch::of(&child).unwrap();
+            let exit = tokio::time::timeout(std::time::Duration::from_secs(10), watch.exited().unwrap()).await.expect("the child exited");
+            assert_eq!(exit, want, "{script}");
+            assert_eq!(exit.to_string(), if script == "exit 7" { "exited with status 7" } else { "killed by signal 9" });
+            let status = child.wait().expect("still the owner's to reap");
+            assert_eq!((status.code(), std::os::unix::process::ExitStatusExt::signal(&status)), if script == "exit 7" { (Some(7), None) } else { (None, Some(9)) });
+        }
+    }
+
+    /// A stopped process (a paused VM of the process driver) has not exited: the watch waits on.
+    #[tokio::test]
+    async fn an_exit_watch_does_not_end_for_a_stopped_child() {
+        let mut child = Command::new("/bin/sleep").arg("600").spawn().unwrap();
+        let watch = super::ExitWatch::of(&child).unwrap();
+        let mut exited = watch.exited().unwrap();
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), nix::sys::signal::Signal::SIGSTOP).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), &mut exited).await.is_err(), "a stopped child counted as exited");
+        child.kill().unwrap();
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(10), exited).await.expect("the child was killed"), super::Exit::Signal(9));
+        child.wait().unwrap();
+    }
     use std::time::{Duration, Instant};
 
     /// A child spawned from a thread that then exits keeps running: the death signal follows the

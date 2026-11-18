@@ -297,9 +297,48 @@ pub fn admit_create(tombstoned: bool, local: Option<(u64, State)>, epoch: u64) -
     }
 }
 
+/// What nestd does when a VM's process is found to have exited without nestd stopping it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VmExit {
+    /// Fence the incarnation: its VM never runs again, so the control plane places the sandbox
+    /// again from its head and this incarnation's disk is salvaged.
+    Fence,
+    /// A create's boot is under way and decides: it fails (`failed`), or it reports `running` and
+    /// the exit is looked at again.
+    Wait,
+    /// Nothing left to do: the incarnation is already final.
+    Ignore,
+}
+
+/// The step for a VM process that exited by itself (a guest that panicked or rebooted, a VMM the
+/// kernel killed), given the incarnation's reported state. The shell asks only when it didn't
+/// stop the VM itself, so every state that still has a VM to lose ends in a fence: a dead VM that
+/// stays `running` would refuse every bind for good.
+pub fn vm_exited(state: State) -> VmExit {
+    match state {
+        State::Creating | State::Restoring => VmExit::Wait,
+        State::Running | State::Suspending | State::Suspended | State::Archiving => VmExit::Fence,
+        State::Archived | State::Fenced | State::Destroyed | State::Failed => VmExit::Ignore,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VM that died by itself is fenced in every state that still had one, left to the boot
+    /// while one runs, and ignored once the incarnation is final.
+    #[test]
+    fn a_vm_that_exited_is_fenced_unless_booting_or_final() {
+        for state in STATES {
+            let want = match state {
+                State::Creating | State::Restoring => VmExit::Wait,
+                State::Archived | State::Fenced | State::Destroyed | State::Failed => VmExit::Ignore,
+                State::Running | State::Suspending | State::Suspended | State::Archiving => VmExit::Fence,
+            };
+            assert_eq!(vm_exited(state), want, "{state:?}");
+        }
+    }
 
     fn after(start: Incarnation, inputs: &[Input]) -> Incarnation {
         let mut i = start;
