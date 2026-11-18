@@ -126,7 +126,7 @@ export function leaseLost(l: Lease, host: string, epoch: number): "replace" | "i
   return l.host === null && l.lost_from === host ? "replace" : "ignore";
 }
 
-/** Evict: off a host going away, suspended (head in the object store); placed now only if someone works. */
+/** Evict: off a host going away, or one whose room a placement needs; suspended (head in the object store); placed now only if someone works. */
 export function evicted(l: Lease, host: string, epoch: number): "replace" | "park" | "ignore" {
   if (!holds(l, host, epoch)) return "ignore";
   l.host = null;

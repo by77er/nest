@@ -474,6 +474,23 @@ export class SandboxDO extends DurableObject<Env> {
 
   // --- lifecycle ----------------------------------------------------------------------------------
 
+  /**
+   * Refuse a sandbox of `memory_mib` that no host of `cell` could hold (FleetDO's `largestSandbox`).
+   * Best effort: a FleetDO that can't be asked (the previous release, or unreachable now) has no
+   * say here, and its `place` refuses such a sandbox anyway.
+   */
+  private async requireFitsAHost(cell: string, memory_mib: number): Promise<void> {
+    let largest: number | null;
+    try {
+      largest = await this.fleet(cell).largestSandbox();
+    } catch {
+      return;
+    }
+    if (largest !== null && memory_mib > largest) {
+      throw new NestError(ErrorCodes.INVALID_MESSAGE, `resources.memory_mib ${memory_mib} is more than a host of cell ${cell} holds in one sandbox (${largest} MiB)`);
+    }
+  }
+
   /** Create (idempotent) and place the sandbox; the first placement grants epoch 1. */
   async create(req: CreateSandbox): Promise<SandboxInfo> {
     // Its operator layer, refused before anything is written.
@@ -482,6 +499,9 @@ export class SandboxDO extends DurableObject<Env> {
     const over = req.guards?.length ? layerOverLimit(req.guards) : null;
     if (over) throw new NestError(ErrorCodes.INVALID_MESSAGE, over);
     if (req.guards?.length && !this.get<SandboxInfo>("info")) await this.requireGuardBounds(req.cell);
+    // More memory than any host its cell launches could hold in one sandbox: refused before anything
+    // is written (it could never be placed, and a host launched for it would refuse it too).
+    if (!this.get<SandboxInfo>("info")) await this.requireFitsAHost(req.cell, (req.resources ?? DEFAULT_RESOURCES).memory_mib);
     // Its operator layer's guards and its own naming `injected: "*"` need every host to read it as any binding.
     if (!this.get<SandboxInfo>("info")) await this.requireInjectedAny(req.cell, [...freshInjectedAny(asked.guards, []), ...freshInjectedAny(req.guards ?? [], [])]);
     // The cell's registry is the authority for which sandboxes exist (its GC roots): registered
@@ -830,7 +850,7 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.set("failed_release", now + lease.FAILED_RELEASE_MS);
   }
 
-  /** FleetDO took this suspended sandbox off a host going away (`lease.evicted`). */
+  /** FleetDO took this suspended sandbox off its host: one going away, or one whose room a placement needed (`lease.evicted`). */
   async evicted(host: string, epoch: number): Promise<void> {
     if (!this.tryInfo()) return;
     const [r] = this.decide((i) => lease.evicted(i, host, epoch));
