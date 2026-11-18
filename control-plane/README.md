@@ -92,7 +92,10 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      `{events, next_before}`, meeting the ring at its seam (`src/lib/trace-history.ts`; docs/control-plane/api/#trace-history)
    - `POST /v1/admin/hosts/<id>/drain`: an operator's drain, the forced drain of a spot notice asked for by hand: the
      host takes no new work, its sandboxes are suspended to the object store and leave, its brains move, and it is
-     retired once empty; returns the host's status (404 for a host the cell doesn't have, 409 unless active or draining)
+     retired once empty. It can't be undone: drain one host at a time, and the next only once a replacement is active.
+     Returns the host's status and `leases`, how many sandboxes it still holds: watch `GET /v1/admin/fleet`, and ask
+     again if a sandbox stays `running` (a suspend whose commit failed isn't retried while an agent works in it). 404
+     for a host the cell doesn't have; 409 for a brain host, or one neither active nor draining
    - `POST /v1/admin/hosts/<id>/confirm-dead`: manual STONITH (also releases the host's tunnel and record; a host
      still running cloudflared keeps its tunnel undeletable until the instance is gone, and the sweep finishes it)
    - `POST /v1/admin/tunnels/sweep?cell=<cell>`: run the daily tunnel sweep now; returns what it deleted, retried,

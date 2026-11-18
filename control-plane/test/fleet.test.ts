@@ -1482,8 +1482,8 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await sandboxStub(busy.sandbox).agentActivity("agt_opdrain00000000000000000000", true);
     const b = await connectHost(cell);
 
-    const status = await adminJson<{ status: string }>(`/v1/admin/hosts/${a.host}/drain?cell=${cell}`, { body: {} });
-    expect(status.status).toBe("draining");
+    const status = await adminJson<{ status: string; leases: number }>(`/v1/admin/hosts/${a.host}/drain?cell=${cell}`, { body: {} });
+    expect(status).toMatchObject({ status: "draining", leases: 1 });
     const cmds = await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
     expect(cmds.filter((c) => c.type === "sandbox_suspend")).toMatchObject([{ sandbox: busy.sandbox, epoch: 1, mode: "disk_only" }]);
     // A draining host takes no new sandbox: the next one goes to the other host.
@@ -1509,7 +1509,13 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     expect(missing.error.code).toBe("not_found");
     await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
     const dead = await adminJson<{ error: { code: string; message: string } }>(`/v1/admin/hosts/${a.host}/drain?cell=${cell}`, { body: {} }, 409);
+    expect(dead.error).toMatchObject({ code: "conflict" });
     expect(dead.error.message).toContain("is dead");
+    // A brain host's drain moves every brain: not by this route.
+    const brain = await connectHost(cell, "brain");
+    const refused = await adminJson<{ error: { code: string; message: string } }>(`/v1/admin/hosts/${brain.host}/drain?cell=${cell}`, { body: {} }, 409);
+    expect(refused.error.message).toContain("only a sandbox host");
+    expect((await fleetStub(cell).hostStatus(brain.host))!.status).toBe("active");
   });
 
   it("a spot drain survives a blip: a host back from STONITH by fence, or from expiry, is still draining (B-3)", async () => {
