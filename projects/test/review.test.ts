@@ -175,6 +175,21 @@ describe("a PR's review", () => {
     expect(fake.agents.get(reviewer)!.ended).toBe(false);
   });
 
+  it("nest refusing its template's write for good fails the job at once, shared template or the project's own", async () => {
+    for (const model of [null, "claude-haiku-5-5"]) {
+      const p = await newProject();
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: model });
+      const name = model ? roleTemplate("reviewer", p.id, model).name : "projects/reviewer";
+      fake.fail(new RegExp(`^PUT /v1/catalog/templates/${name}$`), 403, { times: 1000 });
+      const s = sha();
+      expect((await push(p, 7, s, "opened")).status).toBe(200);
+      await run(p);
+      fake.failures = [];
+      expect(await job(p, 7, s), String(model)).toMatchObject({ state: "failed" });
+      expect(live(p, 7)).toEqual([]);
+    }
+  });
+
   it("an attempt keeps the model it froze when its start is retried after the setting changed, under the same key", async () => {
     const p = await newProject();
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
