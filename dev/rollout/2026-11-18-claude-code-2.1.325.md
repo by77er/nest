@@ -11,7 +11,7 @@
 
   Normally no release is built. Its inputs (`crates/`, `protocol/`, the Cargo files, the toolchain, `.cargo/`, `scripts/publish-release.sh`) are unchanged, so the release job's `release-inputs-<digest>` cache marker hits. If that marker was evicted, the job rebuilds, and `publish-release.sh` publishes nothing only if the binaries come out byte-identical.
 
-  Without a publish, no host AMI build starts, and the AMI the launch templates resolve keeps the version it was built with (2.1.301, if it was built since that pin; running hosts install the pin at boot either way).
+  Without a publish, no host AMI build starts, and the AMI the launch templates resolve keeps the version it was built with (2.1.301, if it was built since that pin; every host installs the pin at boot either way).
 - **Right after the apply, start a host AMI build.** It needs the owner's AWS access; the commands are the ones `deploy.yml`'s release job runs:
 
   ```bash
