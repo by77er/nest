@@ -29,6 +29,7 @@ async function seeded(tasks = 3, messages = 3) {
   const p = await api(token, "POST", "/api/projects", { name: `p ${repo}`, repo });
   expect(p.status, JSON.stringify(p.body)).toBe(201);
   const id = p.body.id as string;
+  const manager = p.body.settings.manager as string;
   const ids: string[] = [];
   for (let i = 0; i < tasks; i++) {
     const t = await api(token, "POST", `/api/projects/${id}/tasks`, { title: `task ${i}`, body: `details of task ${i}, `.repeat(20) });
@@ -37,7 +38,7 @@ async function seeded(tasks = 3, messages = 3) {
   }
   if (ids[0]) expect((await api(token, "PUT", `/api/projects/${id}/tasks/${ids[0]}/spec`, spec)).status).toBe(200);
   for (let i = 0; i < messages; i++) expect((await api(token, "POST", `/api/projects/${id}/chat`, { text: `message ${i}` })).status).toBe(201);
-  return { id, tasks: ids };
+  return { id, manager, tasks: ids };
 }
 
 const get = (path: string, headers: Record<string, string> = {}) => SELF.fetch(`${APP}${path}`, { headers: { "cf-access-jwt-assertion": token, ...headers } });
@@ -51,7 +52,7 @@ describe("conditional GETs", () => {
     const first = await get(`/api/projects/${p.id}/tasks`);
     expect(first.status).toBe(200);
     const etag = first.headers.get("etag");
-    expect(etag).toMatch(/^"[0-9a-f]{32}"$/);
+    expect(etag).toMatch(/^W\/"[0-9a-f]{32}"$/);
     expect(first.headers.get("cache-control")).toBe("no-store");
     expect(first.headers.get("server-timing")).toMatch(timing);
     const tasks = await first.json<{ id: string }[]>();
@@ -63,8 +64,8 @@ describe("conditional GETs", () => {
     expect(again.headers.get("etag")).toBe(etag);
     expect(again.headers.get("cache-control")).toBe("no-store");
     expect(again.headers.get("server-timing")).toMatch(timing);
-    // Cloudflare marks the tag weak when it compresses the answer: the browser's W/ copy matches too.
-    expect((await get(`/api/projects/${p.id}/tasks`, { "if-none-match": `W/${etag}` })).status).toBe(304);
+    // Compared weakly: the tag without its W/ matches too.
+    expect((await get(`/api/projects/${p.id}/tasks`, { "if-none-match": etag!.slice(2) })).status).toBe(304);
     // Another tag: the whole answer.
     const other = await get(`/api/projects/${p.id}/tasks`, { "if-none-match": '"0123"' });
     expect(other.status).toBe(200);
@@ -141,13 +142,19 @@ describe("conditional GETs", () => {
     fake.failures.length = 0;
     expect(asks.status).toBeGreaterThanOrEqual(500);
     expect(asks.headers.get("etag")).toBeNull();
-    // The trace's history and socket are nest's answers, passed through: no ETag.
-    const history = await get(`/api/agents/agt_nosuch/trace/history`, { "if-none-match": "*" });
-    expect(history.status).toBe(404);
+    // The trace's routes are left out: its history's 200 has no ETag, and its WebSocket upgrade (101) is nest's socket as it was.
+    const page = { events: [{ ts_ms: 1, entry: 0, type: "turn_started", input_kind: "unknown" }], next_before: "cur2" };
+    fake.histories.set(p.manager, new Map([["cur1", page]]));
+    const history = await get(`/api/agents/${p.manager}/trace/history?before=cur1`, { "if-none-match": "*" });
+    expect(history.status).toBe(200);
     expect(history.headers.get("etag")).toBeNull();
-    const socket = await get(`/api/agents/agt_nosuch/trace`, { "if-none-match": "*" });
-    expect(socket.status).toBe(426);
+    expect(await history.json()).toEqual(page);
+    const socket = await get(`/api/agents/${p.manager}/trace`, { upgrade: "websocket", "if-none-match": "*" });
+    expect(socket.status).toBe(101);
     expect(socket.headers.get("etag")).toBeNull();
+    expect(socket.headers.get("server-timing")).toBeNull();
+    socket.webSocket!.accept();
+    socket.webSocket!.close();
   });
 
   it("the Access check comes first: no identity is the same 403, with no ETag or timing", async () => {

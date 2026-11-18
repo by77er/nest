@@ -121,7 +121,7 @@ export default {
     if (!who) return json({ error: "a Cloudflare Access login for this app is required" }, 403);
     if (who === "service" && !serviceMayCall(request.method, path)) return json({ error: "a service token may only read the projects and their managers" }, 403);
     if (path.startsWith("/api/")) {
-      // Conditional and timed (src/conditional.ts); the trace's routes are nest's answers, passed through.
+      // Conditional and timed (src/conditional.ts); the trace's routes are left out of the ETags.
       const start = Date.now();
       return timed(await conditional(request, await handleApi(request, env, url), path.startsWith("/api/agents/")), start);
     }

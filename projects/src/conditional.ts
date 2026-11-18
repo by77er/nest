@@ -2,16 +2,18 @@
 // finds nothing new. Each JSON `GET` answer carries an `ETag` of its body, and a request naming it in
 // `If-None-Match` is answered `304` with no body; every answer says how long the Worker took (`Server-Timing`).
 
-/** The ETag of a body: its SHA-256, the first 16 bytes in hex, quoted (a strong validator, RFC 9110 8.8.3). */
+/**
+ * The ETag of a body: its SHA-256, the first 16 bytes in hex, quoted, and marked weak (RFC 9110 8.8.3).
+ * Weak, though it changes with every byte: Cloudflare may make a strong tag weak or drop it when it
+ * compresses an answer (https://developers.cloudflare.com/cache/reference/etag-headers/; for a Worker's
+ * uncached answer, unverified), and `If-None-Match` is compared weakly anyway.
+ */
 export async function etagOf(body: ArrayBuffer): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body), 0, 16);
-  return `"${Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("")}"`;
+  return `W/"${Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("")}"`;
 }
 
-/**
- * Whether `If-None-Match` names `etag`: a list of tags, or `*`. Compared weakly (RFC 9110 13.1.2): Cloudflare
- * marks a strong tag weak (`W/`) when it compresses the answer, and the browser sends that one back.
- */
+/** Whether `If-None-Match` names `etag`: a list of tags, or `*`, compared weakly (RFC 9110 13.1.2). */
 export function matches(ifNoneMatch: string | null, etag: string): boolean {
   if (ifNoneMatch === null) return false;
   const bare = (t: string) => t.trim().replace(/^W\//, "");

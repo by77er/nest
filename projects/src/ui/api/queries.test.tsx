@@ -76,6 +76,8 @@ describe("a poll that finds nothing new", () => {
     const before = { ...renders };
     const data = { tasks: qc.getQueryData(keys.tasks("prj_poll")), chat: qc.getQueryData(keys.chat("prj_poll")) };
     await act(() => qc.refetchQueries({ queryKey: ["projects", "prj_poll"] }));
+    // The poll was answered 304 (TanStack's structural sharing would keep an equal 200's reference too;
+    // client.test.ts shows the 304's value is the one remembered, no body read).
     expect(statuses).toEqual([200, 200, 304, 304]);
     expect(renders).toEqual(before);
     expect(Object.is(qc.getQueryData(keys.tasks("prj_poll")), data.tasks)).toBe(true);
