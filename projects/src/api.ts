@@ -16,6 +16,7 @@ import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, C
 import type { RepoBinding } from "./do/directory";
 import type { ProjectSettings, Settings } from "./do/project";
 import { githubFor, PERMISSIONS } from "./github";
+import { legacyView } from "./reviewers";
 import { PRESETS } from "./routines";
 import type { UntrustedPolicy } from "./review-trust";
 import type { Result } from "./sql";
@@ -420,7 +421,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       // The owner's Restart (README.md#the-manager-lifecycle): the manager goes, a new one starts.
       return done(await answerSettings(env, pid, await p.restartManager()));
     case "GET reviews":
-      return json(await review(env, pid).jobs());
+      // With the release before's keys besides, for a page still running its bundle (README.md#built-the-review-pipeline).
+      return json((await review(env, pid).jobs()).map((j) => ({ ...j, verdict: j.verdict && legacyView(j.verdict) })));
     // The review gate (README.md#the-review-gate): the owner approves a held review of one head commit, or dismisses it.
     case "POST reviews/:pr/:sha/approve":
       return done(await review(env, pid).approve(Number(rest[1]), rest[2]!));

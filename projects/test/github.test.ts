@@ -2,7 +2,8 @@
 // https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries, the review check's
 // required-checks rules, and the check output a verdict makes.
 import { describe, expect, it } from "vitest";
-import { CHECK_NAME, clip, OUTPUT_MAX, protectionKeeping, type Verdict, verdictCheck, verifyGithubSignature, withReviewCheck } from "../src/github";
+import { CHECK_NAME, clip, OUTPUT_MAX, protectionKeeping, TITLE_MAX, verdictCheck, verifyGithubSignature, withReviewCheck } from "../src/github";
+import { CODE_REVIEW, parseVerdict, type Review, type Verdict } from "../src/reviewers";
 
 const bytes = (s: string) => new TextEncoder().encode(s);
 
@@ -71,35 +72,88 @@ describe("the review check among the required checks", () => {
 });
 
 describe("a verdict's check", () => {
-  const v = (c: "pass" | "fail", q: "pass" | "fail", a: "pass" | "fail", summary = "the summary"): Verdict => ({
-    correctness: { verdict: c, notes: "correctness notes" }, quality: { verdict: q, notes: "quality notes" }, architecture: { verdict: a, notes: "architecture notes" }, summary,
+  type P = "pass" | "fail";
+  const code = (c: P, q: P, a: P, o: { summary?: string; tainted?: boolean } = {}): Review => ({
+    reviewer: { id: CODE_REVIEW.id, name: CODE_REVIEW.name }, agent: "agt_r", tainted: o.tainted ?? false,
+    dimensions: [
+      { name: "Correctness", verdict: c, notes: "correctness notes" },
+      { name: "Quality", verdict: q, notes: "quality notes" },
+      { name: "Architectural cohesiveness", verdict: a, notes: "architecture notes" },
+    ],
+    summary: o.summary ?? "the summary",
+  });
+  const v = (...reviews: Review[]): Verdict => ({ reviews });
+  const TAINTED = "yes (its session read untrusted content, such as the PR itself, which could have steered this verdict)";
+
+  describe("the built-in reviewer alone: the check as the release before made it", () => {
+    // The release before's output for the same verdicts, written out: the oracle.
+    const before = (c: P, q: P, a: P, tainted: boolean, summary: string) => {
+      const failed = [["correctness", c], ["quality", q], ["architectural cohesiveness", a]].filter(([, x]) => x !== "pass").map(([n]) => n);
+      return {
+        conclusion: failed.length ? "failure" : "success",
+        output: {
+          title: failed.length ? `Review failed: ${failed.join(", ")}` : "Review passed",
+          summary: summary || "(no summary)",
+          text: `## Correctness: ${c}\n\ncorrectness notes\n\n## Quality: ${q}\n\nquality notes\n\n## Architectural cohesiveness: ${a}\n\narchitecture notes\n\n---\n\nReviewer: agt_r. Tainted: ${tainted ? TAINTED : "no"}.`,
+        },
+      };
+    };
+
+    it("gives the same conclusion, title, summary and text for every verdict", () => {
+      for (const c of ["pass", "fail"] as const) for (const q of ["pass", "fail"] as const) for (const a of ["pass", "fail"] as const) for (const tainted of [false, true]) for (const summary of ["the summary", ""]) {
+        expect(verdictCheck(v(code(c, q, a, { tainted, summary }))), `${c} ${q} ${a} ${tainted} ${JSON.stringify(summary)}`).toEqual(before(c, q, a, tainted, summary));
+      }
+    });
+
+    it("reads a row the release before stored as that same check", () => {
+      const old = JSON.stringify({ correctness: { verdict: "fail", notes: "correctness notes" }, quality: { verdict: "pass", notes: "quality notes" }, architecture: { verdict: "fail", notes: "architecture notes" }, summary: "the summary" });
+      expect(verdictCheck(parseVerdict(old, { agent: "agt_r", tainted: true }))).toEqual(before("fail", "pass", "fail", true, "the summary"));
+    });
   });
 
-  it("succeeds only when all three pass", () => {
-    const all: ("pass" | "fail")[][] = [];
-    for (const c of ["pass", "fail"] as const) for (const q of ["pass", "fail"] as const) for (const a of ["pass", "fail"] as const) all.push([c, q, a]);
-    for (const [c, q, a] of all) {
-      const out = verdictCheck(v(c!, q!, a!), { agent: "agt_r", tainted: false });
-      expect(out.conclusion, `${c} ${q} ${a}`).toBe(c === "pass" && q === "pass" && a === "pass" ? "success" : "failure");
-    }
-  });
+  describe("several reviews", () => {
+    const security = (s: P, o: { tainted?: boolean } = {}): Review => ({
+      reviewer: { id: "rv_sec", name: "Security" }, agent: "agt_s", tainted: o.tainted ?? false,
+      dimensions: [{ name: "Secrets", verdict: s, notes: "secrets notes" }, { name: "Injection", verdict: "pass", notes: "injection notes" }],
+      summary: "security summary",
+    });
 
-  it("names the failed dimensions in the title, the summary as given, and each dimension's notes and the taint in the text", () => {
-    const out = verdictCheck(v("fail", "pass", "fail"), { agent: "agt_r", tainted: true });
-    expect(out.output.title).toBe("Review failed: correctness, architectural cohesiveness");
-    expect(out.output.summary).toBe("the summary");
-    expect(out.output.text).toContain("## Correctness: fail\n\ncorrectness notes");
-    expect(out.output.text).toContain("## Quality: pass\n\nquality notes");
-    expect(out.output.text).toContain("## Architectural cohesiveness: fail\n\narchitecture notes");
-    expect(out.output.text).toMatch(/Reviewer: agt_r\. Tainted: yes/);
-    expect(verdictCheck(v("pass", "pass", "pass"), { agent: "agt_r", tainted: false }).output.text).toMatch(/Tainted: no\.$/);
+    it("succeeds only if every dimension of every review passes", () => {
+      expect(verdictCheck(v(code("pass", "pass", "pass"), security("pass"))).conclusion).toBe("success");
+      expect(verdictCheck(v(code("pass", "pass", "pass"), security("fail"))).conclusion).toBe("failure");
+      expect(verdictCheck(v(code("pass", "fail", "pass"), security("pass"))).conclusion).toBe("failure");
+      // Nothing judged is no pass.
+      expect(verdictCheck(v()).conclusion).toBe("failure");
+      expect(verdictCheck(v({ ...security("pass"), dimensions: [] })).conclusion).toBe("failure");
+    });
+
+    it("names each failed reviewer with its failed dimensions in the title, and gives each reviewer a section", () => {
+      const out = verdictCheck(v(code("fail", "pass", "fail"), security("fail", { tainted: true })));
+      expect(out.output.title).toBe("Review failed: Code review (correctness, architectural cohesiveness); Security (secrets)");
+      expect(verdictCheck(v(code("pass", "pass", "pass"), security("fail"))).output.title).toBe("Review failed: Security (secrets)");
+      expect(verdictCheck(v(code("pass", "pass", "pass"), security("pass"))).output.title).toBe("Review passed");
+      expect(out.output.summary).toBe("**Code review** (failed): the summary\n\n**Security** (failed): security summary");
+      expect(out.output.text).toBe([
+        "# Code review: failed\n\n## Correctness: fail\n\ncorrectness notes\n\n## Quality: pass\n\nquality notes\n\n## Architectural cohesiveness: fail\n\narchitecture notes\n\nReviewer: agt_r. Tainted: no.",
+        `# Security: failed\n\n## Secrets: fail\n\nsecrets notes\n\n## Injection: pass\n\ninjection notes\n\nReviewer: agt_s. Tainted: ${TAINTED}.`,
+      ].join("\n\n---\n\n"));
+    });
+
+    it("a reviewer other than the built-in one, alone, is named too", () => {
+      expect(verdictCheck(v(security("fail"))).output.title).toBe("Review failed: Security (secrets)");
+    });
   });
 
   it("is clipped to GitHub's limits", () => {
-    const out = verdictCheck({ ...v("pass", "pass", "pass", "s".repeat(OUTPUT_MAX + 10)), quality: { verdict: "pass", notes: "n".repeat(OUTPUT_MAX) } }, { agent: "agt_r", tainted: false });
-    expect(out.output.summary.length).toBe(OUTPUT_MAX);
-    expect(out.output.summary.endsWith("(clipped)")).toBe(true);
-    expect(out.output.text!.length).toBe(OUTPUT_MAX);
+    const big = code("pass", "pass", "pass", { summary: "s".repeat(OUTPUT_MAX + 10) });
+    big.dimensions[1]!.notes = "n".repeat(OUTPUT_MAX);
+    for (const verdict of [v(big), v(big, { ...big, reviewer: { id: "rv_2", name: "x".repeat(TITLE_MAX) }, dimensions: [{ name: "y", verdict: "fail", notes: "" }] })]) {
+      const out = verdictCheck(verdict);
+      expect(out.output.summary.length).toBe(OUTPUT_MAX);
+      expect(out.output.summary.endsWith("(clipped)")).toBe(true);
+      expect(out.output.text!.length).toBe(OUTPUT_MAX);
+      expect(out.output.title.length).toBeLessThanOrEqual(TITLE_MAX);
+    }
     // A surrogate pair at the cut isn't split.
     expect(clip(`${"a".repeat(8)}😀😀😀`, 10)).toBe(`${"a".repeat(8)}…`);
   });

@@ -17,7 +17,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { roleTemplate, TEMPLATE, writeSharedTemplate } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
-import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, type Verdict, verdictCheck } from "../github";
+import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
 import { atCapacity, backoff, HOSTS_WAIT, NestError, nestFrom, type Nest, stopRefused } from "../nest";
 import { spawnOverrides, startEgress } from "../github-access";
@@ -25,6 +25,7 @@ import { OUTBOX, type OutboxPolicy, type OutboxRow, outboxStep } from "../outbox
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { toolOf } from "../tools";
+import { CODE_REVIEW, legacySubmit, parseVerdict, type Reviewer, reviewOf, storedVerdict, type Submitted, type Verdict } from "../reviewers";
 import { EARLY_EXITS_KEEP_MS, PRUNE_EVERY_MS, REVIEW_JOBS_KEEP_MS } from "../retention";
 import { type JobEvent, type JobState, jobTransition, REVIEW_DEADLINE_MS } from "../review-job";
 import { HELD_CHECK_INTERVAL_MS, MAX_HELD, MAX_OVERFLOW, type PrOrigin, reviewDecision, type TrustedIds, trustedAuthor, type UntrustedPolicy } from "../review-trust";
@@ -285,7 +286,7 @@ export class ReviewDO extends DurableObject<Env> {
     return {
       pr: r.pr as number, sha: r.sha as string, state: r.state as JobState, title: (r.title as string | null) ?? null, base: (r.base as string | null) ?? null,
       agent: (r.agent as string | null) ?? null, check_run: (r.check_run as number | null) ?? null,
-      verdict: r.verdict ? (JSON.parse(r.verdict as string) as Verdict) : null, tainted: r.tainted === null ? null : r.tainted === 1,
+      verdict: r.verdict ? verdictOf(r) : null, tainted: r.tainted === null ? null : r.tainted === 1,
       attempts: r.attempts as number, runs: r.runs as number, error: (r.error as string | null) ?? null,
       deadline_ms: r.state === "running" ? ((r.deadline_ms as number | null) ?? null) : null,
       author: (r.author as string | null) ?? null, fork: r.fork === 1, approved_ms: (r.approved_ms as number | null) ?? null,
@@ -306,7 +307,7 @@ export class ReviewDO extends DurableObject<Env> {
     const out: Record<string, Verdict> = {};
     for (const h of heads) {
       const r = this.jobRow(h.pr, h.sha);
-      if (r && r.state === "done" && r.verdict) out[`${h.pr}/${h.sha}`] = JSON.parse(r.verdict as string) as Verdict;
+      if (r && r.state === "done" && r.verdict) out[`${h.pr}/${h.sha}`] = verdictOf(r);
     }
     return out;
   }
@@ -699,6 +700,10 @@ export class ReviewDO extends DurableObject<Env> {
   async mcpCall(caller: AgentCaller, tool: string, args: Record<string, unknown>, callKey: string | null): Promise<{ result: string | null; error: string | null }> {
     const def = toolOf("review", tool);
     if (!def) return { result: null, error: `unknown tool ${tool}` };
+    // A reviewer started by the release before submits in its form: converted (README.md#built-the-review-pipeline).
+    const legacy = tool === "submit_review" ? legacySubmit(args) : null;
+    if (legacy && "error" in legacy) return { result: null, error: legacy.error };
+    if (legacy) args = legacy;
     const bad = invalid(def.inputSchema, args);
     if (bad) return { result: null, error: bad };
     if (this.setting("project") === null || caller.labels.project !== this.setting("project")) return { result: null, error: "unknown project" };
@@ -721,21 +726,23 @@ export class ReviewDO extends DurableObject<Env> {
     const r = pr && /^[1-9][0-9]{0,9}$/.test(pr) && sha ? this.jobRow(Number(pr), sha) : undefined;
     if (!r) return fail(404, "no review for your PR and commit");
     switch (tool) {
-      case "review_get":
-        return ok({ repo: await this.repo(), pr: r.pr, sha: r.sha, base: r.base, title: r.title, state: r.state });
+      case "review_get": {
+        const rv = reviewerOf(r);
+        return ok({
+          repo: await this.repo(), pr: r.pr, sha: r.sha, base: r.base, title: r.title, state: r.state,
+          reviewer: { name: rv.name, dimensions: rv.dimensions, instructions: rv.instructions },
+        });
+      }
       case "submit_review": {
         if (r.agent !== caller.agent) return fail(403, "you aren't this review's reviewer");
         if (r.verdict !== null) return fail(409, "this review already has its verdict");
         if (r.state !== "running") return fail(409, `this review is ${r.state}`);
-        const v = a as unknown as Verdict;
-        const verdict: Verdict = {
-          correctness: { verdict: v.correctness.verdict, notes: v.correctness.notes },
-          quality: { verdict: v.quality.verdict, notes: v.quality.notes },
-          architecture: { verdict: v.architecture.verdict, notes: v.architecture.notes },
-          summary: v.summary,
-        };
-        const check = verdictCheck(verdict, { agent: caller.agent, tainted: caller.tainted });
-        this.sql.exec("UPDATE jobs SET verdict = ?, tainted = ? WHERE pr = ? AND sha = ?", JSON.stringify(verdict), caller.tainted ? 1 : 0, r.pr, r.sha);
+        // Refused (nothing recorded, still its one submit to make) unless it names each dimension once.
+        const made = reviewOf(reviewerOf(r), a.verdicts as Submitted[], a.summary as string, { agent: caller.agent, tainted: caller.tainted });
+        if (!made.ok) return fail(400, made.error);
+        const verdict: Verdict = { reviews: [made.review] };
+        const check = verdictCheck(verdict);
+        this.sql.exec("UPDATE jobs SET verdict = ?, tainted = ? WHERE pr = ? AND sha = ?", storedVerdict(verdict), caller.tainted ? 1 : 0, r.pr, r.sha);
         this.end(r, "verdict", check.conclusion, check.output);
         await this.arm();
         return ok({ recorded: true, conclusion: check.conclusion });
@@ -901,7 +908,7 @@ export class ReviewDO extends DurableObject<Env> {
         // A create whose answer was lost made a check run all the same: found by its external id.
         const found = (before.errors as number) > 0 ? (await gh.checkRunsAt(repo, sha)).find((c) => c.external_id === external) : undefined;
         const made = found ?? (await gh.createCheckRun(repo, {
-          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`, output: reviewingOutput(sha),
+          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`, output: reviewingOutput(sha, reviewerOf(before)),
         }))!;
         const appId = made.app?.id;
         if (typeof appId === "number" && this.setting("github_app_id") !== String(appId)) {
@@ -959,7 +966,7 @@ export class ReviewDO extends DurableObject<Env> {
         // Named on the job in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE jobs SET agent = ?, capacity_ms = NULL, room_waits = 0 WHERE pr = ? AND sha = ?", agent, pr, sha);
         // It waited for room: its check says it's reviewing again.
-        if (j0.capacity_ms !== null && j0.check_run !== null) this.oweCheck(j0.check_run as number, { status: "in_progress", output: reviewingOutput(sha) });
+        if (j0.capacity_ms !== null && j0.check_run !== null) this.oweCheck(j0.check_run as number, { status: "in_progress", output: reviewingOutput(sha, reviewerOf(j0)) });
         await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
         // Its holdings and live layer: a secret changed or removed later reaches it too.
         await projectStub(this.env, project).reviewerStarted(agent, key);
@@ -975,7 +982,7 @@ export class ReviewDO extends DurableObject<Env> {
       const j = current()!;
       if (j.briefed !== 1) {
         const spec = await projectStub(this.env, project).reviewerSpec(`${project}/review/${pr}/${sha}/${runs}`, { ensure: false });
-        await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null) + spec.brief, { requestId: `${project}/review/${pr}/${sha}/${runs}/brief` });
+        await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null, reviewerOf(j)) + spec.brief, { requestId: `${project}/review/${pr}/${sha}/${runs}/brief` });
         if (!current()) return;
       }
       this.sql.exec("UPDATE jobs SET briefed = 1, next_ms = NULL, errors = 0, error = NULL, updated_ms = ? WHERE pr = ? AND sha = ?", Date.now(), pr, sha);
@@ -1101,9 +1108,18 @@ const HELD_OUTPUT: CheckOutput = {
   summary: "This pull request isn't from someone the project trusts, so its review doesn't start by itself. The project's owner can approve the review of this commit, or dismiss it.",
 };
 
-const reviewingOutput = (sha: string): CheckOutput => ({
-  title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: correctness, quality and architectural cohesiveness.`,
+const reviewingOutput = (sha: string, reviewer: Reviewer): CheckOutput => ({
+  title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: ${listed(reviewer.dimensions.map((d) => d.toLowerCase()))}.`,
 });
+
+/** "a", "a and b", "a, b and c". */
+const listed = (xs: readonly string[]) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+
+/** The reviewer a job's agent reviews as: the built-in one, the only one there is for now. */
+const reviewerOf = (_job: Row): Reviewer => CODE_REVIEW;
+
+/** A job row's stored verdict, in whichever release's form it was written. */
+const verdictOf = (r: Row): Verdict => parseVerdict(r.verdict as string, { agent: (r.agent as string | null) ?? null, tainted: r.tainted === null ? null : r.tainted === 1 });
 
 const ROOM_OUTPUT: CheckOutput = {
   title: "Waiting for room to start a reviewer",
@@ -1122,13 +1138,16 @@ const SAFE_REF = /^[A-Za-z0-9._/-]{1,200}$/;
 
 /**
  * The reviewer's first input: only what the app knows from GitHub's routing (repo, number, head,
- * base), none of the PR's own text, which the reviewer reads itself (and is tainted by).
+ * base) and the reviewer it reviews as (its name, dimensions and instructions), none of the PR's own
+ * text, which the reviewer reads itself (and is tainted by).
  */
-export function reviewerBrief(repo: string, pr: number, sha: string, base: string | null): string {
+export function reviewerBrief(repo: string, pr: number, sha: string, base: string | null, reviewer: Reviewer): string {
   const b = base && SAFE_REF.test(base) ? base : null;
   return [
     `Review PR #${pr} on ${repo} at its head commit ${sha}${b ? `, against its base branch ${b}` : ""}.`,
     `Read it with projects-review review_get. Check it out in your sandbox: \`git fetch origin pull/${pr}/head && git checkout ${sha}\`, and read the diff against the base: \`git diff origin/${b ?? "<base>"}...${sha}\`.`,
-    "Judge correctness, quality and architectural cohesiveness, then submit once with submit_review.",
+    `You review it as the reviewer "${reviewer.name}". Its dimensions, each judged pass or fail on its own: ${reviewer.dimensions.map((d) => JSON.stringify(d)).join(", ")}.`,
+    `Its instructions: ${reviewer.instructions}`,
+    "Then submit once with submit_review, naming each of those dimensions exactly once.",
   ].join("\n");
 }

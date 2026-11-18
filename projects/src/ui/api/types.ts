@@ -25,7 +25,7 @@ export type { Spec, TaskState } from "../../tasks";
 export type { OutboxState } from "../../outbox";
 export type { ManagerPhase, ManagerStatus } from "../../manager";
 export type { Job, JobState } from "../../do/review";
-export type { Dimension, Verdict } from "../../github";
+export type { DimensionVerdict, Review, Verdict } from "../../reviewers";
 
 /** `GET /api/projects/<id>`. */
 export type Project = ProjectRow & { settings: Settings };

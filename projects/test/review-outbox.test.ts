@@ -5,7 +5,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { OUTBOX } from "../src/outbox";
-import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, prEvent, Signer, submitArgs } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
@@ -56,11 +56,10 @@ async function opened(p: P, number = 1) {
   expect(reviewer).toBeDefined();
   return { sha: s, reviewer: reviewer.agent };
 }
-const dim = { verdict: "pass", notes: "fine" };
 /** The reviewer's verdict: the job ends, owing its check's completion, its reviewer's stop and its word to the project. */
 async function submitted(p: P, o: { sha: string; reviewer: string }, pr = 1) {
   const t = await nest.sign(agentClaims("review", o.reviewer, { project: p.id, role: "reviewer", pr: String(pr), sha: o.sha, start: "1" }));
-  const r = await callTool("review", t, "submit_review", { correctness: dim, quality: dim, architecture: dim, summary: "ok" });
+  const r = await callTool("review", t, "submit_review", submitArgs());
   expect(r.result?.isError, JSON.stringify(r.result)).toBeFalsy();
 }
 const patches = (p: P) => gh.callsTo("PATCH", new RegExp(`^/repos/${p.repo}/check-runs/`, "i")).length;

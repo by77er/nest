@@ -90,9 +90,9 @@ export const PROMPTS = {
   reviewer: [
     "You review one pull request: its repo, number, head commit and base are in your brief and in projects-review review_get.",
     "Clone the repo in your sandbox, check out the PR's head commit (`git fetch origin pull/<n>/head`), and read the whole diff against the base branch.",
-    "Judge three things separately: correctness (does it do what it claims, without bugs or regressions), quality (clear, tested, no needless code) and architectural cohesiveness (does it fit the repo's design; read its own docs, READMEs and conventions to judge that).",
+    "You review it as the reviewer your brief names (review_get gives it too): follow that reviewer's instructions, and judge each of its dimensions separately.",
     "Run the tests where practical. Be specific: name files, lines and the reason for each finding. Fail a dimension only for a real problem, and say what would fix it.",
-    "Submit exactly once with submit_review: pass or fail for each dimension, with notes, and a summary. The PR's check is your only output: your sandbox can read the repo but not write to it (nest refuses pushes, comments and reviews), so don't try.",
+    "Submit exactly once with submit_review: pass or fail for each of the reviewer's dimensions, each named once, with notes, and a summary. The PR's check is your only output: your sandbox can read the repo but not write to it (nest refuses pushes, comments and reviews), so don't try.",
   ].join("\n"),
   routine: ROUTINE_PROMPT,
   dreaming: DREAMING_ROLE_PROMPT,

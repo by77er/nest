@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { atCapacity, NestError } from "../src/nest";
 import { ROOM_TELL_AFTER_MS } from "../src/do/review";
-import { AccessTeam, agentClaims, api, callTool, CLIENT, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, CLIENT, deliverGithub, FakeNest, installFetch, prEvent, Signer, submitArgs } from "./fake-nest";
 
 describe("a capacity refusal, told apart", () => {
   it("is nest's 403 forbidden in ClientDO's words, for agents or sandboxes; nothing else is", () => {
@@ -78,7 +78,6 @@ const nextIn = async (p: P, pr: number, s: string) => runInDurableObject(reviews
 const liveAgents = () => [...fake.agents.values()].filter((a) => !a.ended && a.client === CLIENT).length;
 const liveSandboxes = () => [...fake.sandboxes.values()].filter((x) => !x.ended).length;
 const checkOf = (p: P, s: string) => gh.runsOf(p.repo, s)[0] as any;
-const dim = { verdict: "pass", notes: "fine" };
 
 describe("a review nest has no room for", () => {
   it("max_sandboxes: waits queued, its check in progress saying so, tried again and again (backed off), and starts once there's room", async () => {
@@ -123,7 +122,7 @@ describe("a review nest has no room for", () => {
       // Its verdict completes the check once, as any review's.
       const reviewer = live(p, 1)[0]!;
       const id = await nest.sign(agentClaims("review", reviewer.agent, { project: p.id, role: "reviewer", pr: "1", sha: s, start: reviewer.labels.start! }));
-      const r = await callTool("review", id, "submit_review", { correctness: dim, quality: dim, architecture: dim, summary: "ok" });
+      const r = await callTool("review", id, "submit_review", submitArgs());
       expect(r.result?.isError, JSON.stringify(r.result)).toBeFalsy();
       await run(p);
       expect(checkOf(p, s)).toMatchObject({ status: "completed", conclusion: "success" });
@@ -165,7 +164,7 @@ describe("a review nest has no room for", () => {
       // The first one's verdict: its reviewer is stopped, which frees its place, and the second starts in that drain.
       const reviewer = live(p, 1)[0]!;
       const id = await nest.sign(agentClaims("review", reviewer.agent, { project: p.id, role: "reviewer", pr: "1", sha: s1, start: reviewer.labels.start! }));
-      await callTool("review", id, "submit_review", { correctness: dim, quality: dim, architecture: dim, summary: "ok" });
+      await callTool("review", id, "submit_review", submitArgs());
       await run(p);
       expect((await job(p, 2, s2)).state).toBe("running");
       expect(live(p, 2)).toHaveLength(1);
@@ -201,7 +200,7 @@ describe("a review nest has no room for", () => {
       fake.maxAgents = null;
       const reviewer = live(p, 1)[0]!;
       const id = await nest.sign(agentClaims("review", reviewer.agent, { project: p.id, role: "reviewer", pr: "1", sha: s1, start: reviewer.labels.start! }));
-      await callTool("review", id, "submit_review", { correctness: dim, quality: dim, architecture: dim, summary: "ok" });
+      await callTool("review", id, "submit_review", submitArgs());
       await run(p);
       await dueNow(p);
       await run(p);
@@ -250,7 +249,7 @@ describe("a review nest has no room for", () => {
       // The first review's verdict stops its reviewer: one place. A worker takes it at once (still full).
       const reviewer = live(p, 1)[0]!;
       const id = await nest.sign(agentClaims("review", reviewer.agent, { project: p.id, role: "reviewer", pr: "1", sha: s1, start: reviewer.labels.start! }));
-      await callTool("review", id, "submit_review", { correctness: dim, quality: dim, architecture: dim, summary: "ok" });
+      await callTool("review", id, "submit_review", submitArgs());
       fake.maxAgents = liveAgents();
       await run(p);
       expect(made() - before).toBe(1);

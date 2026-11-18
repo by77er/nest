@@ -2,14 +2,20 @@
 // and a job's reviewer's live trace, one open at a time.
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { Job, Verdict } from "../../api/types";
+import type { Job, Review, Verdict } from "../../api/types";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 import { RecordingSocket } from "../../test/sockets";
 
-const verdict = (quality: "pass" | "fail"): Verdict => ({
-  correctness: { verdict: "pass", notes: "ok" }, quality: { verdict: quality, notes: "q" }, architecture: { verdict: "pass", notes: "a" }, summary: "s",
+const codeReview = (quality: "pass" | "fail", tainted = false): Review => ({
+  reviewer: { id: "code-review", name: "Code review" }, agent: "agt_r", tainted, summary: "s",
+  dimensions: [{ name: "Correctness", verdict: "pass", notes: "ok" }, { name: "Quality", verdict: quality, notes: "q" }, { name: "Architectural cohesiveness", verdict: "pass", notes: "a" }],
 });
+const security = (secrets: "pass" | "fail", tainted = false): Review => ({
+  reviewer: { id: "rv_sec", name: "Security" }, agent: "agt_s", tainted, summary: "sec",
+  dimensions: [{ name: "Secrets", verdict: secrets, notes: "keys" }, { name: "Quality", verdict: "pass", notes: "fine" }],
+});
+const verdict = (quality: "pass" | "fail", tainted = false): Verdict => ({ reviews: [codeReview(quality, tainted)] });
 const job = (pr: number, o: Partial<Job> = {}): Job => ({
   pr, sha: `${pr}`.padEnd(40, "0"), state: "queued", title: `PR ${pr}`, base: "main", agent: null, check_run: null, verdict: null, tainted: null, deadline_ms: null,
   attempts: 0, runs: 1, error: null, author: null, fork: false, approved_ms: null, created_ms: pr, updated_ms: pr, ...o,
@@ -106,12 +112,15 @@ describe("the Reviews page", () => {
     RecordingSocket.opened = [];
     vi.stubGlobal("WebSocket", RecordingSocket);
     const api = new FakeApi();
-    api.reviews = [job(1, { state: "done", verdict: verdict("fail"), runs: 2, tainted: true }), job(3, { state: "running", agent: "agt_rev3" })];
+    api.reviews = [
+      job(1, { state: "done", verdict: verdict("fail", true), runs: 2, tainted: true }), job(3, { state: "running", agent: "agt_rev3" }),
+      job(0, { state: "done", verdict: { reviews: [codeReview("pass"), security("fail", true)] }, tainted: true }),
+    ];
     const { user } = renderApp("/projects/prj_one/reviews", api);
     const list = await screen.findByRole("list", { name: "Review jobs" });
     expect(screen.queryByRole("table")).toBeNull();
     const cards = within(list).getAllByRole("listitem");
-    expect(cards.map((c) => within(c).getAllByRole("link")[0]!.textContent)).toEqual(["#3 PR 3", "#1 PR 1"]);
+    expect(cards.map((c) => within(c).getAllByRole("link")[0]!.textContent)).toEqual(["#3 PR 3", "#1 PR 1", "#0 PR 0"]);
     const done = cards[1]!;
     // Everything the table's row has, in one column: the sha, the verdicts, the runs and when.
     expect(done).toHaveTextContent("1000000 → main");
@@ -121,6 +130,10 @@ describe("the Reviews page", () => {
     const stateRow = within(done).getByText("Tainted").parentElement!.parentElement!;
     expect(stateRow).toHaveTextContent(/Changes needed\s*Tainted/);
     expect(within(cards[0]!).getByRole("button", { name: "Show the trace of #3" })).toHaveTextContent("Show trace");
+    // Several reviewers: Tainted follows the tainted one's badges, so the card says whose; not on its state row.
+    const several = cards.find((c) => c.querySelector("[data-reviewer]"))!;
+    expect(within(several.querySelector('[data-reviewer="rv_sec"]') as HTMLElement).getByText("Tainted")).toBeInTheDocument();
+    expect(within(several).getAllByText("Tainted")).toHaveLength(1);
     // Its trace opens under it.
     await user.click(within(cards[0]!).getByRole("button", { name: "Show the trace of #3" }));
     await waitFor(() => expect(cards[0]!.querySelector("[data-trace]")).not.toBeNull());
@@ -134,13 +147,13 @@ describe("the Reviews page", () => {
 
   it("marks each dimension's verdict by its role and an icon: a failed one danger with a cross", async () => {
     const api = new FakeApi();
-    api.reviews = [job(2, { state: "done", verdict: verdict("fail"), tainted: true })];
+    api.reviews = [job(2, { state: "done", verdict: verdict("fail", true), tainted: true })];
     renderApp("/projects/prj_one/reviews", api);
     // The label is the trigger's (it opens the notes); the badge inside it carries the role.
     const failed = await screen.findByLabelText("Quality: failed");
     expect(failed.querySelector(".mantine-Badge-root")!.getAttribute("style")).toContain("--mantine-color-danger-");
     expect(failed.querySelector(".tabler-icon-x")).not.toBeNull();
-    for (const name of ["Correctness: passed", "Architecture: passed"]) {
+    for (const name of ["Correctness: passed", "Architectural cohesiveness: passed"]) {
       const passed = screen.getByLabelText(name);
       expect(passed.querySelector(".mantine-Badge-root")!.getAttribute("style")).toContain("--mantine-color-success-");
       expect(passed.querySelector(".tabler-icon-check")).not.toBeNull();
@@ -148,5 +161,35 @@ describe("the Reviews page", () => {
     // Tainted isn't a verdict: the neutral outline.
     const tainted = screen.getByText("Tainted").closest(".mantine-Badge-root")!;
     expect(tainted.getAttribute("style")).toContain("--badge-color: var(--nest-muted)");
+    // One reviewer: its badges alone, no reviewer's name over them.
+    expect(screen.queryByText("Code review")).toBeNull();
+  });
+
+  it("several reviewers: each one's name over its own badges, passed or failed, Tainted after the tainted one's", async () => {
+    const api = new FakeApi();
+    api.reviews = [
+      job(5, { state: "done", verdict: { reviews: [codeReview("pass"), security("fail", true)] }, tainted: true }),
+      job(4, { state: "done", verdict: { reviews: [codeReview("pass"), security("pass")] } }),
+    ];
+    renderApp("/projects/prj_one/reviews", api);
+    const table = await screen.findByRole("table", { name: "Review jobs" });
+    const [failedRow, passedRow] = within(table).getAllByRole("row").slice(1);
+    expect(failedRow!.querySelector("[data-state]")).toHaveTextContent("Changes needed");
+    expect(passedRow!.querySelector("[data-state]")).toHaveTextContent("Reviewed");
+    const group = (row: HTMLElement, id: string) => row.querySelector(`[data-reviewer="${id}"]`) as HTMLElement;
+    const code = group(failedRow!, "code-review");
+    const sec = group(failedRow!, "rv_sec");
+    // In the reviewers' order, each named once, over its own dimensions only (both have a Quality).
+    expect([...failedRow!.querySelectorAll("[data-reviewer]")].map((g) => g.getAttribute("data-reviewer"))).toEqual(["code-review", "rv_sec"]);
+    expect(within(code).getByText("Code review")).toBeInTheDocument();
+    expect([...code.querySelectorAll("[aria-label][data-verdict]")].map((b) => b.getAttribute("aria-label"))).toEqual(["Code review, Correctness: passed", "Code review, Quality: passed", "Code review, Architectural cohesiveness: passed"]);
+    expect(within(sec).getByText("Security")).toBeInTheDocument();
+    const secrets = within(sec).getByLabelText("Security, Secrets: failed");
+    expect(secrets.querySelector(".mantine-Badge-root")!.getAttribute("style")).toContain("--mantine-color-danger-");
+    expect(within(sec).getByLabelText("Security, Quality: passed")).toBeInTheDocument();
+    // Tainted after the review whose session was, not the other's.
+    expect(within(sec).getByText("Tainted")).toBeInTheDocument();
+    expect(within(code).queryByText("Tainted")).toBeNull();
+    expect(within(passedRow!).getByLabelText("Security, Secrets: passed")).toBeInTheDocument();
   });
 });

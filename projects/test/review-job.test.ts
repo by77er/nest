@@ -8,7 +8,7 @@ import { resetAccessKeys } from "../src/access";
 import { MAX_RETRIES } from "../src/do/review";
 import { JOB_EVENTS, JOB_STATES, type JobEvent, type JobState, jobTransition, REVIEW_DEADLINE_MS } from "../src/review-job";
 import { catalogFor, NAMESPACE } from "../src/catalog";
-import { AccessTeam, agentClaims, api, callTool, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, deliverGithub, FakeNest, installFetch, prEvent, Signer, submitArgs } from "./fake-nest";
 
 describe("the job table (pure)", () => {
   // The oracle: what the README's review pipeline says, written out here, not read from the code.
@@ -141,8 +141,7 @@ describe("each run's check completes exactly once", () => {
     await run(p);
     const [reviewer] = liveReviewers(p, 1, s);
     const tok = await nest.sign(agentClaims("review", reviewer!.agent, { project: p.id, role: "reviewer", pr: "1", sha: s, start: "1" }));
-    const dim = { verdict: "pass", notes: "n" };
-    const r = await callTool("review", tok, "submit_review", { correctness: dim, quality: dim, architecture: dim, summary: "ok" });
+    const r = await callTool("review", tok, "submit_review", submitArgs());
     expect(r.result?.isError).toBeFalsy();
     await reviews(p).onAgentExited(reviewer!.agent, "done");
     await timePasses(p);

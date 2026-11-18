@@ -12,7 +12,7 @@
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
 // issues or proposals waiting) / "proposals-only" (no issues, two routines' proposals) / "issues-anyone" (issues from
 // anyone) / "triage-dropped" (issues the cap on waiting ones left out) / "issues-no-one" (an org's repo, no comments user:
-// no one's issues come in) / "held-reviews" and "held-many" (reviews waiting for the owner's approval: two, or a dozen with long titles and logins) / "reviews-open" (the review gate turned off) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
+// no one's issues come in) / "held-reviews" and "held-many" (reviews waiting for the owner's approval: two, or a dozen with long titles and logins) / "reviews-open" (the review gate turned off) / "reviewers-several" (verdicts of two reviewers) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
 // routines, runs, proposals or notes) / "routines-long" (many and long runs, proposals and notes). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
@@ -340,7 +340,26 @@ const RICH = [
   };
   const demo = { id: "prj_demo", name, repo, created_ms: now - DAY * 3, settings };
   const other = { id: "prj_other", name: "Widgets", repo: "by77er/widgets", created_ms: now - DAY * 9 };
-  const verdict = (ok) => ({ correctness: { verdict: "pass", notes: "Tests cover the parser." }, quality: { verdict: ok ? "pass" : "fail", notes: ok ? "Clear." : "The query builder repeats itself." }, architecture: { verdict: "pass", notes: "Fits the routes layer." }, summary: ok ? "Good to merge." : "One change needed." });
+  // A verdict: one review per reviewer (src/reviewers.ts), the built-in "Code review" alone unless the variant is "reviewers-several".
+  const codeReview = (ok, tainted = false) => ({
+    reviewer: { id: "code-review", name: "Code review" }, agent: "agt_r9k2", tainted,
+    dimensions: [
+      { name: "Correctness", verdict: "pass", notes: "Tests cover the parser." },
+      { name: "Quality", verdict: ok ? "pass" : "fail", notes: ok ? "Clear." : "The query builder repeats itself." },
+      { name: "Architectural cohesiveness", verdict: "pass", notes: "Fits the routes layer." },
+    ],
+    summary: ok ? "Good to merge." : "One change needed.",
+  });
+  const securityReview = (ok, tainted = false) => ({
+    reviewer: { id: "rv_security", name: "Security and secrets handling" }, agent: "agt_s4m1", tainted,
+    dimensions: [
+      { name: "Secrets", verdict: ok ? "pass" : "fail", notes: ok ? "No credentials in the diff." : "The test fixture commits an API key." },
+      { name: "Input validation", verdict: "pass", notes: "Every handler checks its query." },
+    ],
+    summary: ok ? "Nothing found." : "Remove the key.",
+  });
+  // `tainted`: both sessions; `securityTainted`: only the second reviewer's.
+  const verdict = (ok, o = {}) => ({ reviews: [codeReview(ok, o.tainted), ...(variant === "reviewers-several" ? [securityReview(o.secure ?? true, o.tainted || o.securityTainted)] : [])] });
   const job = (pr, title, state, o = {}) => ({ pr, sha: (pr * 7919).toString(16).padEnd(40, "a"), state, title, base: "main", agent: state === "running" ? "agt_r9k2" : null, check_run: 1000 + pr, verdict: null, tainted: null, attempts: 0, runs: 1, error: null, author: null, fork: false, approved_ms: null, created_ms: now - pr * 60_000, updated_ms: now - pr * 30_000, ...o });
   // "held-many": a dozen reviews waiting for approval, with long titles and logins, one past the cap, among the rest.
   const LONG = "Rework the gadget importer so that malformed rows are reported per line, the rest of the file still loads, and the summary names every column that was skipped";
@@ -360,8 +379,8 @@ const RICH = [
     job(121, "Search: tag suggestions in the filter bar", "done", { verdict: verdict(false), runs: 2 }),
     job(119, "Search: build the tag index", "done", { verdict: verdict(true) }),
     job(118, "Add search by tag", "running"),
-    job(117, "Paginate the gadget list", "done", { verdict: verdict(true), tainted: true }),
-    job(116, "Cache gadget thumbnails", "done", { verdict: verdict(false), tainted: true, runs: 2 }),
+    job(117, "Paginate the gadget list", "done", { verdict: verdict(true, { tainted: variant !== "reviewers-several", securityTainted: true, secure: false }), tainted: true }),
+    job(116, "Cache gadget thumbnails", "done", { verdict: verdict(false, { tainted: true }), tainted: true, runs: 2 }),
     job(115, "Rate-limit the public API", "failed", { error: "The reviewer exited three times without a verdict.", runs: 3 }),
     job(114, "Write the 0.5 changelog", "superseded"),
   ];

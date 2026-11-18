@@ -33,11 +33,6 @@ const strs = (description: string) => ({ type: "array", items: { type: "string",
 const taskId = str("The task's id (tsk_…).", 64);
 /** A wait's timeout: 10 s to 30 days (src/waits.ts). */
 const timeout = { type: "integer", minimum: 10, maximum: 30 * 24 * 3600, description: "How long to wait at most, in seconds (10 s to 30 days)." };
-const dimension = (question: string) => ({
-  ...obj({ verdict: { type: "string", enum: ["pass", "fail"], description: question }, notes: str("Why: specific files, lines and reasons.", 20000) }, ["verdict", "notes"]),
-  description: question,
-});
-
 /** On /mcp/board and /mcp/task: asking the owner for a secret, never for its value (README.md#secrets). */
 const REQUEST_SECRET: ToolDef = {
   name: "request_secret",
@@ -189,16 +184,25 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     ...MEMORY_READ,
   ],
   review: [
-    { name: "review_get", description: "The PR you review, as the app knows it: its repo, number, head commit (sha), base branch and title.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    {
+      name: "review_get",
+      description: "The PR you review, as the app knows it: its repo, number, head commit (sha), base branch and title; and the reviewer you review it as: its name, its dimensions and its instructions.",
+      inputSchema: obj({}), readOnly: true, idempotent: true,
+    },
     {
       name: "submit_review",
-      description: "Your review, once: pass or fail for each of correctness, quality and architectural cohesiveness, each with specific notes, and a summary. The PR's check passes only if all three pass.",
+      description: "Your review, once: pass or fail for each of your reviewer's dimensions (your brief and review_get name them), each exactly once with specific notes, and a summary. The PR's check passes only if every dimension passes. A call that misses a dimension, names one twice or names one that isn't your reviewer's is refused, saying which, and records nothing: submit again.",
       inputSchema: obj({
-        correctness: dimension("Does it do what it claims, without bugs?"),
-        quality: dimension("Is it clear, tested, and free of needless code?"),
-        architecture: dimension("Does it fit the repo's design, docs and conventions?"),
+        verdicts: {
+          type: "array", maxItems: 20, description: "One entry per dimension of your reviewer.",
+          items: obj({
+            dimension: str("The dimension's name, as your brief gives it.", 200),
+            verdict: { type: "string", enum: ["pass", "fail"], description: "pass, or fail for a real problem." },
+            notes: str("Why: specific files, lines and reasons; for a fail, what would fix it.", 20000),
+          }, ["dimension", "verdict", "notes"]),
+        },
         summary: str("The review's summary, shown as the check's summary.", 20000),
-      }, ["correctness", "quality", "architecture", "summary"]),
+      }, ["verdicts", "summary"]),
     },
   ],
   // A routine run (README.md#routines): it reads, proposes and keeps memory; it never assigns, starts or changes work.

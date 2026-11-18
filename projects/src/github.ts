@@ -14,6 +14,7 @@
 
 import type { Env } from "./env";
 import { AppTokens } from "./github-app";
+import { builtInAlone, type Review, reviewPassed, type Verdict, verdictPassed } from "./reviewers";
 
 export const GITHUB_API = "https://api.github.com";
 /** GitHub's REST version header (https://docs.github.com/en/rest/about-the-rest-api/api-versions). */
@@ -497,21 +498,32 @@ export function clip(s: string, max: number): string {
   return s.slice(0, cut) + marker;
 }
 
-export const DIMENSIONS = ["correctness", "quality", "architecture"] as const;
-export type Dimension = (typeof DIMENSIONS)[number];
-export type Verdict = Record<Dimension, { verdict: "pass" | "fail"; notes: string }> & { summary: string };
+const TAINTED = "yes (its session read untrusted content, such as the PR itself, which could have steered this verdict)";
+const reviewerLine = (r: Review) => `Reviewer: ${r.agent}. Tainted: ${r.tainted ? TAINTED : "no"}.`;
+const failedNames = (r: Review) => r.dimensions.filter((d) => d.verdict !== "pass").map((d) => d.name.toLowerCase()).join(", ");
+const dimensionSections = (r: Review) => r.dimensions.map((d) => `## ${d.name}: ${d.verdict}\n\n${d.notes}`);
 
-const LABEL: Record<Dimension, string> = { correctness: "Correctness", quality: "Quality", architecture: "Architectural cohesiveness" };
-
-/** The conclusion and output a verdict completes its check with: success only if all three pass. */
-export function verdictCheck(v: Verdict, o: { agent: string; tainted: boolean }): { conclusion: "success" | "failure"; output: CheckOutput } {
-  const failed = DIMENSIONS.filter((d) => v[d].verdict !== "pass");
-  const conclusion = failed.length === 0 ? "success" : "failure";
-  const title = failed.length === 0 ? "Review passed" : `Review failed: ${failed.map((d) => LABEL[d].toLowerCase()).join(", ")}`;
-  const text = [
-    ...DIMENSIONS.map((d) => `## ${LABEL[d]}: ${v[d].verdict}\n\n${v[d].notes}`),
-    "---",
-    `Reviewer: ${o.agent}. Tainted: ${o.tainted ? "yes (its session read untrusted content, such as the PR itself, which could have steered this verdict)" : "no"}.`,
-  ].join("\n\n");
-  return { conclusion, output: { title: clip(title, TITLE_MAX), summary: clip(v.summary || "(no summary)", OUTPUT_MAX), text: clip(text, OUTPUT_MAX) } };
+/**
+ * The conclusion and output a verdict completes its check with: success only if every dimension of every
+ * review passes. The built-in reviewer alone reads as it always has (the title names the failed dimensions,
+ * the summary is the reviewer's); several reviews get a section each, and the title names each failed
+ * reviewer with its failed dimensions.
+ */
+export function verdictCheck(v: Verdict): { conclusion: "success" | "failure"; output: CheckOutput } {
+  const conclusion = verdictPassed(v) ? "success" : "failure";
+  let title: string, summary: string, text: string;
+  if (builtInAlone(v)) {
+    const r = v.reviews[0]!;
+    title = conclusion === "success" ? "Review passed" : `Review failed: ${failedNames(r)}`;
+    summary = r.summary || "(no summary)";
+    text = [...dimensionSections(r), "---", reviewerLine(r)].join("\n\n");
+  } else {
+    const failed = v.reviews.filter((r) => !reviewPassed(r));
+    title = conclusion === "success" ? "Review passed"
+      : failed.length ? `Review failed: ${failed.map((r) => `${r.reviewer.name} (${failedNames(r) || "nothing judged"})`).join("; ")}`
+      : "Review failed: no review";
+    summary = v.reviews.map((r) => `**${r.reviewer.name}** (${reviewPassed(r) ? "passed" : "failed"}): ${r.summary || "(no summary)"}`).join("\n\n") || "(no review)";
+    text = v.reviews.map((r) => [`# ${r.reviewer.name}: ${reviewPassed(r) ? "passed" : "failed"}`, ...dimensionSections(r), reviewerLine(r)].join("\n\n")).join("\n\n---\n\n");
+  }
+  return { conclusion, output: { title: clip(title, TITLE_MAX), summary: clip(summary, OUTPUT_MAX), text: clip(text, OUTPUT_MAX) } };
 }

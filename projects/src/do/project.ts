@@ -12,7 +12,8 @@ import { roleTemplate, TEMPLATE, writeSharedTemplate } from "../catalog";
 import { DEFAULT_MODEL, modelLabel, type ModelRole, modelProblem } from "../models";
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
-import { type AttachChange, DIMENSIONS, GitHubError, githubFor, ownInstallation, PERMISSIONS, requireReviewCheck, type Verdict } from "../github";
+import { type AttachChange, GitHubError, githubFor, ownInstallation, PERMISSIONS, requireReviewCheck } from "../github";
+import { reviewPassed, type Verdict, verdictPassed } from "../reviewers";
 import type { AgentCaller } from "../identity";
 import { type AgentView, backoff, clientIdOf, HOSTS_WAIT, NestError, nestFrom, type Nest, type SandboxExtras, type SpawnOverrides, stopRefused } from "../nest";
 import { envName, MAX_BINDINGS, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
@@ -4289,8 +4290,11 @@ export class ProjectDO extends DurableObject<Env> {
       .map((j) => ({
         pr: j.pr, sha: j.sha, title: j.title, state: j.state, at_ms: j.updated_ms,
         verdict: j.verdict === null ? null : {
-          summary: j.verdict.summary.slice(0, 2000),
-          ...Object.fromEntries(DIMENSIONS.map((d) => [d, { verdict: j.verdict![d].verdict, notes: j.verdict![d].notes.slice(0, 1000) }])),
+          passed: verdictPassed(j.verdict),
+          reviews: j.verdict.reviews.map((r) => ({
+            reviewer: r.reviewer.name, passed: reviewPassed(r), summary: r.summary.slice(0, 2000),
+            dimensions: r.dimensions.map((d) => ({ name: d.name, verdict: d.verdict, notes: d.notes.slice(0, 1000) })),
+          })),
         },
       }));
     return { since_ms: since, merged_prs: merged, tasks_done: done, reviews, pr_comments: comments };
@@ -5787,11 +5791,9 @@ function toWait(r: Row): Wait {
 /** A start's sandbox extras for its frozen rules: none when there are none (the request as before). */
 
 /** A review job's end, in a word: its verdict's conclusion, or that it failed. */
-function reviewConclusion(j: { state: string; verdict: unknown }): string {
+export function reviewConclusion(j: { state: string; verdict: Verdict | null }): string {
   if (j.state === "failed") return "failed without a verdict";
-  const v = j.verdict as { correctness?: { verdict: string }; quality?: { verdict: string }; architecture?: { verdict: string } } | null;
-  const all = v && [v.correctness, v.quality, v.architecture].every((d) => d?.verdict === "pass");
-  return all ? "passed" : "failed";
+  return j.verdict && verdictPassed(j.verdict) ? "passed" : "failed";
 }
 
 /** How long a declined proposal's title can't be proposed again (within the triaged proposals' keep). */

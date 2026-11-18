@@ -12,6 +12,7 @@ import { Row, TaskCards, TaskChipPending, TaskRefCard } from "../../layout";
 import { REVIEW_STATE } from "../../status";
 import { taskLine } from "../../rich/tasks";
 import { StateBadge } from "../board/StateBadge";
+import { changesNeeded } from "../reviews/ReviewsPage";
 import { TaskCardBody } from "../board/TaskCardBody";
 
 export function TaskChip({ projectId, id, fallback }: { projectId: string; id: string; fallback: ReactNode }) {
@@ -32,8 +33,7 @@ export function TaskChip({ projectId, id, fallback }: { projectId: string; id: s
 
 function Verdict({ job }: { job: Job | undefined }) {
   if (!job) return null;
-  const failed = job.state === "done" && job.verdict && (["correctness", "quality", "architecture"] as const).some((d) => job.verdict![d].verdict !== "pass");
-  const s = failed ? { label: "Changes needed", color: "danger" as const } : REVIEW_STATE[job.state];
+  const s = changesNeeded(job) ? { label: "Changes needed", color: "danger" as const } : REVIEW_STATE[job.state];
   return (
     <Badge size="sm" variant="light" color={s.color}>
       {s.label}

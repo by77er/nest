@@ -16,7 +16,12 @@ const now = Date.now();
 const job = (pr: number, o: Partial<Job> = {}): Job => ({
   pr, sha: "a".repeat(40), state: "done", title: null, base: "main", agent: "agt_r", check_run: 1, tainted: false, deadline_ms: null, attempts: 0, runs: 1, error: null,
   author: null, fork: false, approved_ms: null, created_ms: now - 1000, updated_ms: now,
-  verdict: { correctness: { verdict: "pass", notes: "" }, quality: { verdict: "fail", notes: "" }, architecture: { verdict: "pass", notes: "" }, summary: "s" },
+  verdict: {
+    reviews: [{
+      reviewer: { id: "code-review", name: "Code review" }, agent: "agt_r", tainted: false, summary: "s",
+      dimensions: [{ name: "Correctness", verdict: "pass", notes: "" }, { name: "Quality", verdict: "fail", notes: "" }, { name: "Architectural cohesiveness", verdict: "pass", notes: "" }],
+    }],
+  },
   ...o,
 });
 const pr = (number: number, o: Partial<TaskPr> = {}): TaskPr => ({ number, state: "open", title: `PR ${number}`, fork: false, attached_by: "owner", attached_ms: now, auto_merge: null, ...o });
