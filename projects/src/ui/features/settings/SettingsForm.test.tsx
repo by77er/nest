@@ -336,6 +336,21 @@ describe("the models in the settings", () => {
     expect(await save(3)).toMatchObject({ reviewer_model: null, routine_model: null });
   });
 
+  it("a reviewers' or routines' model the server leaves out reads as the default, and is saved as null", async () => {
+    const api = new FakeApi();
+    const settings = api.projects[0]!.settings as Partial<typeof api.projects[0]["settings"]>;
+    delete settings.reviewer_model;
+    delete settings.routine_model;
+    const { user, dialog } = await openSettings(api);
+    expect(select(dialog, "Reviewers' model")).toHaveValue("Claude Code's default");
+    expect(select(dialog, "Routines' model")).toHaveValue("Claude Code's default");
+    await user.click(select(dialog, "Workers' model"));
+    await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    expect(api.writes[0]!.body).toMatchObject({ reviewer_model: null, routine_model: null });
+  });
+
   it("an unlisted reviewers' or routines' model shows as Custom with its id", async () => {
     const api = new FakeApi();
     api.projects[0]!.settings.routine_model = "us.anthropic.claude-haiku-5-5";

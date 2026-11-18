@@ -84,7 +84,9 @@ const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", 
 
 const values = (s: Settings) => ({
   auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows,
-  manager_model: s.manager_model, worker_model: s.worker_model, reviewer_model: s.reviewer_model, routine_model: s.routine_model, issues_from: s.issues_from,
+  manager_model: s.manager_model, worker_model: s.worker_model,
+  // One a server leaves out (a release before them) reads as Claude Code's default, as the server's own null.
+  reviewer_model: s.reviewer_model ?? null, routine_model: s.routine_model ?? null, issues_from: s.issues_from,
   comments_from_login: s.comments_from?.login ?? null,
   // "Use the repo owner": the server takes the repo's owner by id, never this login.
   comments_from_repo_owner: false,
