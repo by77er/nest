@@ -1,9 +1,9 @@
 // The Reviews page: ReviewDO's jobs, newest first, each state in its role (a done job by its verdict),
-// and a job's reviewer's live trace, one open at a time.
+// and a job's reviewer's live trace, one open at a time; under them, the project's reviewers, managed there.
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { Job, Review, Verdict } from "../../api/types";
-import { FakeApi } from "../../test/fakeApi";
+import { FakeApi, reviewer } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 import { RecordingSocket } from "../../test/sockets";
 
@@ -162,7 +162,7 @@ describe("the Reviews page", () => {
     const tainted = screen.getByText("Tainted").closest(".mantine-Badge-root")!;
     expect(tainted.getAttribute("style")).toContain("--badge-color: var(--nest-muted)");
     // One reviewer: its badges alone, no reviewer's name over them.
-    expect(screen.queryByText("Code review")).toBeNull();
+    expect(within(screen.getByRole("table", { name: "Review jobs" })).queryByText("Code review")).toBeNull();
   });
 
   it("several reviewers: each one's name over its own badges, passed or failed, Tainted after the tainted one's", async () => {
@@ -191,5 +191,173 @@ describe("the Reviews page", () => {
     expect(within(sec).getByText("Tainted")).toBeInTheDocument();
     expect(within(code).queryByText("Tainted")).toBeNull();
     expect(within(passedRow!).getByLabelText("Security, Secrets: passed")).toBeInTheDocument();
+  });
+});
+
+describe("the Reviewers section", () => {
+  const card = async (name: string) => (await screen.findByRole("heading", { name, level: 4 })).closest("[data-reviewer]") as HTMLElement;
+
+  it("a new project's built-in alone: its dimensions, no Off, no author, no Tainted; how reviewers run, said once; no warning", async () => {
+    const api = new FakeApi();
+    renderApp("/projects/prj_one/reviews", api);
+    const section = await screen.findByRole("region", { name: /^Reviewers/ });
+    const code = await card("Code review");
+    expect(within(code).getByText("Correctness · Quality · Architectural cohesiveness")).toBeInTheDocument();
+    expect(code).not.toHaveTextContent(/Off|By |manager|Tainted/);
+    expect(within(code).getByRole("button", { name: "Edit Code review" })).toBeInTheDocument();
+    expect(within(section).getAllByText(/one after another/)).toHaveLength(1);
+    expect(section).toHaveTextContent("Every reviewer that's on reviews each PR head, one after another; the review check passes only if all of them pass.");
+    expect(screen.queryByText("No reviewer is on")).toBeNull();
+  });
+
+  it("a manager-written tainted reviewer (its mark explains itself) and one that's off", async () => {
+    const api = new FakeApi();
+    api.reviewers = [
+      reviewer(),
+      reviewer({ id: "rvw_sec", name: "Security", dimensions: ["Secrets", "Injection"], source: "manager", tainted: true }),
+      reviewer({ id: "rvw_docs", name: "Docs", dimensions: ["Accuracy"], enabled: false }),
+    ];
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    const sec = await card("Security");
+    expect(sec).toHaveTextContent("By the manager");
+    expect(sec).not.toHaveTextContent(/\bOff\b/);
+    const mark = within(sec).getByLabelText(/^Tainted: the reviewer Security — Written by an agent that read untrusted text/);
+    await user.hover(mark);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Written by an agent that read untrusted text (an issue, a PR, the web).");
+    const docs = await card("Docs");
+    expect(within(docs).getByText("Off")).toBeInTheDocument();
+    expect(docs).not.toHaveTextContent(/By |Tainted/);
+    expect((await card("Code review")).querySelector("[data-slot=status]")).toBeNull();
+    // The editor says the tainted one's text is the manager's, and that saving makes it the owner's.
+    await user.click(within(sec).getByRole("button", { name: "Edit Security" }));
+    const sheet = await screen.findByRole("dialog", { name: "Edit Security" });
+    expect(sheet).toHaveTextContent("Its name, instructions or dimensions were last written by the manager, in a session that read untrusted text (an issue, a PR, the web). Check them: saving makes them yours.");
+    await user.click(within(sheet).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.writes.find((w) => w.method === "PATCH")).toEqual({ method: "PATCH", path: "/api/projects/prj_one/reviewers/rvw_sec", body: { name: "Security", instructions: expect.any(String), dimensions: ["Secrets", "Injection"], enabled: true } }));
+    await waitFor(() => expect(screen.queryByLabelText(/^Tainted: the reviewer Security/)).toBeNull());
+  });
+
+  it("none on: a warning in the section, and at the top of the page while reviews are listed above it", async () => {
+    const api = new FakeApi();
+    api.reviewers = [reviewer({ enabled: false })];
+    api.reviews = [job(1, { state: "done", verdict: null })];
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    const section = await screen.findByRole("region", { name: /^Reviewers/ });
+    await within(section).findByText("No reviewer is on");
+    expect(section).toHaveTextContent("PRs aren't reviewed, and the required check passes without a review.");
+    expect(screen.getAllByText("No reviewer is on")).toHaveLength(2);
+    await user.click(screen.getByRole("button", { name: "Go to reviewers" }));
+    expect(screen.getByRole("heading", { name: "Reviewers" })).toHaveFocus();
+  });
+
+  it("empty: no reviewers says so, with the warning; Add offers the built-in", async () => {
+    const api = new FakeApi();
+    api.reviewers = [];
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    expect(await screen.findByText("No reviewers")).toBeInTheDocument();
+    expect(screen.getByText("No reviewer is on")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add reviewer" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Code review" }));
+    await waitFor(() => expect(api.writes).toContainEqual({ method: "POST", path: "/api/projects/prj_one/reviewers", body: { preset: "code" } }));
+    expect(await card("Code review")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("No reviewer is on")).toBeNull());
+    // With the built-in there, Add opens the editor for a custom one: no menu of one.
+    await user.click(screen.getByRole("button", { name: "Add reviewer" }));
+    expect(await screen.findByRole("dialog", { name: "New reviewer" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Code review" })).toBeNull();
+  });
+
+  it("a custom reviewer: checked with the Worker's schema before it's sent (empty name, duplicate dimension, at most 6), then added", async () => {
+    const api = new FakeApi();
+    api.reviewers = [];
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    await user.click(await screen.findByRole("button", { name: "Add reviewer" }));
+    await user.click(await screen.findByRole("menuitem", { name: /Custom reviewer/ }));
+    const sheet = await screen.findByRole("dialog", { name: "New reviewer" });
+    await user.type(within(sheet).getByRole("textbox", { name: "Instructions" }), "Look for leaked secrets.");
+    await user.type(within(sheet).getByRole("textbox", { name: "Dimension 1" }), "Secrets");
+    await user.click(within(sheet).getByRole("button", { name: "Add dimension" }));
+    await user.type(within(sheet).getByRole("textbox", { name: "Dimension 2" }), " secrets ");
+    await user.click(within(sheet).getByRole("button", { name: "Add reviewer" }));
+    expect(await within(sheet).findByText("Too small: expected string to have >=1 characters")).toBeInTheDocument();
+    expect(within(sheet).getByRole("textbox", { name: "Dimension 2" })).toHaveAccessibleDescription(/is there twice/);
+    expect(api.writes).toEqual([]);
+    await user.type(within(sheet).getByRole("textbox", { name: "Name" }), "Security");
+    await user.clear(within(sheet).getByRole("textbox", { name: "Dimension 2" }));
+    await user.type(within(sheet).getByRole("textbox", { name: "Dimension 2" }), "Injection");
+    // Up to six: then Add dimension is off and says why; a removed one makes room again.
+    for (let i = 3; i <= 6; i++) {
+      await user.click(within(sheet).getByRole("button", { name: "Add dimension" }));
+      await user.type(within(sheet).getByRole("textbox", { name: `Dimension ${i}` }), `D${i}`);
+    }
+    expect(within(sheet).getByRole("button", { name: "Add dimension" })).toBeDisabled();
+    expect(sheet).toHaveTextContent("At most 6: remove one to add another.");
+    await user.click(within(sheet).getByRole("button", { name: "Remove dimension 6 (D6)" }));
+    expect(within(sheet).getByRole("button", { name: "Add dimension" })).toBeEnabled();
+    await user.click(within(sheet).getByRole("button", { name: "Remove dimension 5 (D5)" }));
+    await user.click(within(sheet).getByRole("button", { name: "Remove dimension 3 (D3)" }));
+    await user.click(within(sheet).getByRole("button", { name: "Add reviewer" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/reviewers", body: { name: "Security", instructions: "Look for leaked secrets.", dimensions: ["Secrets", "Injection", "D4"], enabled: true } }]));
+    expect(await card("Security")).toHaveTextContent("Secrets · Injection · D4");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "New reviewer" })).toBeNull());
+  });
+
+  it("the Worker's refusal is shown in the form; the list follows the manager's changes without a reload", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = new FakeApi();
+      const { user } = renderApp("/projects/prj_one/reviews", api);
+      await user.click(await screen.findByRole("button", { name: "Edit Code review" }));
+      const sheet = await screen.findByRole("dialog", { name: "Edit Code review" });
+      api.fail(/PATCH .*\/reviewers\/code-review/, 400, "dimensions: dimension names must differ");
+      await user.click(within(sheet).getByRole("button", { name: "Save" }));
+      expect(await within(sheet).findByRole("alert")).toHaveTextContent("dimension names must differ");
+      // The manager adds a reviewer of its own; the next poll shows it.
+      api.reviewers = [...api.reviewers, reviewer({ id: "rvw_m", name: "Licences", dimensions: ["Licences"], source: "manager" })];
+      await vi.advanceTimersByTimeAsync(16_000);
+      expect(await card("Licences")).toHaveTextContent("By the manager");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Delete is last in the editor, confirmed, Keep it the default; the only one on says what deleting it means", async () => {
+    const api = new FakeApi();
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    await user.click(await screen.findByRole("button", { name: "Edit Code review" }));
+    const sheet = await screen.findByRole("dialog", { name: "Edit Code review" });
+    const buttons = within(sheet).getAllByRole("button").map((b) => b.textContent);
+    expect(buttons.at(-1)).toBe("Delete reviewer");
+    await user.click(within(sheet).getByRole("button", { name: "Delete reviewer" }));
+    const confirm = await screen.findByRole("dialog", { name: "Delete Code review?" });
+    expect(confirm).toHaveTextContent("It's the only reviewer on: without it, PRs aren't reviewed, and the required check passes without a review.");
+    expect(within(confirm).getByRole("button", { name: "Keep it" })).toHaveFocus();
+    await user.click(within(confirm).getByRole("button", { name: "Keep it" }));
+    expect(api.writes).toEqual([]);
+    await user.click(within(sheet).getByRole("button", { name: "Delete reviewer" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Delete Code review?" })).getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "DELETE", path: "/api/projects/prj_one/reviewers/code-review", body: undefined }]));
+    expect(await screen.findByText("No reviewers")).toBeInTheDocument();
+  });
+
+  it("at the limit, Add reviewer is off and says why", async () => {
+    const api = new FakeApi();
+    api.reviewers = Array.from({ length: 8 }, (_, i) => reviewer({ id: `rvw_${i}`, name: `Reviewer ${i}`, dimensions: ["Quality"] }));
+    renderApp("/projects/prj_one/reviews", api);
+    await card("Reviewer 7");
+    const add = screen.getByRole("button", { name: "Add reviewer" });
+    expect(add).toBeDisabled();
+    expect(add).toHaveAccessibleDescription("A project holds at most 8 reviewers: delete one to add another.");
+  });
+
+  it("loading and error, as the Routines page has them", async () => {
+    const api = new FakeApi();
+    api.fail(/GET .*\/reviewers$/, 500, "ReviewDO is down");
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    const section = await screen.findByRole("region", { name: /^Reviewers/ });
+    expect(await within(section).findByText("The reviewers couldn't be loaded")).toBeInTheDocument();
+    expect(within(section).queryByText("No reviewer is on")).toBeNull();
+    await user.click(within(section).getByRole("button", { name: /Retry|Try again/ }));
+    expect(await card("Code review")).toBeInTheDocument();
   });
 });

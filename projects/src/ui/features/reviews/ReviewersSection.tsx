@@ -8,9 +8,10 @@
 import { Badge, Button, Menu, Text, Title } from "@mantine/core";
 import { modals } from "@mantine/modals";
 import { IconChevronDown, IconPlus, IconShieldCheck } from "@tabler/icons-react";
+import type { UseQueryResult } from "@tanstack/react-query";
 import { type RefObject, useId, useState } from "react";
 import { MAX_REVIEWERS, REVIEWER_PRESET_IDS } from "../../../requests";
-import { useAddReviewerPreset, useDeleteReviewer, useReviewers } from "../../api/queries";
+import { useAddReviewerPreset, useDeleteReviewer } from "../../api/queries";
 import type { Reviewer } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Row, Section, SectionGrid, Sheet, Stack } from "../../layout";
@@ -81,8 +82,8 @@ function ReviewerCard({ r, onEdit }: { r: Reviewer; onEdit: () => void }) {
   );
 }
 
-export function ReviewersSection({ projectId, headingRef }: { projectId: string; headingRef?: RefObject<HTMLHeadingElement | null> }) {
-  const reviewers = useReviewers(projectId);
+/** `reviewers`: the page's `useReviewers`, which its own warning reads too. */
+export function ReviewersSection({ projectId, reviewers, headingRef }: { projectId: string; reviewers: UseQueryResult<Reviewer[]>; headingRef?: RefObject<HTMLHeadingElement | null> }) {
   const del = useDeleteReviewer(projectId);
   const [editing, setEditing] = useState<Reviewer | "new" | null>(null);
   const fullId = useId();

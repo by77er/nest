@@ -12,7 +12,7 @@
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
 // issues or proposals waiting) / "proposals-only" (no issues, two routines' proposals) / "issues-anyone" (issues from
 // anyone) / "triage-dropped" (issues the cap on waiting ones left out) / "issues-no-one" (an org's repo, no comments user:
-// no one's issues come in) / "held-reviews" and "held-many" (reviews waiting for the owner's approval: two, or a dozen with long titles and logins) / "reviews-open" (the review gate turned off) / "reviewers-several" (verdicts of two reviewers) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
+// no one's issues come in) / "held-reviews" and "held-many" (reviews waiting for the owner's approval: two, or a dozen with long titles and logins) / "reviews-open" (the review gate turned off) / "reviewers-several" (verdicts of two reviewers) / "reviewers-none-on", "reviewers-empty", "reviewers-full" and "reviewers-error" (the project's reviewers: all off, none, the limit, failing to load) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
 // routines, runs, proposals or notes) / "routines-long" (many and long runs, proposals and notes). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
@@ -457,6 +457,25 @@ const RICH = [
     workflows_refused: variant === "workflows-refused" ? "the GitHub App's installation doesn't grant workflows: write" : null,
   };
 
+  // The project's reviewers (README.md#reviewers): the built-in; the manager's, written in a session that read
+  // an issue ("By the manager", "Tainted"); one off. "reviewers-none-on": every one off; "reviewers-empty": none;
+  // "reviewers-full": the limit (8), long names and instructions; "reviewers-error": the list fails to load.
+  const reviewer = (id, name, dimensions, o = {}) => ({
+    id, name, dimensions, instructions: "Judge each dimension separately, from the PR's diff and the repo's own docs.", enabled: true, source: "owner", tainted: false, created_ms: now - 9 * DAY, updated_ms: now - 2 * DAY, ...o,
+  });
+  const CODE_REVIEW = reviewer("code-review", "Code review", ["Correctness", "Quality", "Architectural cohesiveness"], {
+    instructions: "Judge three things separately: correctness (does it do what it claims, without bugs or regressions), quality (clear, tested, no needless code) and architectural cohesiveness (does it fit the repo's design; read its own docs, READMEs and conventions to judge that).",
+  });
+  const reviewers = variant === "reviewers-empty" ? []
+    : variant === "reviewers-full" ? [CODE_REVIEW, ...Array.from({ length: 7 }, (_, k) => reviewer(`rvw_full${k}`, k % 2 ? `Reviewer ${k + 2}` : `Accessibility and internationalisation of every user-facing string, form and page (${k + 2})`, k % 2 ? ["Quality"] : ["Contrast", "Keyboard reach", "Screen-reader labels", "Right-to-left layouts", "Translatable strings", "Date and number formats"], {
+      instructions: "Check every changed page and form against WCAG 2.2 AA, and every user-facing string for translation: no concatenated sentences, no hard-coded formats. ".repeat(4), enabled: k !== 3 }))]
+    : [
+      { ...CODE_REVIEW, enabled: variant !== "reviewers-none-on" },
+      reviewer("rvw_sec7k2", "Security", ["Secrets", "Input validation"], { source: "manager", tainted: true, enabled: variant !== "reviewers-none-on", updated_ms: now - 3 * 3_600_000,
+        instructions: "Look for credentials committed in the diff, and for any handler that reads a query or body without checking it." }),
+      reviewer("rvw_docs3m", "Docs", ["Accuracy"], { enabled: false, instructions: "Check that every changed behaviour is described in the README that owns it." }),
+    ];
+
   // Routines (README.md#routines): the two presets (review running, dreaming cooling down), a custom one
   // off, and the manager's (tainted); their runs in each outcome; proposals waiting; memory notes (one written by a routine, tainted).
   const noRoutines = variant === "routines-empty";
@@ -566,7 +585,8 @@ const RICH = [
       const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
       return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
     }
-    const routes = { "": demo, "/tasks": variant === "board-empty" ? [] : tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": variant === "manager-ended"
+    if (variant === "reviewers-error" && q === "/reviewers") return [500, { error: "ReviewDO didn't answer" }];
+    const routes = { "": demo, "/reviewers": reviewers, "/tasks": variant === "board-empty" ? [] : tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": variant === "manager-ended"
       // Ended past its automatic restarts (README.md#the-manager-lifecycle): the owner's Restart.
       ? { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited), 4 times within an hour: restart it when you're ready." }
       : { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null },

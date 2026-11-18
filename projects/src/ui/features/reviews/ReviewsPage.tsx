@@ -281,7 +281,7 @@ export function ReviewsPage() {
               </TableFrame>
             )}
           </Section>
-          <ReviewersSection projectId={projectId} headingRef={reviewersHeading} />
+          <ReviewersSection projectId={projectId} reviewers={reviewers} headingRef={reviewersHeading} />
         </Stack>
       )}
     </ProjectFrame>
