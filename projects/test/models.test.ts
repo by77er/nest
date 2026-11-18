@@ -12,8 +12,8 @@ import { DEFAULT_MODEL, MODELS, modelLabel, modelProblem, modelTemplateEntry } f
 import { AccessTeam, api, deliver, deliverGithub, FakeNest, installFetch, prEvent } from "./fake-nest";
 
 describe("model ids", () => {
-  it("the defaults are the owner's: the manager on Fable 5.2, workers on Opus 5.5, both among the listed ones", () => {
-    expect(DEFAULT_MODEL).toEqual({ manager: "claude-fable-5-2", worker: "claude-opus-5-5" });
+  it("the defaults are the owner's: the manager on Fable 5.2, workers, reviewers and routine runs on Opus 5.5, all among the listed ones", () => {
+    expect(DEFAULT_MODEL).toEqual({ manager: "claude-fable-5-2", worker: "claude-opus-5-5", reviewer: "claude-opus-5-5", routine: "claude-opus-5-5" });
     expect(MODELS.map((m) => m.id)).toEqual(["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
     expect(modelLabel("claude-fable-5-2")).toBe("Fable 5.2");
     expect(modelLabel("my-own")).toBe("my-own");
@@ -53,8 +53,8 @@ describe("model ids", () => {
     const shared = catalogFor("https://projects.example").templates as Record<string, { launch: Record<string, unknown> }>;
     for (const role of ["reviewer", "routine", "dreaming"] as const) {
       const base = shared[TEMPLATE[role]]!;
-      // The shared ones name no model: Claude Code's default.
-      expect(base.launch, role).not.toHaveProperty("model");
+      // The shared ones name the default, as the manager's and the worker's do.
+      expect(base.launch.model, role).toBe("claude-opus-5-5");
       const t = roleTemplate(role, "prj_abc123", "claude-haiku-5-5");
       expect(t.name).toBe(`projects/${role}-abc123-claude-haiku-5-5`);
       expect(t.body, role).toEqual({ ...base, launch: { ...base.launch, model: "claude-haiku-5-5" } });
@@ -918,25 +918,23 @@ describe("a project's models", () => {
     /** Each reviewer template's write as if made longer ago than a start can be in flight. */
     const leaseOver = (p: P) => runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE model_templates SET at_ms = ? WHERE role = 'reviewer'", Date.now() - START_LEASE_MS - 1); });
 
-    it("read null until set; PATCH sets each and clears it with null; a bad id is refused and nothing is written", async () => {
+    it("read Opus 5.5 until set; PATCH sets each; null or a bad id is refused and nothing is written", async () => {
       const p = await newProject();
-      expect(p.settings).toMatchObject({ reviewer_model: null, routine_model: null });
-      expect(await settingsOf(p)).toMatchObject({ reviewer_model: null, routine_model: null });
+      expect(p.settings).toMatchObject({ reviewer_model: "claude-opus-5-5", routine_model: "claude-opus-5-5" });
+      expect(await settingsOf(p)).toMatchObject({ reviewer_model: "claude-opus-5-5", routine_model: "claude-opus-5-5" });
       let r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5", routine_model: "us.anthropic.claude-haiku-5-5" });
       expect(r.status).toBe(200);
       expect(r.body).toMatchObject({ reviewer_model: "claude-sonnet-5-5", routine_model: "us.anthropic.claude-haiku-5-5" });
       for (const field of ["reviewer_model", "routine_model"]) {
-        for (const bad of ["-p", "opus 5", "x".repeat(101)]) {
+        for (const bad of ["-p", "opus 5", "x".repeat(101), null]) {
           expect((await api(token, "PATCH", `/api/projects/${p.id}/settings`, { [field]: bad, worker_model: "claude-haiku-5-5" })).status, `${field} ${bad}`).toBe(400);
         }
       }
       // ProjectDO checks it itself too, whoever calls it.
       expect(await stub(p).updateSettings({ routine_model: "--model", worker_model: "claude-haiku-5-5" })).toMatchObject({ ok: false, status: 400 });
       expect(await settingsOf(p)).toMatchObject({ reviewer_model: "claude-sonnet-5-5", routine_model: "us.anthropic.claude-haiku-5-5", worker_model: "claude-opus-5-5" });
-      r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: null });
-      expect(r.body).toMatchObject({ reviewer_model: null, routine_model: "us.anthropic.claude-haiku-5-5" });
-      r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { routine_model: null });
-      expect(r.body).toMatchObject({ reviewer_model: null, routine_model: null });
+      r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-opus-5-5" });
+      expect(r.body).toMatchObject({ reviewer_model: "claude-opus-5-5", routine_model: "us.anthropic.claude-haiku-5-5" });
     });
 
     it("a reviewer's template goes once it's neither the setting nor a live reviewer's, and its write's lease is over", async () => {
@@ -947,7 +945,7 @@ describe("a project's models", () => {
       const [reviewer] = reviewersOf(p);
       expect(reviewer!.template).toBe(haiku);
       // The setting moves on: the live reviewer keeps its template, its lease over or not.
-      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: null });
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5" });
       await leaseOver(p);
       await stub(p).drain();
       expect(fake.catalog.has(`templates/${haiku}`)).toBe(true);
@@ -1031,7 +1029,7 @@ describe("a project's models", () => {
       // Frozen as the shared template's name and the model: the release before reads it as a dreaming run still.
       expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT template, model FROM routine_runs").one()))
         .toEqual({ template: "projects/dreaming", model: "claude-haiku-5-5" });
-      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { routine_model: null });
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { routine_model: "claude-sonnet-5-5" });
       await stub(p).drain();
       expect(deletesOf(dreaming)).toBe(0);
       fake.failures = [];

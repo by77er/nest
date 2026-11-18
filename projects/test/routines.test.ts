@@ -181,7 +181,8 @@ describe("firing", () => {
     const run = await liveRun(s, id);
     expect(run).toMatchObject({ state: "running", trigger: "timer", n: 1 });
     const a = fake.agents.get(run.agent)!;
-    expect(a.template).toBe("projects/routine");
+    // The project's own on the default model (README.md#models).
+    expect(a.template).toBe(roleTemplate("routine", s.id, "claude-opus-5-5").name);
     // A sandbox of its own, to read the repo.
     expect(a.sandbox).toMatch(/^sbx_/);
     expect(a.labels).toEqual({ project: s.id, role: "routine", routine: id, run: run.id });
@@ -709,8 +710,8 @@ describe("the transcript grant at a dreaming run's spawn", () => {
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id);
     expect(creates).toHaveLength(2);
     expect(creates[1]!.body).toEqual(creates[0]!.body);
-    // No hands: the dreaming template, and no sandbox made or named.
-    expect(creates[0]!.body.template).toBe("projects/dreaming");
+    // No hands: the dreaming template (the project's own on the default model), and no sandbox made or named.
+    expect(creates[0]!.body.template).toBe(roleTemplate("dreaming", s.id, "claude-opus-5-5").name);
     expect(creates[0]!.body.sandbox).toBeUndefined();
     expect(fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.run === run.id)).toEqual([]);
     expect(creates[0]!.body.grants).toEqual([{
@@ -737,7 +738,7 @@ describe("a start's requests are frozen at its first attempt", () => {
     const run = await liveRun(s, r.id);
     expect(run.state).toBe("running");
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id);
-    expect(creates.map((c) => c.body.template)).toEqual(["projects/dreaming", "projects/dreaming"]);
+    expect(creates.map((c) => c.body.template)).toEqual(Array(2).fill(roleTemplate("dreaming", s.id, "claude-opus-5-5").name));
     expect(creates[1]!.body).toEqual(creates[0]!.body);
     expect(fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.run === run.id)).toEqual([]);
     const brief = fake.inbox.find((m) => m.agent === run.agent)!.text;
@@ -750,18 +751,19 @@ describe("the routine runs' model (README.md#models)", () => {
   const agentsCreated = (run: string) => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run);
   const sandboxesCreated = (run: string) => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.run === run);
 
-  it("unset: a routine run and a dreaming run start from the shared templates, which name no model", async () => {
+  it("by default: a routine run and a dreaming run start on Opus 5.5, from the project's own templates", async () => {
     const s = await setup();
     await api(token, "PATCH", `/api/projects/${s.id}/settings`, { max_routine_runs: 2 });
     const id = await create(s);
     await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
     const run = await liveRun(s, id);
-    expect(fake.agents.get(run.agent)!.template).toBe("projects/routine");
-    expect(fake.catalog.get("templates/projects/routine")).not.toHaveProperty("launch.model");
+    const rt = roleTemplate("routine", s.id, "claude-opus-5-5");
+    expect(fake.agents.get(run.agent)!.template).toBe(rt.name);
+    expect(fake.catalog.get(`templates/${rt.name}`)).toMatchObject({ launch: { model: "claude-opus-5-5" } });
     const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
     await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
     const dream = await liveRun(s, d.id);
-    expect(fake.agents.get(dream.agent)!.template).toBe("projects/dreaming");
+    expect(fake.agents.get(dream.agent)!.template).toBe(roleTemplate("dreaming", s.id, "claude-opus-5-5").name);
   });
 
   it("set: each run starts from the project's own template on it, a routine's with its sandbox, a dreaming run's with none", async () => {
