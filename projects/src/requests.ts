@@ -142,6 +142,8 @@ export const UpdateRoutine = z.strictObject(Object.fromEntries(Object.entries(Ro
  * page checks them too (src/reviewers.ts, the reviewers' module, re-exports them; the page may import only this one).
  */
 export const REVIEWER_LIMITS = { name: 80, instructions: 8000, dimensions: 6, dimension: 60 } as const;
+/** Reviewers a project holds. */
+export const MAX_REVIEWERS = 8;
 /** Why a reviewer's dimensions can't be, or null: names unique without case (and surrounding spaces). */
 export function dimensionsProblem(dimensions: readonly string[]): string | null {
   const seen = new Set<string>();
@@ -155,6 +157,8 @@ export function dimensionsProblem(dimensions: readonly string[]): string | null 
 /** The presets a reviewer can be added from: `code`, the built-in "Code review" (src/reviewers.ts). */
 export const REVIEWER_PRESETS = ["code"] as const;
 export type ReviewerPreset = (typeof REVIEWER_PRESETS)[number];
+/** Each preset's id (a project has it once) and name, which the page offers it by. */
+export const REVIEWER_PRESET_IDS: Record<ReviewerPreset, { id: string; name: string }> = { code: { id: "code-review", name: "Code review" } };
 const RL = REVIEWER_LIMITS;
 /** A project's reviewer (README.md#reviewers): what it judges (its dimensions) and how (its instructions). */
 const ReviewerFields = {

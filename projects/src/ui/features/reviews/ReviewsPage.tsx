@@ -1,20 +1,22 @@
 // A project's reviews: every review job ReviewDO knows, newest first, with its PR, where it is, and the
 // verdict once there is one: each reviewer's dimensions, grouped by reviewer when there are several. Read-only, but for a review held for the owner's approval
 // (README.md#the-review-gate), which is approved or dismissed here. A table, or below `sm` a card per review (its
-// PR and title, its sha, its state, its verdicts, when, and its trace), so nothing starts off screen.
+// PR and title, its sha, its state, its verdicts, when, and its trace), so nothing starts off screen. Under
+// them, the project's reviewers (ReviewersSection); while none is on, a warning at the top says so too.
 
 import { Anchor, Badge, Button, Table, Text, Tooltip } from "@mantine/core";
 import { IconCheck, IconChevronDown, IconChevronRight, IconShieldCheck, IconX } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
-import { Fragment, type ReactNode, useState } from "react";
-import { useReviews } from "../../api/queries";
+import { Fragment, type ReactNode, useRef, useState } from "react";
+import { useReviewers, useReviews } from "../../api/queries";
 import type { Job, Review, Verdict } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Stack, TableFrame, Token, TriggerBadge, usePhone, weight } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Row, Section, Stack, TableFrame, Token, TriggerBadge, usePhone, weight } from "../../layout";
 import { REVIEW_STATE } from "../../status";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ReviewTrace } from "../trace/AgentTraces";
 import { HeldActions, heldFrom } from "./HeldReview";
+import { NONE_ON, ReviewersSection } from "./ReviewersSection";
 
 /** Whether a verdict failed: any dimension of any review (src/reviewers.ts's `verdictPassed`, negated). */
 const failed = (v: Verdict) => v.reviews.length === 0 || v.reviews.some((r) => r.dimensions.length === 0 || r.dimensions.some((d) => d.verdict !== "pass"));
@@ -180,6 +182,10 @@ function ReviewCard({ projectId, repo, j, open, onToggle }: { projectId: string;
 export function ReviewsPage() {
   const { projectId } = useParams({ from: "/projects/$projectId/reviews" });
   const reviews = useReviews(projectId);
+  const reviewers = useReviewers(projectId);
+  const reviewersHeading = useRef<HTMLHeadingElement>(null);
+  // None on, with reviews above the section: said at the top too, where the owner looks first.
+  const noneOn = reviewers.data !== undefined && !reviewers.data.some((r) => r.enabled) && (reviews.data?.length ?? 0) > 0;
   // The job whose reviewer's trace is open (one at a time: each open trace is a WebSocket).
   const [traced, setTraced] = useState<string | null>(null);
   // Below `sm`, a card per review: the table's Verdict column would start off screen.
@@ -187,81 +193,96 @@ export function ReviewsPage() {
   return (
     <ProjectFrame projectId={projectId}>
       {(p) => (
-        <Section title="Reviews" count={reviews.data?.length}>
-          {reviews.isPending ? (
-            <LoadingState label="Loading the reviews" />
-          ) : reviews.isError ? (
-            <ErrorState title="The reviews couldn't be loaded" error={reviews.error} onRetry={() => void reviews.refetch()} />
-          ) : reviews.data.length === 0 ? (
-            <Panel>
-              <EmptyState icon={IconShieldCheck} title="No reviews yet" description="Every PR on the repo gets a review by a reviewer agent; one from someone the project doesn't trust waits here for your approval." />
-            </Panel>
-          ) : phone ? (
-            <Stack gap="sm" role="list" aria-label="Review jobs">
-              {[...reviews.data]
-                .sort(byHeldThenNewest)
-                .map((j) => {
-                  const key = `${j.pr}/${j.sha}`;
-                  const open = traced === key;
-                  return <ReviewCard key={key} projectId={projectId} repo={p.repo} j={j} open={open} onToggle={() => setTraced(open ? null : key)} />;
-                })}
-            </Stack>
-          ) : (
-            <TableFrame label="Review jobs">
-              <Table.Thead>
-                <Table.Tr>
-                  <Table.Th>Pull request</Table.Th>
-                  <Table.Th>State</Table.Th>
-                  <Table.Th>Verdict</Table.Th>
-                  <Table.Th ta="right">Runs</Table.Th>
-                  <Table.Th ta="right">Updated</Table.Th>
-                  <Table.Th>Trace</Table.Th>
-                </Table.Tr>
-              </Table.Thead>
-              <Table.Tbody>
+        <Stack gap="2xl">
+          {noneOn && (
+            <Notice tone="warning" title="No reviewer is on" role="status">
+              <Stack gap="sm">
+                <Text fz="sm">{NONE_ON}</Text>
+                <Row>
+                  <Button variant="default" size="xs" onClick={() => reviewersHeading.current?.focus()}>
+                    Go to reviewers
+                  </Button>
+                </Row>
+              </Stack>
+            </Notice>
+          )}
+          <Section title="Reviews" count={reviews.data?.length}>
+            {reviews.isPending ? (
+              <LoadingState label="Loading the reviews" />
+            ) : reviews.isError ? (
+              <ErrorState title="The reviews couldn't be loaded" error={reviews.error} onRetry={() => void reviews.refetch()} />
+            ) : reviews.data.length === 0 ? (
+              <Panel>
+                <EmptyState icon={IconShieldCheck} title="No reviews yet" description="Every PR on the repo gets a review by each reviewer that's on; one from someone the project doesn't trust waits here for your approval." />
+              </Panel>
+            ) : phone ? (
+              <Stack gap="sm" role="list" aria-label="Review jobs">
                 {[...reviews.data]
                   .sort(byHeldThenNewest)
                   .map((j) => {
                     const key = `${j.pr}/${j.sha}`;
                     const open = traced === key;
-                    return (
-                    <Fragment key={key}>
-                    <Table.Tr data-job={key}>
-                      <Table.Td>
-                        <PrTitle repo={p.repo} j={j} />
-                      </Table.Td>
-                      <Table.Td>
-                        <JobState job={j} />
-                      </Table.Td>
-                      <Table.Td>
-                        <Verdicts job={j} projectId={projectId} />
-                      </Table.Td>
-                      <Table.Td ta="right">
-                        <Text fz="sm">{j.runs}</Text>
-                      </Table.Td>
-                      <Table.Td ta="right">
-                        <Token mono={false} size="sm" nowrap title={exact(j.updated_ms)}>
-                          {ago(j.updated_ms)}
-                        </Token>
-                      </Table.Td>
-                      <Table.Td>
-                        <TraceToggle j={j} open={open} onToggle={() => setTraced(open ? null : key)} />
-                      </Table.Td>
-                    </Table.Tr>
-                    {open && (
-                      <Table.Tr data-trace={key}>
-                        <Table.Td colSpan={6}>
-                          <ReviewTrace job={j} />
+                    return <ReviewCard key={key} projectId={projectId} repo={p.repo} j={j} open={open} onToggle={() => setTraced(open ? null : key)} />;
+                  })}
+              </Stack>
+            ) : (
+              <TableFrame label="Review jobs">
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>Pull request</Table.Th>
+                    <Table.Th>State</Table.Th>
+                    <Table.Th>Verdict</Table.Th>
+                    <Table.Th ta="right">Runs</Table.Th>
+                    <Table.Th ta="right">Updated</Table.Th>
+                    <Table.Th>Trace</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {[...reviews.data]
+                    .sort(byHeldThenNewest)
+                    .map((j) => {
+                      const key = `${j.pr}/${j.sha}`;
+                      const open = traced === key;
+                      return (
+                      <Fragment key={key}>
+                      <Table.Tr data-job={key}>
+                        <Table.Td>
+                          <PrTitle repo={p.repo} j={j} />
+                        </Table.Td>
+                        <Table.Td>
+                          <JobState job={j} />
+                        </Table.Td>
+                        <Table.Td>
+                          <Verdicts job={j} projectId={projectId} />
+                        </Table.Td>
+                        <Table.Td ta="right">
+                          <Text fz="sm">{j.runs}</Text>
+                        </Table.Td>
+                        <Table.Td ta="right">
+                          <Token mono={false} size="sm" nowrap title={exact(j.updated_ms)}>
+                            {ago(j.updated_ms)}
+                          </Token>
+                        </Table.Td>
+                        <Table.Td>
+                          <TraceToggle j={j} open={open} onToggle={() => setTraced(open ? null : key)} />
                         </Table.Td>
                       </Table.Tr>
-                    )}
-                    </Fragment>
-                    );
-                  })}
-              </Table.Tbody>
-            </TableFrame>
-          )}
-        </Section>
+                      {open && (
+                        <Table.Tr data-trace={key}>
+                          <Table.Td colSpan={6}>
+                            <ReviewTrace job={j} />
+                          </Table.Td>
+                        </Table.Tr>
+                      )}
+                      </Fragment>
+                      );
+                    })}
+                </Table.Tbody>
+              </TableFrame>
+            )}
+          </Section>
+          <ReviewersSection projectId={projectId} headingRef={reviewersHeading} />
+        </Stack>
       )}
     </ProjectFrame>
   );

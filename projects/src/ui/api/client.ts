@@ -1,6 +1,7 @@
 // The one module that calls the JSON API (src/api.ts). Same origin, so Cloudflare Access's cookie goes
 // with every call and the page holds no credential of its own.
 
+import type { CreateReviewerBody, Reviewer, UpdateReviewerBody } from "./types";
 import type { AcceptIssueBody, AddDependencyBody, AnswerBody, Ask, AttachableRepos, AttachPrBody, Attention, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateRoutineBody, CreateTaskBody, DeclineIssueBody, DeclineProposalBody, Issue, Job, ListedProject, ManagerStatus, NetworkBody, NetworkView, Note, OpenPr, OutboxState, Project, ProjectRow, Proposal, PutSecretBody, RepoBinding, RereadBinding, Routine, RoutineRun, RoutinesAnswer, SecretsAnswer, SecretView, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateRoutineBody, UpdateTaskBody, Waits } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
@@ -97,6 +98,10 @@ export const api = {
   reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
   approveReview: (id: string, pr: number, sha: string) => call<Job>("POST", `${prj(id)}/reviews/${pr}/${sha}/approve`),
   dismissReview: (id: string, pr: number, sha: string) => call<Job>("POST", `${prj(id)}/reviews/${pr}/${sha}/dismiss`),
+  reviewers: (id: string) => call<Reviewer[]>("GET", `${prj(id)}/reviewers`),
+  createReviewer: (id: string, b: CreateReviewerBody) => call<Reviewer>("POST", `${prj(id)}/reviewers`, b),
+  updateReviewer: (id: string, reviewer: string, b: UpdateReviewerBody) => call<Reviewer>("PATCH", `${prj(id)}/reviewers/${encodeURIComponent(reviewer)}`, b),
+  deleteReviewer: (id: string, reviewer: string) => call<{ deleted: string }>("DELETE", `${prj(id)}/reviewers/${encodeURIComponent(reviewer)}`),
 
   routines: (id: string) => call<RoutinesAnswer>("GET", `${prj(id)}/routines`),
   createRoutine: (id: string, b: CreateRoutineBody) => call<Routine>("POST", `${prj(id)}/routines`, b),

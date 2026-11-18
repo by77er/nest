@@ -7,6 +7,8 @@ import type { AttachableRepos, Issue, SecretRequest, SecretsAnswer } from "../ap
 import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
 import type { Note, Proposal, RepoBinding, RereadBinding, Routine, RoutineRun } from "../api/types";
 import { PRESETS } from "../../routines";
+import { CODE_REVIEW, MAX_REVIEWERS } from "../../reviewers";
+import type { Reviewer } from "../api/types";
 
 export interface Write {
   method: string;
@@ -37,6 +39,11 @@ export function routine(over: Partial<Routine> = {}): Routine {
     next_timer_ms: null, counts: { tasks_done: 0, prs_merged: 0 }, due: null, waiting: null, cooldown_until_ms: null, live_run: null, last_run: null, runs: 0,
     created_ms: now - 86_400_000, updated_ms: now - 86_400_000, ...over,
   };
+}
+
+/** A project's reviewer as the Worker answers it (README.md#reviewers): by default the built-in, as a new project has it. */
+export function reviewer(over: Partial<Reviewer> = {}): Reviewer {
+  return { ...CODE_REVIEW, dimensions: [...CODE_REVIEW.dimensions], enabled: true, source: "owner", tainted: false, created_ms: now - 86_400_000, updated_ms: now - 86_400_000, ...over };
 }
 
 export function run(over: Partial<RoutineRun> = {}): RoutineRun {
@@ -81,6 +88,8 @@ export class FakeApi {
     return { binding: after, changed: true, previous_id: b.repo_id, rename: null };
   };
   reviews: Job[] = [];
+  /** The project's reviewers: the built-in alone, as a new project has it. */
+  reviewers: Reviewer[] = [reviewer()];
   /** PRs past the review queue's limits, with no job yet. */
   reviewBacklog = 0;
   /** The default PR comments user cleared by a transfer (README.md#pr-comments), as Needs you lists it. */
@@ -237,7 +246,7 @@ export class FakeApi {
       this.notes = this.notes.filter((n) => n.key !== key);
       return json({ deleted: key });
     }
-    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^rtn_/.test(s) ? ":routine" : /^run_/.test(s) ? ":run" : /^prp_/.test(s) ? ":proposal" : /^agt_/.test(s) ? ":agent" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
+    const route = `${m} ${parts.slice(2).map((s, i) => (i === 1 && parts[2] === "reviewers" ? ":reviewer" : /^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^rtn_/.test(s) ? ":routine" : /^run_/.test(s) ? ":run" : /^prp_/.test(s) ? ":proposal" : /^agt_/.test(s) ? ":agent" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
     const rt = this.routines.find((x) => x.id === parts[3]);
     const t = this.tasks.find((x) => x.id === parts[3]);
     switch (route) {
@@ -284,6 +293,26 @@ export class FakeApi {
         return json(this.network);
       case "GET reviews":
         return json(this.reviews);
+      case "GET reviewers":
+        return json(this.reviewers);
+      case "POST reviewers": {
+        // As ReviewDO: at most MAX_REVIEWERS, the preset once under its own id.
+        if (this.reviewers.length >= MAX_REVIEWERS) return json({ error: `a project holds at most ${MAX_REVIEWERS} reviewers` }, 409);
+        const r = "preset" in body ? reviewer() : reviewer({ ...body, id: `rvw_${++seq}` });
+        if (this.reviewers.some((x) => x.id === r.id)) return json({ error: `the project has the reviewer "${r.name}" already: change that one instead` }, 409);
+        this.reviewers.push(r);
+        return json(r, 201);
+      }
+      case "PATCH reviewers/:reviewer": {
+        const r = this.reviewers.find((x) => x.id === parts[3]);
+        if (!r) return json({ error: "unknown reviewer" }, 404);
+        Object.assign(r, body, { source: "owner", tainted: false, updated_ms: now });
+        return json(r);
+      }
+      case "DELETE reviewers/:reviewer":
+        if (!this.reviewers.some((x) => x.id === parts[3])) return json({ error: "unknown reviewer" }, 404);
+        this.reviewers = this.reviewers.filter((x) => x.id !== parts[3]);
+        return json({ deleted: parts[3] });
       case "GET secrets":
         return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents, workflow_workers: this.workflowWorkers, workflows_refused: this.workflowsRefused });
       case "GET prs/open":
