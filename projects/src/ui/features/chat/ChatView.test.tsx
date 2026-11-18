@@ -667,6 +667,8 @@ describe("the chat", () => {
     const below = (a: Element, b: Element) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
     const seqs = () => [...c.querySelectorAll("[data-seq]")].map((e) => e.getAttribute("data-seq"));
     const mine = () => within(c).getByText("Also check the tests").closest("[data-sender=owner]")!;
+    // A row the reader opened stays open as the stream splits and grows (its part isn't remounted).
+    await user.click(read());
 
     // Sent mid-turn: in flight, it's below the steps, the working line under it.
     let release = () => {};
@@ -682,6 +684,7 @@ describe("the chat", () => {
     expect(api.chat.at(-1)!.at_ms).toBe(AT);
     expect(below(read(), mine())).toBe(true);
     expect(below(mine(), within(c).getByText("Working…"))).toBe(true);
+    expect(read()).toHaveAttribute("aria-expanded", "true");
 
     // What the turn does after it comes below it; what it did before stays above.
     await trace.push(ev("tool_call", { ...t(1_000), call_id: "m2", name: "Bash", input: { command: "npm test" } }));
@@ -689,12 +692,15 @@ describe("the chat", () => {
     expect(below(mine(), bash)).toBe(true);
     expect(below(read(), mine())).toBe(true);
     expect(within(c).queryByText("Working…")).toBeNull();
+    await user.click(bash);
     await trace.push(ev("tool_result", { ...t(2_000), call_id: "m2", is_error: false, summary: "ok" }), ev("assistant_text", { ...t(3_000), text: "Both look fine." }), ev("turn_completed", t(3_500)));
     // Ended, held for its reply: split as it was.
     await within(c).findByRole("button", { name: "Bash npm test, done" });
     expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(2);
     expect(below(read(), mine())).toBe(true);
     expect(below(mine(), within(c).getByRole("button", { name: "Bash npm test, done" }))).toBe(true);
+    expect(within(c).getByRole("button", { name: "Bash npm test, done" })).toHaveAttribute("aria-expanded", "true");
+    expect(read()).toHaveAttribute("aria-expanded", "true");
 
     // The reply lands where the last part was; the stream goes, its steps behind the reply.
     api.chat.push({ seq: 3, at_ms: AT + 3_000, sender: "manager", text: "Both look fine.", delivered: true, status: "done" as const, error: null });
