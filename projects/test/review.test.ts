@@ -136,9 +136,10 @@ describe("a PR's review", () => {
     const [check] = gh.runsOf(p.repo, s);
     expect(check).toMatchObject({ name: CHECK_NAME, head_sha: s, status: "in_progress" });
     const a = fake.agents.get(reviewer)!;
-    // No model chosen: the shared template, as this release has it (Claude Code's default model).
-    expect(a.template).toBe("projects/reviewer");
-    expect(fake.catalog.get("templates/projects/reviewer")).not.toHaveProperty("launch.model");
+    // No model chosen: the project's own template on the default (README.md#models).
+    const t = roleTemplate("reviewer", p.id, "claude-opus-5-5");
+    expect(a.template).toBe(t.name);
+    expect(fake.catalog.get(`templates/${t.name}`)).toEqual(t.body);
     expect(a.labels).toMatchObject({ project: p.id, role: "reviewer", pr: "3", sha: s });
     expect(a.sandbox).toMatch(/^sbx_/);
     // It reads the repo and pushes to none.
@@ -167,26 +168,37 @@ describe("a PR's review", () => {
     const create = fake.calls.findIndex((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);
     expect(put).toBeGreaterThanOrEqual(0);
     expect(put).toBeLessThan(create);
-    // Back to the default: the next review's reviewer starts from the shared template.
-    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: null });
+    // Back to the default: the next review's reviewer starts on it.
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-opus-5-5" });
     const next = await opened(p, 5);
-    expect(fake.agents.get(next.reviewer)!.template).toBe("projects/reviewer");
+    expect(fake.agents.get(next.reviewer)!.template).toBe(roleTemplate("reviewer", p.id, "claude-opus-5-5").name);
     // The running one isn't switched.
     expect(fake.agents.get(reviewer)!.ended).toBe(false);
   });
 
-  it("nest refusing its template's write for good fails the job at once, shared template or the project's own", async () => {
-    for (const model of [null, "claude-haiku-5-5"]) {
+  it("nest refusing its template's write for good fails the job at once, the project's own template or the shared one", async () => {
+    for (const shared of [false, true]) {
       const p = await newProject();
-      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: model });
-      const name = model ? roleTemplate("reviewer", p.id, model).name : "projects/reviewer";
-      fake.fail(new RegExp(`^PUT /v1/catalog/templates/${name}$`), 403, { times: 1000 });
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
       const s = sha();
-      expect((await push(p, 7, s, "opened")).status).toBe(200);
+      let name = roleTemplate("reviewer", p.id, "claude-haiku-5-5").name;
+      if (shared) {
+        // An attempt frozen before models were chosen (no model in its spec) starts from the shared template.
+        fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+        expect((await push(p, 7, s, "opened")).status).toBe(200);
+        await run(p);
+        fake.failures = [];
+        await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("UPDATE start_specs SET spec = json_remove(spec, '$.model')"); });
+        name = "projects/reviewer";
+      }
+      fake.fail(new RegExp(`^PUT /v1/catalog/templates/${name}$`), 403, { times: 1000 });
+      if (shared) await dueNow(p);
+      else expect((await push(p, 7, s, "opened")).status).toBe(200);
       await run(p);
       fake.failures = [];
-      expect(await job(p, 7, s), String(model)).toMatchObject({ state: "failed" });
+      expect(await job(p, 7, s), name).toMatchObject({ state: "failed" });
       expect(live(p, 7)).toEqual([]);
+      expect(fake.calls.filter((c) => c.method === "PUT" && c.path === `/v1/catalog/templates/${name}`).length, name).toBeGreaterThan(0);
     }
   });
 
