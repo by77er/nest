@@ -317,7 +317,9 @@ describe("the models in the settings", () => {
     };
     await user.click(select(dialog, "Reviewers' model"));
     await user.click(await screen.findByRole("option", { name: "Haiku 5.5" }));
-    expect(await save(1)).toMatchObject({ reviewer_model: "claude-haiku-5-5", routine_model: null });
+    const first = await save(1);
+    expect(first).toMatchObject({ reviewer_model: "claude-haiku-5-5" });
+    expect(first).not.toHaveProperty("routine_model");
     // From the default, Custom starts empty, and an empty id isn't saved.
     await user.click(select(dialog, "Routines' model"));
     await user.click(await screen.findByRole("option", { name: "Custom…" }));
