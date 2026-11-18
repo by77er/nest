@@ -983,6 +983,37 @@ describe("a project's models", () => {
       expect(fake.catalog.has(`templates/${haiku}`)).toBe(true);
     });
 
+    it("a start writing a template whose delete is at nest waits for the delete's answer, so the template stays", async () => {
+      const p = await newProject();
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
+      const haiku = reviewTemplate(p, "claude-haiku-5-5");
+      const reviews = env.REVIEW.get(env.REVIEW.idFromName(p.id));
+      // The attempt is frozen on Haiku, its create failing for now.
+      fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+      await openPr(p, 4);
+      expect(reviewersOf(p)).toEqual([]);
+      // The setting moves on and the write's lease runs out: the sweep's delete goes to nest, and is held there.
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5" });
+      await leaseOver(p);
+      let release!: () => void;
+      const hold = { match: new RegExp(`^DELETE /v1/catalog/templates/${haiku}$`), release: new Promise<void>((r) => { release = r; }), reached: false };
+      fake.holds.push(hold);
+      const sweeping = stub(p).drain();
+      for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(hold.reached).toBe(true);
+      // The attempt's retry writes the template again meanwhile.
+      fake.failures = [];
+      await runInDurableObject(reviews, (_o, st) => { st.storage.sql.exec("UPDATE jobs SET next_ms = 0 WHERE next_ms IS NOT NULL"); });
+      const reviewing = reviews.drain();
+      await new Promise((r) => setTimeout(r, 200));
+      release();
+      await Promise.all([sweeping, reviewing]);
+      const [reviewer] = reviewersOf(p);
+      expect(reviewer!.template).toBe(haiku);
+      expect(fake.catalog.has(`templates/${haiku}`)).toBe(true);
+      expect(deletesOf(haiku)).toBe(1);
+    });
+
     it("a routine run's template stays from its first attempt until the run ends; then it goes", async () => {
       const p = await newProject();
       await api(token, "PATCH", `/api/projects/${p.id}/settings`, { routine_model: "claude-haiku-5-5" });

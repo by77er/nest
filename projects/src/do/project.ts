@@ -765,6 +765,11 @@ export class ProjectDO extends DurableObject<Env> {
   private prunedMs = 0;
   /** Whether this drain already went round again for a changed grant (`grantSeen`). */
   private reowed = false;
+  /**
+   * Each model template's delete at nest now (`sweepModelTemplates`), until its answer: a start writing that
+   * template meanwhile waits for it, so the delete can't land after the write (in memory, as the request is).
+   */
+  private readonly templateDeletes = new Map<string, Promise<unknown>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -2212,6 +2217,8 @@ export class ProjectDO extends DurableObject<Env> {
     // `at_ms` each time, so a sweep whose delete was in flight sees the row is this start's now (and a
     // reviewer's is kept for START_LEASE_MS from it).
     this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = MAX(excluded.at_ms, model_templates.at_ms + 1), del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, model, Date.now());
+    // A delete of it already at nest is answered first, so it can't land after this write.
+    await this.templateDeletes.get(t.name);
     await nest.putCatalog("templates", t.name, t.body);
     return t.name;
   }
@@ -2250,10 +2257,14 @@ export class ProjectDO extends DurableObject<Env> {
       if (!r) return;
       tried.add(r.name);
       let failed: { permanent: boolean; error: string } | null = null;
+      const deleting = nest.deleteCatalog("templates", r.name);
+      this.templateDeletes.set(r.name, deleting.catch(() => undefined));
       try {
-        await nest.deleteCatalog("templates", r.name);
+        await deleting;
       } catch (e) {
         failed = verdict(e);
+      } finally {
+        this.templateDeletes.delete(r.name);
       }
       // Written again by a start meanwhile (`templateFor`): the row is that start's, and so is the template.
       const cur = this.sql.exec<{ at_ms: number }>("SELECT at_ms FROM model_templates WHERE name = ?", r.name).toArray()[0];
