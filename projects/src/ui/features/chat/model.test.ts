@@ -1,9 +1,9 @@
 // The chat's pure parts: grouping by author and day, the turn in progress read from a trace as steps, the
-// steps found again for each reply, and the quote a reply starts from.
+// steps found again for each reply, the turn placed in the log by time, and the quote a reply starts from.
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "../../api/types";
 import type { TraceEvent } from "../trace/model";
-import { finishedTurns, GROUP_GAP_MS, groupLog, liveTurn, quote, stepsBySeq } from "./model";
+import { finishedTurns, GROUP_GAP_MS, groupLog, liveTurn, type LogItem, quote, type Step, stepsBySeq, timeline, type ToolStep } from "./model";
 
 const NOW = new Date(2026, 10, 2, 15, 0).getTime();
 const msg = (seq: number, sender: string, at_ms: number): ChatMessage => ({ seq, at_ms, sender, text: `m${seq}`, delivered: true, status: "done" as const, error: null });
@@ -106,6 +106,62 @@ describe("finishedTurns and stepsBySeq", () => {
     const tool = t!.steps[0]!;
     expect(tool).toMatchObject({ kind: "tool", name: "Write", summary: "src/search/tags.ts" });
     expect(tool.kind === "tool" && tool.input).toEqual([{ key: "input (cut short)", value: cut }]);
+  });
+});
+
+describe("timeline", () => {
+  const T0 = NOW - 60_000;
+  const said = (key: string, ts_ms: number): Step => ({ kind: "text", key, ts_ms, text: key });
+  const call = (key: string, ts_ms: number, status: ToolStep["status"] = "done"): Step => ({ kind: "tool", key, ts_ms, name: "Read", summary: key, input: [], result: null, status });
+  const turn = (steps: Step[], running = true) => ({ turn: "trn_1", started_ms: T0, steps, running });
+  // The log as it reads: an author group by its seqs, a stream part by its steps (+ its working line).
+  const shape = (items: LogItem[]) =>
+    items.flatMap((i) => (i.kind === "day" ? [] : i.kind === "group" ? [`${i.sender} ${i.messages.map((m) => m.seq).join(",")}`] : [`stream ${[...i.steps.map((s) => s.key), ...(i.working ? ["working"] : [])].join(",")}`]));
+  // The message that started the turn, from before it.
+  const asked = msg(1, "owner", T0 - 1_000);
+
+  it("is the log as groupLog gives it while no turn is in progress", () => {
+    const messages = [asked, msg(2, "manager", T0 + 5_000), msg(3, "owner", T0 + 9_000)];
+    expect(timeline(messages, null, NOW)).toEqual(groupLog(messages, NOW));
+  });
+
+  it("puts the turn after every message when none was sent during it, as one live part", () => {
+    expect(shape(timeline([msg(0, "manager", T0 - 9_000), asked], turn([said("a", T0 + 1_000), call("b", T0 + 2_000)]), NOW))).toEqual(["manager 0", "owner 1", "stream a,b,working"]);
+  });
+
+  it("splits the turn at a message sent during it: the steps up to its time above it, the later ones and the working line below", () => {
+    // A step at the message's very time was already shown: above it.
+    const items = timeline([asked, msg(2, "owner", T0 + 2_000)], turn([said("a", T0 + 1_000), call("b", T0 + 2_000), call("c", T0 + 3_000)]), NOW);
+    expect(shape(items)).toEqual(["owner 1", "stream a,b", "owner 2", "stream c,working"]);
+    // Only the last part is live.
+    expect(items.filter((i) => i.kind === "stream").map((i) => i.kind === "stream" && i.live)).toEqual([false, true]);
+  });
+
+  it("after the last step, the message is followed by the working line alone; a call still running keeps its place above, with nothing empty below", () => {
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 5_000)], turn([said("a", T0 + 1_000), call("b", T0 + 2_000)]), NOW))).toEqual(["owner 1", "stream a,b", "owner 2", "stream working"]);
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 5_000)], turn([said("a", T0 + 1_000), call("b", T0 + 2_000, "running")]), NOW))).toEqual(["owner 1", "stream a,b", "owner 2"]);
+  });
+
+  it("splits at each of several messages; one straight after another is the same group, with no empty part between", () => {
+    const steps = [call("a", T0 + 1_000), call("b", T0 + 3_000), call("c", T0 + 5_000)];
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "owner", T0 + 4_000)], turn(steps), NOW))).toEqual(["owner 1", "stream a", "owner 2", "stream b", "owner 3", "stream c,working"]);
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "owner", T0 + 2_500)], turn(steps), NOW))).toEqual(["owner 1", "stream a", "owner 2,3", "stream b,c,working"]);
+  });
+
+  it("keeps a message from before the turn started above it, even with no step before its time", () => {
+    // `asked` is from before the start; one at the start with nothing shown yet is above the stream too.
+    expect(shape(timeline([asked, msg(2, "owner", T0)], turn([call("a", T0 + 1_000)]), NOW))).toEqual(["owner 1,2", "stream a,working"]);
+  });
+
+  it("puts a message in flight after every step shown, and one never taken (Retry) last, after the stream", () => {
+    const inFlight: ChatMessage = { ...msg(-20, "owner", T0), delivered: false, status: "owed" };
+    const refused: ChatMessage = { ...msg(-10, "owner", T0 - 30_000), delivered: false, status: "failed", error: "offline" };
+    expect(shape(timeline([asked, inFlight, refused], turn([call("a", T0 + 1_000), call("b", T0 + 2_000)]), NOW))).toEqual(["owner 1", "stream a,b", "owner -20", "stream working", "owner -10"]);
+  });
+
+  it("keeps the split once the turn has ended and is held for its reply, with no working line", () => {
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000)], turn([call("a", T0 + 1_000), said("b", T0 + 3_000)], false), NOW))).toEqual(["owner 1", "stream a", "owner 2", "stream b"]);
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 5_000)], turn([call("a", T0 + 1_000)], false), NOW))).toEqual(["owner 1", "stream a", "owner 2"]);
   });
 });
 

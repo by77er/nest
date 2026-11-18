@@ -644,4 +644,65 @@ describe("the chat", () => {
     expect(api.chat.filter((m) => m.text === "Once only")).toHaveLength(1);
     await waitFor(() => expect(within(c).getAllByText("Once only")).toHaveLength(1));
   });
+
+  it("a message sent while a turn runs goes below what the turn has shown, what the turn does next below it, and the reply lands there", async () => {
+    // The fake API's clock: a message it takes is at this time.
+    const AT = Date.UTC(2026, 10, 2, 9, 0, 0);
+    const trace = drivenTraceSocket();
+    vi.stubGlobal("WebSocket", trace.Socket);
+    const api = new FakeApi();
+    api.chat = [{ seq: 1, at_ms: AT - 120_000, sender: "owner", text: "Plan the next milestone.", delivered: true, status: "done" as const, error: null }];
+    const { user, queryClient } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await within(c).findByText("Plan the next milestone.");
+    const t = (ms: number) => ({ turn: "trn_m", ts_ms: AT + ms });
+    await trace.push(
+      ev("turn_started", t(-60_000)),
+      ev("assistant_text", { ...t(-50_000), text: "Reading the board first." }),
+      ev("tool_call", { ...t(-40_000), call_id: "m1", name: "Read", input: { file_path: "a.ts" } }),
+      ev("tool_result", { ...t(-39_000), call_id: "m1", is_error: false, summary: "ok" }),
+    );
+    await within(c).findByRole("button", { name: "Read a.ts, done" });
+    const read = () => within(c).getByRole("button", { name: "Read a.ts, done" });
+    const below = (a: Element, b: Element) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const seqs = () => [...c.querySelectorAll("[data-seq]")].map((e) => e.getAttribute("data-seq"));
+    const mine = () => within(c).getByText("Also check the tests").closest("[data-sender=owner]")!;
+
+    // Sent mid-turn: in flight, it's below the steps, the working line under it.
+    let release = () => {};
+    api.holds.push({ match: /^POST .*\/chat$/, until: new Promise((r) => (release = () => r(null))) });
+    await user.type(within(c).getByLabelText("Message to the manager"), "Also check the tests{Enter}");
+    await within(c).findByText("Also check the tests");
+    expect(mine()).toHaveAttribute("data-seq", expect.stringMatching(/^-/));
+    expect(below(read(), mine())).toBe(true);
+    expect(below(mine(), within(c).getByText("Working…"))).toBe(true);
+    // Taken: the same place, with nest's seq and time.
+    release();
+    await waitFor(() => expect(seqs()).toEqual(["1", "2"]));
+    expect(api.chat.at(-1)!.at_ms).toBe(AT);
+    expect(below(read(), mine())).toBe(true);
+    expect(below(mine(), within(c).getByText("Working…"))).toBe(true);
+
+    // What the turn does after it comes below it; what it did before stays above.
+    await trace.push(ev("tool_call", { ...t(1_000), call_id: "m2", name: "Bash", input: { command: "npm test" } }));
+    const bash = await within(c).findByRole("button", { name: "Bash npm test, running" });
+    expect(below(mine(), bash)).toBe(true);
+    expect(below(read(), mine())).toBe(true);
+    expect(within(c).queryByText("Working…")).toBeNull();
+    await trace.push(ev("tool_result", { ...t(2_000), call_id: "m2", is_error: false, summary: "ok" }), ev("assistant_text", { ...t(3_000), text: "Both look fine." }), ev("turn_completed", t(3_500)));
+    // Ended, held for its reply: split as it was.
+    await within(c).findByRole("button", { name: "Bash npm test, done" });
+    expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(2);
+    expect(below(read(), mine())).toBe(true);
+    expect(below(mine(), within(c).getByRole("button", { name: "Bash npm test, done" }))).toBe(true);
+
+    // The reply lands where the last part was; the stream goes, its steps behind the reply.
+    api.chat.push({ seq: 3, at_ms: AT + 3_000, sender: "manager", text: "Both look fine.", delivered: true, status: "done" as const, error: null });
+    await queryClient.refetchQueries();
+    const reply = (await within(c).findByRole("button", { name: "Used 2 tools" })).closest("[data-sender=manager]")!;
+    expect(reply).toHaveAttribute("data-seq", "3");
+    expect(below(mine(), reply)).toBe(true);
+    await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
+    expect(seqs()).toEqual(["1", "2", "3"]);
+  });
 });
