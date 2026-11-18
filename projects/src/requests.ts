@@ -122,7 +122,7 @@ const RoutineFields = {
   /** The instructions for each run (its brief carries them; relayed when a tainted session wrote them). */
   prompt: z.string().trim().min(1).max(8000).describe("The instructions each run gets in its brief (at most 8000 characters)."),
   enabled: z.boolean().describe("Whether its triggers fire it."),
-  triggers: Triggers.describe("What fires it, any of them: a timer, N tasks done or N task PRs merged since its last run; null for none."),
+  triggers: Triggers.describe("What fires it, any of them: a timer, N tasks done or N task PRs merged since its last run. All three keys, each null for none."),
   /** At least this long between two runs' starts (a manual run skips it). */
   cooldown_min: z.number().int().min(0).max(7 * 24 * 60).describe("At least this many minutes between two runs' starts (0 to 10080)."),
   /** The run is stopped after this long (its cost guard). */

@@ -2,7 +2,7 @@
 
 Not a one-way deploy, and no ordering constraint.
 
-- **What it adds:** the board tools `list_routines`, `create_routine`, `update_routine` and `delete_routine` on `/mcp/board`, each routine's `source` and `tainted`, and a tainted routine's run brief relayed (`from: "projects/board"`) ([projects/README.md#routines](../../projects/README.md#routines)). Stored: `routines.source` (nullable; null reads as `owner`), `routines.name_tainted` and `routines.prompt_tainted` (default 0), and `routine_runs.brief_tainted` (nullable; null reads as untainted), added by a migration the previous release skips. `POST …/routines {preset}` now refuses a preset the project has already (the page offered each once already).
+- **What it adds:** the board tools `list_routines`, `create_routine`, `update_routine` and `delete_routine` on `/mcp/board`, each routine's `source` and `tainted`, and a tainted routine's run brief relayed (`from: "projects/board"`) ([projects/README.md#routines](../../projects/README.md#routines)). Stored: `routines.source` (nullable; null reads as `owner`), `routines.name_tainted` and `routines.prompt_tainted` (default 0), and `routine_runs.brief_tainted` (nullable: a brief frozen before it reads as untainted; a run with no frozen brief takes its routine's taint at its post), added by a migration the previous release skips. `POST …/routines {preset}` now refuses a preset the project has already (the page offered each once already).
 - **After the Worker deploys:** the next catalog sync lists the four tools to the manager, and its next session's prompt names them.
 - **What a rollback does:**
   - The previous release's catalog sync lists the board without the tools; a call to one is refused as an unknown tool.
