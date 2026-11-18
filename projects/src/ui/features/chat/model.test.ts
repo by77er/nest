@@ -113,7 +113,7 @@ describe("timeline", () => {
   const T0 = NOW - 60_000;
   const said = (key: string, ts_ms: number): Step => ({ kind: "text", key, ts_ms, text: key });
   const call = (key: string, ts_ms: number, status: ToolStep["status"] = "done"): Step => ({ kind: "tool", key, ts_ms, name: "Read", summary: key, input: [], result: null, status });
-  const turn = (steps: Step[], running = true) => ({ turn: "trn_1", started_ms: T0, steps, running });
+  const turn = (steps: Step[], running = true) => ({ turn: "trn_1", steps, running });
   // The log as it reads: an author group by its seqs, a stream part by its steps (+ its working line).
   const shape = (items: LogItem[]) =>
     items.flatMap((i) => (i.kind === "day" ? [] : i.kind === "group" ? [`${i.sender} ${i.messages.map((m) => m.seq).join(",")}`] : [`stream ${[...i.steps.map((s) => s.key), ...(i.working ? ["working"] : [])].join(",")}`]));
@@ -133,8 +133,6 @@ describe("timeline", () => {
     // A step at the message's very time was already shown: above it.
     const items = timeline([asked, msg(2, "owner", T0 + 2_000)], turn([said("a", T0 + 1_000), call("b", T0 + 2_000), call("c", T0 + 3_000)]), NOW);
     expect(shape(items)).toEqual(["owner 1", "stream a,b", "owner 2", "stream c,working"]);
-    // Only the last part is live.
-    expect(items.filter((i) => i.kind === "stream").map((i) => i.kind === "stream" && i.live)).toEqual([false, true]);
   });
 
   it("after the last step, the message is followed by the working line alone; a call still running keeps its place above, with nothing empty below", () => {
@@ -148,9 +146,13 @@ describe("timeline", () => {
     expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "owner", T0 + 2_500)], turn(steps), NOW))).toEqual(["owner 1", "stream a", "owner 2,3", "stream b,c,working"]);
   });
 
-  it("keeps a message from before the turn started above it, even with no step before its time", () => {
-    // `asked` is from before the start; one at the start with nothing shown yet is above the stream too.
+  it("keeps a message from before the turn's first step above the whole stream, the one that started it too", () => {
+    // `asked` is from before the start, the second from its start with nothing shown yet.
     expect(shape(timeline([asked, msg(2, "owner", T0)], turn([call("a", T0 + 1_000)]), NOW))).toEqual(["owner 1,2", "stream a,working"]);
+  });
+
+  it("never splits the turn at a manager's message: an earlier turn's reply nest reported late stays above it all", () => {
+    expect(shape(timeline([asked, msg(2, "manager", T0 + 1_500)], turn([call("a", T0 + 1_000), call("b", T0 + 2_000)]), NOW))).toEqual(["owner 1", "manager 2", "stream a,b,working"]);
   });
 
   it("puts a message in flight after every step shown, and one never taken (Retry) last, after the stream", () => {

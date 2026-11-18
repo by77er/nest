@@ -13,7 +13,7 @@ export type LogItem =
   | { kind: "day"; key: string; label: string }
   | { kind: "group"; key: string; sender: string; messages: ChatMessage[] }
   /** A part of the manager's turn in progress: its steps, and `working` when it's the live end with no call running. */
-  | { kind: "stream"; key: string; steps: Step[]; live: boolean; working: boolean };
+  | { kind: "stream"; key: string; steps: Step[]; working: boolean };
 
 const dayKey = (ms: number) => new Date(ms).toDateString();
 
@@ -87,8 +87,6 @@ export type Step = ToolStep | TextStep;
 /** The manager's turn in progress, from its trace: what it has said and done so far, in order. */
 export interface LiveTurn {
   turn: string;
-  /** When it started (its `turn_started`). */
-  started_ms: number;
   steps: Step[];
 }
 
@@ -96,7 +94,6 @@ export interface LiveTurn {
 interface ChatTurn {
   turn: string;
   started: boolean;
-  started_ms: number;
   completed: boolean;
   items: ({ kind: "text"; key: string; ts_ms: number; text: string } | { kind: "tool"; key: string; call: TraceEvent; result: TraceEvent | null })[];
 }
@@ -113,12 +110,9 @@ function chatTurns(events: TraceEvent[]): ChatTurn[] {
   for (const ev of events) {
     if (!ev.turn) continue;
     let t = byId.get(ev.turn);
-    if (!t) byId.set(ev.turn, (t = { turn: ev.turn, started: false, started_ms: 0, completed: false, items: [] }));
+    if (!t) byId.set(ev.turn, (t = { turn: ev.turn, started: false, completed: false, items: [] }));
     const key = `s${ev.seq}`;
-    if (ev.type === "turn_started") {
-      t.started = true;
-      t.started_ms = ev.ts_ms;
-    }
+    if (ev.type === "turn_started") t.started = true;
     else if (ev.type === "turn_completed") t.completed = true;
     else if (ev.type === "assistant_text" && str(ev.text).trim()) t.items.push({ kind: "text", key, ts_ms: ev.ts_ms, text: str(ev.text) });
     else if (ev.type === "tool_call") {
@@ -197,7 +191,7 @@ function stepsOfTurn(t: ChatTurn, running: boolean): Step[] {
 export function liveTurn(events: TraceEvent[]): LiveTurn | null {
   const t = chatTurns(events).at(-1);
   if (!t || !t.started || t.completed) return null;
-  return { turn: t.turn, started_ms: t.started_ms, steps: stepsOfTurn(t, true) };
+  return { turn: t.turn, steps: stepsOfTurn(t, true) };
 }
 
 /** A finished turn, as it ended: its steps (a call it never answered stopped) and its reply (its last text), if any. */
@@ -243,28 +237,32 @@ export function stepsBySeq(messages: ChatMessage[], turns: FinishedTurn[]): Map<
 
 /**
  * The log as one timeline with the manager's turn in progress (running, or held until its reply lands)
- * placed in it by time. Messages keep their order; each one sent during the turn (from its start on)
- * comes after the steps the turn had shown by then (`ts_ms` not later than its `at_ms`), so the stream is
- * split into parts around them, and what the turn does afterwards follows it. One in flight here (a
- * negative seq, not yet given a time by nest) follows every step shown. Messages nest never took
- * (`failed`, a negative seq) stay last, after the stream. Only the last part is live: it carries the
- * working line (`running` and no call running); a part with nothing to show is left out.
+ * placed in it by time. Messages keep their order; each of the owner's or the app's comes after the steps
+ * the turn had shown by then (`ts_ms` not later than its `at_ms`: one from before the turn, above it all),
+ * so the stream is split into parts around those sent during it, and what the turn does afterwards
+ * follows them. One in flight here (a negative seq, not yet given a time by nest) follows every step
+ * shown. The manager's own messages never split it: each is a turn's reply, timed when nest reported it,
+ * which can be after a later turn has begun. Messages nest never took (`failed`, a negative seq) stay
+ * last, after the stream. Only the last part is live: it carries the working line (`running` and no call
+ * running); a part with nothing to show is left out.
  */
 export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: boolean }) | null, now = Date.now()): LogItem[] {
-  if (!turn) return grouped(messages, now);
+  if (!turn) return groupLog(messages, now);
   const local = (m: ChatMessage) => m.seq < 0 && (m.status ?? (m.error ? "failed" : "owed")) === "failed";
   const kept = messages.filter((m) => !local(m));
   const { steps } = turn;
   const entries: (ChatMessage | Extract<LogItem, { kind: "stream" }>)[] = [];
+  // Keyed by their order, so a part keeps its rows as the turn grows and the live one as messages come.
+  let n = 0;
   const part = (from: number, to: number, live: boolean) => {
     const working = live && turn.running && !steps.some((s) => s.kind === "tool" && s.status === "running");
-    if (to > from || working) entries.push({ kind: "stream", key: `stream:${turn.turn}:${from}`, steps: steps.slice(from, to), live, working });
+    if (to > from || working) entries.push({ kind: "stream", key: `stream:${turn.turn}:${n++}`, steps: steps.slice(from, to), working });
   };
   let cut = 0;
   for (const m of kept) {
     // Never back before a message already placed: the messages keep their order.
     const after = steps.findIndex((s) => s.ts_ms > m.at_ms);
-    const at = m.seq < 0 ? steps.length : m.at_ms < turn.started_ms ? 0 : after < 0 ? steps.length : after;
+    const at = m.sender === "manager" ? cut : m.seq < 0 ? steps.length : after < 0 ? steps.length : after;
     if (at > cut) {
       part(cut, at, false);
       cut = at;

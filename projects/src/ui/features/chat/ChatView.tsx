@@ -344,7 +344,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   // Nothing said yet and no turn running: nothing to follow (its welcome is read from the top).
   const emptyRef = useRef(true);
   // The last stream, kept until the turn's message lands, so the swap doesn't jump.
-  const [held, setHeld] = useState<{ turn: string; started_ms: number; steps: Step[]; sinceSeq: number } | null>(null);
+  const [held, setHeld] = useState<{ turn: string; steps: Step[]; sinceSeq: number } | null>(null);
 
   const latest = useMemo(() => chat.data ?? [], [chat.data]);
   const messages = useMemo(() => {
@@ -365,7 +365,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
 
   // Hold the stream until its message lands (a manager message newer than when it began).
   useEffect(() => {
-    if (live && live.steps.length) setHeld((h) => ({ turn: live.turn, started_ms: live.started_ms, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : lastManagerSeq }));
+    if (live && live.steps.length) setHeld((h) => ({ turn: live.turn, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : lastManagerSeq }));
   }, [live]); // `lastManagerSeq` is read at each turn's start only
   // The held turn as it ended (a call it never answered reads stopped), while the ring has it.
   const heldEnd = !live && held ? (finished.find((t) => t.turn === held.turn) ?? null) : null;
@@ -525,7 +525,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const phone = usePhone();
   // The turn in the log where it is in time (README.md#the-manager-chat): split by the messages sent
   // during it; a held one keeps its split until its reply lands.
-  const turn = live ? { ...live, running } : held && !landed ? { turn: held.turn, started_ms: held.started_ms, steps: heldEnd?.steps ?? held.steps, running: false } : null;
+  const turn = live ? { ...live, running } : held && !landed ? { turn: held.turn, steps: heldEnd?.steps ?? held.steps, running: false } : null;
   const items = timeline(messages, turn);
   const replySteps = stepsBySeq(messages, finished);
   // One spinner in the log: the most recent of the owner's messages in flight.
@@ -543,9 +543,9 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     it.kind === "day" ? (
       <DaySeparator key={it.key} label={it.label} />
     ) : it.kind === "stream" ? (
-      // A part of the turn in progress: only the last is live (its working line, its running call).
+      // A part of the turn in progress, between the messages sent during it: the last has the working line.
       <MessageGroup key={it.key} side="manager" name="Manager" avatar={MANAGER_MARK}>
-        <MessageRow side="manager" quiet data-sender="stream" data-live={it.live ? "" : undefined}>
+        <MessageRow side="manager" quiet data-sender="stream">
           <Stack gap="sm">
             {it.steps.length > 0 && <LiveSteps steps={it.steps} projectId={projectId} />}
             {it.working && <WorkingLine>Working…</WorkingLine>}

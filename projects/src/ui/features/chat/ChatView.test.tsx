@@ -673,7 +673,7 @@ describe("the chat", () => {
     api.holds.push({ match: /^POST .*\/chat$/, until: new Promise((r) => (release = () => r(null))) });
     await user.type(within(c).getByLabelText("Message to the manager"), "Also check the tests{Enter}");
     await within(c).findByText("Also check the tests");
-    expect(mine()).toHaveAttribute("data-seq", expect.stringMatching(/^-/));
+    expect(seqs()).toEqual(["1", expect.stringMatching(/^-/)]);
     expect(below(read(), mine())).toBe(true);
     expect(below(mine(), within(c).getByText("Working…"))).toBe(true);
     // Taken: the same place, with nest's seq and time.
