@@ -336,7 +336,7 @@ describe("the models in the settings", () => {
     expect(await save(3)).toMatchObject({ reviewer_model: null, routine_model: null });
   });
 
-  it("a reviewers' or routines' model the server leaves out reads as the default, and is saved as null", async () => {
+  it("a reviewers' or routines' model the server leaves out reads as the default, and isn't sent unless changed", async () => {
     const api = new FakeApi();
     const settings = api.projects[0]!.settings as Partial<typeof api.projects[0]["settings"]>;
     delete settings.reviewer_model;

@@ -134,10 +134,13 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
 
   return (
     <form
-      onSubmit={form.onSubmit(({ comments_from_login, comments_from_repo_owner, ...v }) =>
+      onSubmit={form.onSubmit(({ comments_from_login, comments_from_repo_owner, reviewer_model, routine_model, ...v }) =>
         // Whose comments count is sent only when changed: an id with no login known shows as an empty field.
+        // So are the reviewers' and routines' models: a server that leaves them out (a release before them) takes none.
         update.mutate({
           ...v,
+          ...(form.isDirty("reviewer_model") ? { reviewer_model } : {}),
+          ...(form.isDirty("routine_model") ? { routine_model } : {}),
           ...(hold !== held ? { untrusted_reviews: hold ? ("hold" as const) : ("review" as const) } : {}),
           ...(comments_from_repo_owner ? { comments_from_repo_owner: true as const }
             : form.isDirty("comments_from_login") ? { comments_from_login: comments_from_login?.trim() || null } : {}),
