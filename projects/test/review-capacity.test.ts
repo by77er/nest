@@ -428,8 +428,12 @@ describe("a review nest has no room for", () => {
       const s = sha();
       await push(p, 1, s);
       await run(p);
+      // Again: the check's update owed by the first is sent, so no alarm is due for it.
+      await run(p);
       expect((await job(p, 1, s)).state).toBe("queued");
-      await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => {
+      // The long wait, with no alarm armed: one due meanwhile would tell the project before the test's own drain.
+      await runInDurableObject(reviews(p), async (_o: unknown, st: DurableObjectState) => {
+        await st.storage.deleteAlarm();
         st.storage.sql.exec("UPDATE jobs SET capacity_ms = ?, next_ms = ? WHERE pr = 1", Date.now() - ROOM_TELL_AFTER_MS - 60_000, Date.now() + nextMs);
       });
       return { p, s };
