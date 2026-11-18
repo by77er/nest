@@ -176,9 +176,6 @@ export function roleTemplate(role: ModelRole, project: string, model: string): {
   return { name: `${NAMESPACE}/${modelTemplateEntry(role, project, model)}`, body: { ...shared, launch: { ...shared.launch, model } } };
 }
 
-/** Whether a dreaming run starts from `template`: the shared one, or a project's own on its model (no hands either way). */
-export const isDreamingTemplate = (template: string): boolean => template === TEMPLATE.dreaming || template.startsWith(`${TEMPLATE.dreaming}-`);
-
 export interface CatalogEntries {
   capabilities: Record<string, unknown>;
   templates: Record<string, unknown>;

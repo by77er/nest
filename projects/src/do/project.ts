@@ -8,7 +8,7 @@
 
 import { type IssuesFrom, MAX_UNTRIAGED_ISSUES } from "../issues";
 import { DurableObject } from "cloudflare:workers";
-import { isDreamingTemplate, roleTemplate, TEMPLATE, writeSharedTemplate } from "../catalog";
+import { roleTemplate, TEMPLATE, writeSharedTemplate } from "../catalog";
 import { DEFAULT_MODEL, modelLabel, type ModelRole, modelProblem } from "../models";
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
@@ -680,7 +680,8 @@ export const MIGRATIONS = [
   ],
   [
     // The models reviewers and routine runs run on (README.md#models); null: Claude Code's default (the shared
-    // templates, which name none). A run's model as its first attempt froze it, with its template (null: the shared one).
+    // templates, which name none). A run's model as its first attempt froze it (null: none); its `template` keeps the
+    // shared name, which a previous release reads (`runTemplate`).
     "ALTER TABLE settings ADD COLUMN reviewer_model TEXT",
     "ALTER TABLE settings ADD COLUMN routine_model TEXT",
     "ALTER TABLE routine_runs ADD COLUMN model TEXT",
@@ -2322,8 +2323,10 @@ export class ProjectDO extends DurableObject<Env> {
         else if (r.role === "reviewer" && now - r.at_ms < START_LEASE_MS) keep.add(r.name);
       }
       // A routine run's, frozen with it before it's written: until the run has ended and its agent's stop isn't owed.
-      for (const t of this.sql.exec<{ template: string }>(
-        "SELECT DISTINCT template FROM routine_runs WHERE template IS NOT NULL AND (state != 'ended' OR agent IN (SELECT agent FROM stops))").toArray()) keep.add(t.template);
+      for (const t of this.sql.exec<{ template: string; model: string }>(
+        "SELECT DISTINCT template, model FROM routine_runs WHERE template IS NOT NULL AND model IS NOT NULL AND (state != 'ended' OR agent IN (SELECT agent FROM stops))").toArray()) {
+        keep.add(runTemplate(s.id, t.template === TEMPLATE.dreaming, t.model));
+      }
     }
     const out: (OutboxRow & { name: string; at_ms: number })[] = [];
     for (const r of rows) {
@@ -4068,22 +4071,22 @@ export class ProjectDO extends DurableObject<Env> {
       const deadline = now + (routine.max_minutes as number) * 60_000;
       const kind = routine.kind as RoutineKind;
       const extras = routineSpawnExtras({ kind, project: s.id, deadline_ms: deadline, last_start_ms: (routine.prev_start_ms as number | null) ?? null, now });
-      // Its model as the settings have it now (README.md#models): the project's own template on it, or the shared one.
-      const role = kind === "dreaming" ? "dreaming" : "routine";
-      const model = s.routine_model;
+      // Its model as the settings have it now (README.md#models), beside the shared template's name (`runTemplate`).
       this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ?, template = ?, model = ?, brief = ? WHERE id = ? AND spawn IS NULL",
-        JSON.stringify(extras), deadline, model ? roleTemplate(role, s.id, model).name : TEMPLATE[role], model, briefOf(extras), id);
+        JSON.stringify(extras), deadline, kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine, s.routine_model, briefOf(extras), id);
     }
     const frozen = this.runRow(id)!;
     const spawn = JSON.parse(frozen.spawn as string) as Record<string, unknown>;
-    const template = (frozen.template as string | null) ?? (routine.kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine);
+    const dreaming = ((frozen.template as string | null) ?? (routine.kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine)) === TEMPLATE.dreaming;
+    // Frozen before the column existed: none (the shared template).
     const model = (frozen.model as string | null | undefined) ?? null;
+    const template = runTemplate(s.id, dreaming, model);
     try {
       let agent = (before.agent as string | null) ?? null;
       if (!agent) {
         // No secrets and no egress beyond nest's own and the repo's: a routine reads the repo and the board.
         // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
-        if (isDreamingTemplate(template)) {
+        if (dreaming) {
           // On a model of the project's: its own template, written first.
           if (model) await this.writeModelTemplate(nest, "dreaming", model);
           agent = (await nest.createAgent({ ...spawn, template, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent;
@@ -5649,6 +5652,14 @@ export const REVISE_MAX = 3;
 const REVISE_WINDOW_MS = 3_600_000;
 
 /** A line of text that can't add lines of its own to the frame: control characters (newlines too) go. */
+/**
+ * The template a routine run starts from (README.md#models): the project's own on the model it froze, or the
+ * shared one. `routine_runs.template` keeps the shared name (a previous release starts a dreaming run by it,
+ * without hands), and `routine_runs.model` the model.
+ */
+const runTemplate = (project: string, dreaming: boolean, model: string | null): string =>
+  model ? roleTemplate(dreaming ? "dreaming" : "routine", project, model).name : dreaming ? TEMPLATE.dreaming : TEMPLATE.routine;
+
 const oneLine = (s: string) => s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").slice(0, 300);
 
 /** How long a comment's text may be in the message (the rest is behind its link). */
