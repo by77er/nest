@@ -3,7 +3,7 @@
 import type { HistoryRow, Settings as ProjectSettings, Task } from "../../do/project";
 import type { ProjectRow } from "../../do/directory";
 
-export type { Ask, ChatMessage, HistoryRow, Task } from "../../do/project";
+export type { Ask, ChatMessage, HistoryRow, Task, TaskSummary } from "../../do/project";
 /** A project's settings as the API answers them: ProjectDO's, with ReviewDO's `untrusted_reviews` (README.md#the-review-gate; `hold` when absent). */
 export type Settings = ProjectSettings & { untrusted_reviews?: "hold" | "review" };
 export type { ProjectRow, RepoBinding, SyncState } from "../../do/directory";

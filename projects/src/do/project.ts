@@ -152,6 +152,9 @@ export interface Task {
   updated_ms: number;
 }
 
+/** A task as the board's list carries it (README.md#built-the-core): all of it but its body and spec, which `getTask` has. */
+export type TaskSummary = Omit<Task, "body" | "spec">;
+
 /**
  * A task's issue, and closing it on GitHub once the task is done: not yet owed (null), owed (being
  * tried), closed, or failed (GitHub refused for good: `error` says why, and the owner may retry).
@@ -707,6 +710,11 @@ export const MIGRATIONS = [
     "ALTER TABLE routines ADD COLUMN prompt_tainted INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE routine_runs ADD COLUMN brief_tainted INTEGER",
   ],
+  [
+    // The board's list reads which tasks have a tainted write in one statement (`taskSummaries`): only the
+    // tainted rows are indexed, so it reads those and none of the rest of the history.
+    "CREATE INDEX IF NOT EXISTS history_tainted ON history (task) WHERE tainted = 1",
+  ],
 ] as const;
 
 /** The roles an ask's agent may carry in its labels (as the webhook routes them); any other reads as none. */
@@ -777,6 +785,45 @@ const outboxRow = (r: Row): OutboxRow => ({ next_ms: (r.next_ms as number | null
 
 /** A task's row with `tainted`: whether any write in its history came from a tainted session. */
 const TASK_SELECT = "SELECT t.*, EXISTS (SELECT 1 FROM history h WHERE h.task = t.id AND h.tainted = 1) AS tainted FROM tasks t";
+/** The columns of a task the list reads (`taskSummaries`): what `summaryOf` uses, never the body or the spec. */
+const SUMMARY_COLUMNS = "id, title, state, ord, assignee, start_error, worker_live, issue, created_ms, updated_ms, blocked_ms, blocked_by, blocked_role, blocked_reason, blocked_question, blocked_tainted";
+
+type Relations = Pick<Task, "pr" | "prs" | "blocked_by" | "blocks" | "waiting_on">;
+
+/**
+ * A task as the list carries it, from its row, its relations, its issue's close row (undefined: none, or no
+ * issue) and whether a tainted session ever wrote it. Its keys in the order `toTask` has always answered them.
+ */
+function summaryOf(r: Row, rel: Relations, close: Row | undefined, tainted: boolean): TaskSummary {
+  return {
+    id: r.id as string, title: r.title as string,
+    state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null,
+    start_error: (r.start_error as string | null) ?? null, tainted, blocked: blockedOf(r),
+    worker_live: r.worker_live === 1 && !TERMINAL.has(r.state as TaskState),
+    ...rel, issue: taskIssue(r, close),
+    created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+  };
+}
+
+/** A task's issue, as Task carries it, from its `issue_closes` row (undefined: no close owed yet). */
+function taskIssue(r: Row, c: Row | undefined): TaskIssue | null {
+  if (r.issue === null || r.issue === undefined) return null;
+  const close = !c ? null : c.closed_ms !== null ? "closed" : c.next_ms !== null ? "owed" : "failed";
+  return { number: r.issue as number, close, error: close === "failed" ? ((c!.error as string | null) ?? null) : null };
+}
+
+const taskPr = (p: Row): TaskPr => ({
+  number: p.pr as number, state: p.state as "open" | "merged", title: (p.title as string | null) ?? null, fork: p.fork === null ? null : p.fork === 1,
+  attached_by: p.attached_by as string, attached_ms: p.attached_ms as number, auto_merge: prAutoMerge(p),
+});
+const taskRef = (r: Row): TaskRef => ({ id: r.id as string, title: r.title as string, state: r.state as TaskState });
+
+/** `key`'s list in `m`, made empty the first time. */
+function group<T>(m: Map<string, T[]>, key: string): T[] {
+  let l = m.get(key);
+  if (!l) m.set(key, (l = []));
+  return l;
+}
 
 export class ProjectDO extends DurableObject<Env> {
   private draining: Promise<void> | null = null;
@@ -973,39 +1020,62 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   private toTask(r: Row): Task {
-    return {
-      id: r.id as string, title: r.title as string, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null,
-      state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null,
-      start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, blocked: blockedOf(r),
-      worker_live: r.worker_live === 1 && !TERMINAL.has(r.state as TaskState),
-      ...this.relations(r.id as string), issue: this.taskIssue(r),
-      created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
-    };
+    const close = r.issue === null || r.issue === undefined ? undefined : this.sql.exec("SELECT next_ms, closed_ms, error FROM issue_closes WHERE task = ?", r.id).toArray()[0];
+    const { id, title, ...rest } = summaryOf(r, this.relations(r.id as string), close, r.tainted === 1);
+    // Its body and spec in their places (after the title), then the rest as the list has it.
+    return { id, title, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null, ...rest };
   }
 
-  /** A task's issue, as Task carries it. */
-  private taskIssue(r: Row): TaskIssue | null {
-    if (r.issue === null || r.issue === undefined) return null;
-    const c = this.sql.exec("SELECT next_ms, closed_ms, error FROM issue_closes WHERE task = ?", r.id).toArray()[0];
-    const close = !c ? null : c.closed_ms !== null ? "closed" : c.next_ms !== null ? "owed" : "failed";
-    return { number: r.issue as number, close, error: close === "failed" ? ((c!.error as string | null) ?? null) : null };
-  }
-
-  /** A task's PRs and dependencies, as Task carries them. */
-  private relations(id: string): Pick<Task, "pr" | "prs" | "blocked_by" | "blocks" | "waiting_on"> {
-    const prs = this.sql.exec("SELECT * FROM task_prs WHERE task = ? AND state != 'detached' ORDER BY attached_ms, pr", id).toArray().map((p): TaskPr => ({
-      number: p.pr as number, state: p.state as "open" | "merged", title: (p.title as string | null) ?? null, fork: p.fork === null ? null : p.fork === 1,
-      attached_by: p.attached_by as string, attached_ms: p.attached_ms as number, auto_merge: prAutoMerge(p),
-    }));
-    const ref = (r: Row): TaskRef => ({ id: r.id as string, title: r.title as string, state: r.state as TaskState });
-    const blocked_by = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.blocker WHERE d.task = ? ORDER BY d.at_ms", id).toArray().map(ref);
-    const blocks = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.task WHERE d.blocker = ? ORDER BY d.at_ms", id).toArray().map(ref);
+  /**
+   * A task's PRs and dependencies, as Task carries them. Dependencies added in the same ms: its blockers by id,
+   * the tasks waiting on it by rowid, as added (`taskSummaries` orders them the same).
+   */
+  private relations(id: string): Relations {
+    const prs = this.sql.exec("SELECT * FROM task_prs WHERE task = ? AND state != 'detached' ORDER BY attached_ms, pr", id).toArray().map(taskPr);
+    const blocked_by = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.blocker WHERE d.task = ? ORDER BY d.at_ms, d.blocker", id).toArray().map(taskRef);
+    const blocks = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.task WHERE d.blocker = ? ORDER BY d.at_ms, d.rowid", id).toArray().map(taskRef);
     return { pr: prs[0]?.number ?? null, prs, blocked_by, blocks, waiting_on: waitingOn(blocked_by) };
   }
 
-  async listTasks(): Promise<Result<Task[]>> {
+  /**
+   * Every task as the board's list carries it (README.md#built-the-core), in the board's order, and whether it has a
+   * spec. A fixed number of statements whatever the number of tasks: the tasks without their bodies and specs,
+   * then the PRs, the dependencies (both ways), the issues' closes and the tainted tasks, each read once for
+   * the project and grouped here. Each field is what `toTask` makes of the same rows.
+   */
+  private taskSummaries(): { task: TaskSummary; specced: boolean }[] {
+    const rows = this.sql.exec(`SELECT ${SUMMARY_COLUMNS}, spec IS NOT NULL AS specced FROM tasks ORDER BY ord, created_ms`).toArray();
+    const prs = new Map<string, TaskPr[]>();
+    for (const p of this.sql.exec("SELECT * FROM task_prs WHERE state != 'detached' ORDER BY attached_ms, pr").toArray()) {
+      group(prs, p.task as string).push(taskPr(p));
+    }
+    // Both ways in one read: a task's blockers (in `blocked_by`) and the tasks waiting on it (in `blocks`).
+    const blockedBy = new Map<string, TaskRef[]>();
+    const blocks = new Map<string, TaskRef[]>();
+    for (const d of this.sql.exec(
+      `SELECT d.task, d.blocker, b.id AS b_id, b.title AS b_title, b.state AS b_state, w.id AS w_id, w.title AS w_title, w.state AS w_state
+        FROM task_deps d LEFT JOIN tasks b ON b.id = d.blocker LEFT JOIN tasks w ON w.id = d.task ORDER BY d.at_ms, d.blocker, d.rowid`,
+    ).toArray()) {
+      if (d.b_id !== null) group(blockedBy, d.task as string).push({ id: d.b_id as string, title: d.b_title as string, state: d.b_state as TaskState });
+      if (d.w_id !== null) group(blocks, d.blocker as string).push({ id: d.w_id as string, title: d.w_title as string, state: d.w_state as TaskState });
+    }
+    const closes = new Map(this.sql.exec("SELECT task, next_ms, closed_ms, error FROM issue_closes").toArray().map((c) => [c.task as string, c]));
+    // Through `history_tainted`, which holds only the tainted rows: the rest of the history isn't read.
+    const tainted = new Set(this.sql.exec("SELECT DISTINCT task FROM history WHERE tainted = 1").toArray().map((h) => h.task as string));
+    return rows.map((r) => {
+      const id = r.id as string;
+      const taskPrs = prs.get(id) ?? [];
+      const by = blockedBy.get(id) ?? [];
+      const rel: Relations = { pr: taskPrs[0]?.number ?? null, prs: taskPrs, blocked_by: by, blocks: blocks.get(id) ?? [], waiting_on: waitingOn(by) };
+      const close = r.issue === null || r.issue === undefined ? undefined : closes.get(id);
+      return { task: summaryOf(r, rel, close, tainted.has(id)), specced: r.specced === 1 };
+    });
+  }
+
+  /** The board's list: every task without its body and spec (`getTask` has them). */
+  async listTasks(): Promise<Result<TaskSummary[]>> {
     if (!this.settings()) return fail(404, "unknown project");
-    return ok(this.sql.exec(`${TASK_SELECT} ORDER BY t.ord, t.created_ms`).toArray().map((r) => this.toTask(r)));
+    return ok(this.taskSummaries().map((s) => s.task));
   }
 
   async getTask(id: string): Promise<Result<Task & { history: HistoryRow[] }>> {
@@ -4410,9 +4480,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (server === "board") {
       switch (tool) {
         case "list_tasks": {
-          const tasks = (await this.listTasks());
-          if (!tasks.ok) return tasks;
-          return ok({ project: this.settings(), tasks: tasks.value.map(({ body: _b, spec, ...t }) => ({ ...t, specced: spec !== null })) });
+          if (!this.settings()) return fail(404, "unknown project");
+          return ok({ project: this.settings(), tasks: this.taskSummaries().map(({ task, specced }) => ({ ...task, specced })) });
         }
         case "get_task":
           return this.getTask(a.task as string);
@@ -4541,9 +4610,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (!run) return fail(403, "this run has ended");
     switch (tool) {
       case "list_tasks": {
-        const tasks = await this.listTasks();
-        if (!tasks.ok) return tasks;
-        return ok({ tasks: tasks.value.map(({ body: _b, spec, ...t }) => ({ ...t, specced: spec !== null })) });
+        if (!this.settings()) return fail(404, "unknown project");
+        return ok({ tasks: this.taskSummaries().map(({ task, specced }) => ({ ...task, specced })) });
       }
       case "get_task":
         return this.getTask(a.task as string);

@@ -14,7 +14,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { IconLayoutList, IconPlus } from "@tabler/icons-react";
 import { lazy, Suspense, useMemo, useState } from "react";
 import { useAsks, useReorderTask, useTasks } from "../../api/queries";
-import type { Task } from "../../api/types";
+import type { TaskSummary } from "../../api/types";
 import { EmptyState, ErrorState, icon, LoadingState, Panel, Section, TaskGroup, TaskList, Toolbar } from "../../layout";
 import { CANCELLED_COLUMN, type Column, COLUMNS } from "../../status";
 import { ordForMove } from "./order";
@@ -43,14 +43,14 @@ function saveCollapsed(projectId: string, ids: Set<string>) {
 }
 
 /** The tasks of each stage, in board order, leaving out a stage with none. */
-export function groupTasks(tasks: readonly Task[], columns: readonly Column[]): { column: Column; tasks: Task[] }[] {
+export function groupTasks(tasks: readonly TaskSummary[], columns: readonly Column[]): { column: Column; tasks: TaskSummary[] }[] {
   return columns.map((column) => ({ column, tasks: tasks.filter((t) => column.states.includes(t.state)) })).filter((g) => g.tasks.length > 0);
 }
 
 /** One stage's rows: they reorder within it (dnd-kit), the moved row's new `ord` written at once. */
 function BoardGroup({ column, tasks, open, onToggle, projectId, repo, pendingAsks, onMove, onDragging }: {
   column: Column;
-  tasks: Task[];
+  tasks: TaskSummary[];
   open: boolean;
   onToggle: () => void;
   projectId: string;
