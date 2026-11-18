@@ -1643,8 +1643,11 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     const held = new Promise<void>((r) => { release = r; });
     const orig = SandboxDO.prototype.evicted;
     SandboxDO.prototype.evicted = async function (this: SandboxDO, ...args: Parameters<SandboxDO["evicted"]>) {
-      reached = true;
-      await held;
+      // Only this test's host: other cells' evictions run in the same pool.
+      if (args[0] === a.host) {
+        reached = true;
+        await held;
+      }
       return orig.apply(this, args);
     };
     try {
@@ -1683,12 +1686,49 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     expect(cmds.filter((c) => c.type === "sandbox_suspend")).toMatchObject([{ sandbox: sbx.sandbox, epoch: 1 }]);
     expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 1 });
 
-    // Answered without a `running` before it (the resume failed): suspended as reported, so a second drain evicts it.
+    // The resume fails: the VM is still suspended, and nestd answers the suspend "already suspended"
+    // with no report. The resume's result is what lets the lease leave.
     sendEvents(a.ws, [{ ts_ms: Date.now(), type: "command_result", cmd: resume.cmd, outcome: { status: "error", error: { code: "internal", message: "resume failed", retryable: false } } }]);
-    await eventually("the resume is answered", async () => (await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) =>
-      st.storage.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", resume.cmd).toArray().length)) === 1);
-    await adminJson(`/v1/admin/hosts/${a.host}/drain?cell=${cell}`, { body: {} });
-    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toBeNull();
+    await eventually("the lease left with the failed resume's result", async () => (await fleetStub(cell).leaseOf(sbx.sandbox)) === null);
+    await eventually("SandboxDO heard of the eviction", async () => (await sandboxStub(sbx.sandbox).info()).host === null);
+  });
+
+  it("a wake while SandboxDO is hearing `suspended` from a draining host sends no resume there", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const ran = state(a.ws, sbx.sandbox, 1, "running");
+    await a.ws.next("ack", (m) => m.up_to >= ran);
+    await commitHead(a.ws, sbx.sandbox, 1, "req_wakerace2");
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+
+    // SandboxDO has recorded `suspended`, and its answer to FleetDO is held: FleetDO is in the await
+    // between the report and telling SandboxDO of the eviction.
+    let reached = false;
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    const orig = SandboxDO.prototype.reportState;
+    SandboxDO.prototype.reportState = async function (this: SandboxDO, ...args: Parameters<SandboxDO["reportState"]>) {
+      const r = await orig.apply(this, args);
+      if (args[0] === a.host && args[2] === "suspended") {
+        reached = true;
+        await held;
+      }
+      return r;
+    };
+    try {
+      state(a.ws, sbx.sandbox, 1, "suspended");
+      await eventually("SandboxDO has it suspended", () => reached);
+      expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ host: a.host, state: "suspended" });
+      await expect(Promise.resolve().then(() => sandboxStub(sbx.sandbox).wake())).rejects.toThrow(/holds no lease/);
+      expect(await resumesFor(cell, sbx.sandbox)).toBe(0);
+    } finally {
+      release();
+      SandboxDO.prototype.reportState = orig;
+    }
+    await eventually("SandboxDO heard of the eviction", async () => (await sandboxStub(sbx.sandbox).info()).host === null);
   });
 
   // Hosts inventory B8: the same resume in flight, at an idle retirement.

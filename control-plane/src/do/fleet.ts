@@ -1253,14 +1253,27 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Sandboxes with a `sandbox_resume` no host has answered. Such a lease still reads `suspended`
-   * (nestd reports `running` once the guest is up, and the command's result follows that report
-   * on the same channel), but its VM may already run and hold work: it isn't evicted or moved as
-   * suspended, and it keeps its host from retiring as idle.
+   * Whether a lease of `host` has a `sandbox_resume` the host hasn't answered. Such a lease still
+   * reads `suspended` (nestd reports `running` once the guest is up, and the command's result
+   * follows that report on the same channel), but its VM may already run and hold work: it isn't
+   * evicted or moved as suspended, and it keeps its host from retiring as idle.
    */
-  private resumesUnanswered(): Set<string> {
-    return new Set(this.sql.exec<{ sandbox: string }>(
-      "SELECT sandbox FROM commands WHERE type = 'sandbox_resume' AND result IS NULL AND sandbox IS NOT NULL").toArray().map((r) => r.sandbox));
+  private resumesUnanswered(host: string): (l: { sandbox: string; epoch: number }) => boolean {
+    const waking = new Set(this.sql.exec<{ sandbox: string; epoch: number }>(
+      "SELECT sandbox, epoch FROM commands WHERE host = ? AND result IS NULL AND type = 'sandbox_resume' AND sandbox IS NOT NULL", host)
+      .toArray().map((r) => `${r.sandbox}@${r.epoch}`));
+    return (l) => waking.has(`${l.sandbox}@${l.epoch}`);
+  }
+
+  /**
+   * On a draining host, the leases that read `suspended` with no resume unanswered leave: dropped and
+   * their evictions owed, in one step (the caller tells SandboxDO, `processEvictions`). The drain
+   * does this once; again whenever such a lease can appear later: a resume that failed leaves its
+   * VM suspended, and nestd answers the drain's suspend "already suspended" with no report.
+   */
+  private evictSuspendedOf(host: string): void {
+    const waking = this.resumesUnanswered(host);
+    this.recordEvictions(host, this.leasesOf(host).filter((l) => !l.expired && l.state === "suspended" && !waking(l)).map((l) => l.sandbox));
   }
 
   /**
@@ -1281,9 +1294,10 @@ export class FleetDO extends DurableObject<Env> {
         drop();
         continue;
       }
-      // A destroyed sandbox has nothing to salvage (its commit would be refused), and its own
-      // `sandbox_destroy` may have deleted the incarnation under its retire, which then reports
-      // nothing: waiting out the window would only keep the host from retiring or finishing a drain.
+      // A destroyed sandbox has nothing worth salvaging (its generations are no longer kept), and
+      // its own `sandbox_destroy` may have deleted the incarnation under its retire, which then
+      // reports nothing: waiting out the window would only keep the host from retiring or
+      // finishing a drain.
       if (!r.clean && !this.sandboxDestroyedHere(r.sandbox) && now - r.first_seen_ms < SALVAGE_WINDOW_MS) continue;
       const [cmd] = this.issueCommands(r.host, [{ type: "sandbox_destroy", sandbox: r.sandbox, epoch: r.epoch }]);
       this.sql.exec("UPDATE stale_incarnations SET cmd = ? WHERE sandbox = ? AND host = ? AND epoch = ?", cmd!, r.sandbox, r.host, r.epoch);
@@ -1452,10 +1466,14 @@ export class FleetDO extends DurableObject<Env> {
           return;
         }
         this.recordState(host, ev.sandbox, ev.epoch, ev.state, ev.guest);
+        // A draining host's sandboxes leave as soon as they're safely suspended: the lease goes in
+        // this step, before SandboxDO hears `suspended` (a wake it sends from then on is refused,
+        // not sent to a host about to lose the lease), and SandboxDO is told of the eviction after.
+        const leaving = ev.state === "suspended" && this.host(host)?.status === "draining";
+        if (leaving) this.evictSuspendedOf(host);
         await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.detail ?? null, ev.guest ?? null);
         if (ev.state === "fenced") await this.holderFenced(host, ev.sandbox, ev.epoch, false);
-        // A draining host's sandboxes leave as soon as they're safely suspended.
-        else if (ev.state === "suspended" && this.host(host)?.status === "draining") await this.evict(host, [ev.sandbox]);
+        else if (leaving) await this.processEvictions();
         return;
       case "commit_request":
         return this.onCommitRequest(host, ev);
@@ -1572,7 +1590,11 @@ export class FleetDO extends DurableObject<Env> {
     const owed = resultFollowups(row, outcome).length > 0;
     this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ?, followup_ms = ?, followup_attempts = 0 WHERE cmd = ?",
       JSON.stringify(outcome), Date.now(), answeredBy, owed ? Date.now() : null, cmd);
+    // A resume answered on a draining host: its lease, if it still reads `suspended`, can leave now.
+    const left = row.type === "sandbox_resume" && this.host(host)?.status === "draining";
+    if (left) this.evictSuspendedOf(host);
     if (owed) await this.deadlines.set(ALARM_FOLLOWUPS, Date.now() + followupBackoff(1), true);
+    if (left) await this.processEvictions();
 
     if (row.purpose === "stonith_fence") {
       const body = JSON.parse(row.body) as Extract<CommandBody, { type: "fence" }>;
@@ -1785,12 +1807,12 @@ export class FleetDO extends DurableObject<Env> {
     const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(opens ? ["guard_injected_any = 1"] : []), ...(basic ? [ENFORCES_AT] : [])].join(" AND ");
     // A sandbox whose resume is in flight still reads `suspended`: it isn't moved to make room.
     const facts = () => {
-      const waking = this.resumesUnanswered();
       return this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
         .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
         .map((h) => {
           const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;
-          const leases = this.leasesOf(h.host).map((l) => ({ ...l, movable: l.state === "suspended" && !l.expired && !waking.has(l.sandbox) }));
+          const waking = this.resumesUnanswered(h.host);
+          const leases = this.leasesOf(h.host).map((l) => ({ ...l, movable: l.state === "suspended" && !l.expired && !waking(l) }));
           return { host: h.host, capacity, capacity_seq: h.capacity_seq, leases, warm: !!req.from && !!capacity?.warm.includes(req.from.id) };
         });
     };
@@ -2497,8 +2519,8 @@ export class FleetDO extends DurableObject<Env> {
         // Nor is a host retired while it holds an incarnation not yet salvaged and destroyed (a failed
         // sandbox's, released): its uncommitted work would go with the instance.
         const salvaging = this.sql.exec("SELECT 1 FROM stale_incarnations WHERE host = ? AND cmd IS NULL", h.host).toArray().length > 0;
-        const waking = this.resumesUnanswered();
-        const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended" || waking.has(l.sandbox)) || this.brainsOn(h.host) > 0 || salvaging;
+        const waking = this.resumesUnanswered(h.host);
+        const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended" || waking(l)) || this.brainsOn(h.host) > 0 || salvaging;
         const step = idleStep(busy, h.idle_since, now, grace);
         if (step === "busy") {
           if (h.idle_since !== null) this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", h.host);
@@ -2513,6 +2535,8 @@ export class FleetDO extends DurableObject<Env> {
     // A draining host of any kind goes once empty, rather than at its deadline: never with a lease,
     // an indexed brain (alive until its exit), or a stale incarnation not yet salvaged.
     for (const h of this.hostsBy({ status: "draining" })) {
+      // What became evictable since the drain (a failed resume's result): told below, with the rest.
+      this.evictSuspendedOf(h.host);
       if (this.leasesOf(h.host).length) continue;
       if (this.sql.exec("SELECT 1 FROM host_agents WHERE host = ?", h.host).toArray().length) continue;
       if (this.sql.exec("SELECT 1 FROM stale_incarnations WHERE host = ? AND cmd IS NULL", h.host).toArray().length) continue;
@@ -2575,14 +2599,11 @@ export class FleetDO extends DurableObject<Env> {
   private async drain(host: string, why: string): Promise<void> {
     this.move(host, "drain");
     console.warn(`FleetDO: ${host} draining (${why})`);
-    const leases = this.leasesOf(host).filter((l) => !l.expired);
-    // Read in this step, before the evictions' await: a lease with a resume unanswered is told to
-    // suspend like a running one (the host runs its commands in order, the resume first).
-    const waking = this.resumesUnanswered();
-    const suspended = (l: { state: string | null; sandbox: string }) => l.state === "suspended" && !waking.has(l.sandbox);
-    const running = leases.filter((l) => !suspended(l));
-    // The leases that go and the suspends are decided and written in one step; SandboxDO is told after.
-    this.recordEvictions(host, leases.filter(suspended).map((l) => l.sandbox));
+    // The leases that go and the suspends are decided and written in one step; SandboxDO is told
+    // after. A lease with a resume unanswered is told to suspend like a running one (the host runs
+    // its commands in order, the resume first).
+    this.evictSuspendedOf(host);
+    const running = this.leasesOf(host).filter((l) => !l.expired);
     if (running.length) {
       this.issueCommands(host, running.map((l) => ({ type: "sandbox_suspend" as const, sandbox: l.sandbox, epoch: l.epoch, mode: "disk_only" as const })));
     }

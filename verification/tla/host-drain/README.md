@@ -18,4 +18,4 @@ java -XX:+UseParallelGC -Xmx3g -cp ../../.tools/tla2tools-1.7.4.jar tlc2.TLC -wo
   -metadir /var/tmp/tlc-host-drain -config MC_spot.cfg HostDrain.tla
 ```
 
-Every config is in `expect.tsv` with its expected outcome; all are `ci` (the largest has about 116,000 distinct states).
+Every config is in `expect.tsv` with its expected outcome; all are `ci` (the largest has about 240,000 distinct states).

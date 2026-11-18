@@ -2069,8 +2069,9 @@ describe("FleetDO and SandboxDO at the seam", () => {
           first = false;
           const other = args[0] === h1.host ? h2.host : h1.host;
           st.storage.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ?", other);
-          // A suspended lease: it doesn't keep an idle host up, but a draining host isn't retired with it.
-          st.storage.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, state) VALUES ('sbx_hold', ?, 1, 0, 'suspended')", other);
+          // A suspended lease, expired: it doesn't keep an idle host up, but a draining host isn't retired
+          // with it (one not expired would simply leave a draining host: `evictSuspendedOf`).
+          st.storage.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, state) VALUES ('sbx_hold', ?, 1, 1, 'suspended')", other);
         }
         return real(...args);
       };
