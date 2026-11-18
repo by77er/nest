@@ -3,7 +3,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api } from "./client";
-import type { CreateRoutineBody, PutSecretBody, UpdateRoutineBody } from "./types";
+import type { CreateReviewerBody, CreateRoutineBody, PutSecretBody, ReviewerPreset, UpdateReviewerBody, UpdateRoutineBody } from "./types";
 import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody, Waiting } from "./types";
 import { splitAttention } from "./types";
 
@@ -16,6 +16,7 @@ export const keys = {
   asks: (id: string) => ["projects", id, "asks"] as const,
   manager: (id: string) => ["projects", id, "manager"] as const,
   reviews: (id: string) => ["projects", id, "reviews"] as const,
+  reviewers: (id: string) => ["projects", id, "reviewers"] as const,
   openPrs: (id: string) => ["projects", id, "open-prs"] as const,
   secrets: (id: string) => ["projects", id, "secrets"] as const,
   attention: (id: string) => ["projects", id, "attention"] as const,
@@ -236,6 +237,30 @@ function useHeldReview(id: string, act: (pr: number, sha: string) => Promise<unk
 }
 export const useApproveReview = (id: string) => useHeldReview(id, (pr, sha) => api.approveReview(id, pr, sha), "The review wasn't started");
 export const useDismissReview = (id: string) => useHeldReview(id, (pr, sha) => api.dismissReview(id, pr, sha), "The review wasn't dismissed");
+
+// --- the project's reviewers (README.md#reviewers) ---------------------------------------------------------
+
+/** Polled with the reviews, so a reviewer the manager adds or changes shows without a reload. */
+export const useReviewers = (id: string) => useQuery({ queryKey: keys.reviewers(id), queryFn: () => api.reviewers(id), refetchInterval: POLL.reviews });
+
+/** A write to reviewers: the list read again after it. `failure` null: the form shows its error itself. */
+function useReviewerWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: fn,
+    meta: failure === null ? { inline: true } : { failure },
+    onSettled: () => qc.invalidateQueries({ queryKey: keys.reviewers(id) }),
+  });
+}
+
+export const useCreateReviewer = (id: string) => useReviewerWrite(id, (b: CreateReviewerBody) => api.createReviewer(id, b), null);
+export const useAddReviewerPreset = (id: string) => useReviewerWrite(id, (preset: ReviewerPreset) => api.createReviewer(id, { preset }), "The reviewer wasn't added");
+export const useUpdateReviewer = (id: string) =>
+  useReviewerWrite(id, (v: { reviewer: string } & UpdateReviewerBody) => {
+    const { reviewer, ...b } = v;
+    return api.updateReviewer(id, reviewer, b);
+  }, null);
+export const useDeleteReviewer = (id: string) => useReviewerWrite(id, (reviewer: string) => api.deleteReviewer(id, reviewer), "The reviewer wasn't deleted");
 
 /**
  * Needs you's notice that the default PR comments user was cleared (README.md#pr-comments), seen. `onDone`:

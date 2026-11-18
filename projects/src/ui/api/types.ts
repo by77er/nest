@@ -26,6 +26,9 @@ export type { OutboxState } from "../../outbox";
 export type { ManagerPhase, ManagerStatus } from "../../manager";
 export type { Job, JobState } from "../../do/review";
 export type { DimensionVerdict, Review, Verdict } from "../../reviewers";
+// A project's reviewer as the API answers it (README.md#reviewers): with who last wrote it (`source`) and its taint.
+export type { ProjectReviewer as Reviewer } from "../../reviewers";
+export type { CreateReviewerBody, ReviewerPreset, UpdateReviewerBody } from "../../requests";
 
 /** `GET /api/projects/<id>`. */
 export type Project = ProjectRow & { settings: Settings };

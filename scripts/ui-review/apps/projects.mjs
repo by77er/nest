@@ -894,6 +894,26 @@ const app = {
     { name: "manager-trace-beginning", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, check: traceCheck, checkName: "trace", after: toTop("the beginning of the trace") },
     { name: "reviews", section: "project", path: "/projects/prj_demo/reviews" },
     { name: "reviews-trace", section: "project", path: "/projects/prj_demo/reviews", after: (p) => p.getByRole("button", { name: "Show the trace of #118" }).click(), check: traceCheck, checkName: "trace" },
+    // The project's reviewers (README.md#reviewers), under the reviews: `reviews` has the built-in, the manager's (tainted) and one off; none on (the warnings), none, the limit, an error; the editor.
+    { name: "reviewers-none-on", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-none-on" },
+    { name: "reviewers-empty", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-empty" },
+    { name: "reviewers-full", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-full" },
+    { name: "reviewers-error", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-error", httpErrors: true, ready: shown("[data-ds=error]") },
+    { name: "reviewers-add", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-empty", full: false, after: async (p) => { const b = p.getByRole("button", { name: "Add reviewer" }); await b.scrollIntoViewIfNeeded(); await b.click(); await p.getByRole("menuitem", { name: /Custom reviewer/ }).waitFor(); } },
+    { name: "reviewer-edit-tainted", section: "project", path: "/projects/prj_demo/reviews", full: false, after: (p) => p.getByRole("button", { name: "Edit Security" }).click() },
+    // The editor's Delete, set apart at its end; its confirmation, and the one for the only reviewer on; "Go to reviewers" from the top's warning.
+    { name: "reviewer-edit-delete", section: "project", path: "/projects/prj_demo/reviews", full: false, after: async (p) => { await p.getByRole("button", { name: "Edit Security" }).click(); await p.getByRole("button", { name: "Delete reviewer" }).scrollIntoViewIfNeeded(); } },
+    { name: "reviewer-delete-confirm", section: "project", path: "/projects/prj_demo/reviews", full: false, after: async (p) => { await p.getByRole("button", { name: "Edit Security" }).click(); await p.getByRole("button", { name: "Delete reviewer" }).click(); await p.getByRole("button", { name: "Keep it" }).waitFor(); } },
+    { name: "reviewer-delete-only-on", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-one-on", full: false, after: async (p) => { await p.getByRole("button", { name: "Edit Code review" }).click(); await p.getByRole("button", { name: "Delete reviewer" }).click(); await p.getByRole("button", { name: "Keep it" }).waitFor(); } },
+    { name: "reviewers-go-to", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-none-on", full: false, after: async (p) => { await p.getByRole("button", { name: "Go to reviewers" }).click(); await p.waitForTimeout(400); } },
+    { name: "reviewer-new-invalid", section: "project", path: "/projects/prj_demo/reviews", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "Add reviewer" }).click();
+      const sheet = p.getByRole("dialog", { name: "New reviewer" });
+      await sheet.getByRole("textbox", { name: "Dimension 1" }).fill("Secrets");
+      await sheet.getByRole("button", { name: "Add dimension" }).click();
+      await sheet.getByRole("textbox", { name: "Dimension 2" }).fill("secrets");
+      await sheet.getByRole("button", { name: "Add reviewer" }).click();
+    } },
     // The Routines page (README.md#routines): routines in each state, proposals, runs, memory; empty; the editor; a run opened with its trace.
     { name: "routines", section: "project", path: "/projects/prj_demo/routines" },
     { name: "routines-empty", section: "project", path: "/projects/prj_demo/routines", fixture: "routines-empty" },

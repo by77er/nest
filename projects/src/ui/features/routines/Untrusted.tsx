@@ -1,5 +1,5 @@
-// The mark on what a tainted session wrote (README.md#memory, README.md#routines): a memory note, a
-// proposed task or a routine whose agent read text anyone could write (an issue, a PR, a comment, the web).
+// The mark on what a tainted session wrote (README.md#memory, README.md#routines, README.md#reviewers): a
+// memory note, a proposed task, a routine or a reviewer whose agent read text anyone could write (an issue, a PR, a comment, the web).
 // It's data, never instructions; the mark explains itself (on hover, focus or tap), and its source is shown
 // beside it.
 
@@ -25,7 +25,10 @@ export function sourceText(source: string): string {
   return source === "manager" ? "the manager" : source;
 }
 
-/** The routine editor's note on a tainted routine: who wrote its text, and that saving makes it the owner's. */
-export function taintedRoutineText(source: string): string {
-  return `Its name or instructions were last written by ${sourceText(source)}, in a session that read untrusted text (an issue, a PR, the web). Check them: saving makes them yours.`;
+/** An editor's note on tainted text (a routine's, a reviewer's): which `fields`, who wrote them, and that saving makes them the owner's. */
+export function taintedText(source: string, fields: string): string {
+  return `Its ${fields} were last written by ${sourceText(source)}, in a session that read untrusted text (an issue, a PR, the web). Check them: saving makes them yours.`;
 }
+
+/** The routine editor's note on a tainted routine. */
+export const taintedRoutineText = (source: string): string => taintedText(source, "name or instructions");

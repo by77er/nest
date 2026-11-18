@@ -4,12 +4,12 @@
 // The latest notes first, the rest behind "Show all", with a filter by key or text once there are many.
 
 import { ActionIcon, Button, Text, TextInput, Tooltip } from "@mantine/core";
-import { modals } from "@mantine/modals";
 import { IconNotebook, IconSearch, IconTrash } from "@tabler/icons-react";
 import { useId, useState } from "react";
 import { MAX_NOTES } from "../../../memory";
 import { useDeleteNote, useMemory } from "../../api/queries";
 import type { Note } from "../../api/types";
+import { confirmDelete } from "../../common/editing";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, Token } from "../../layout";
 import { preview } from "../triage/TriagePage";
@@ -24,14 +24,7 @@ function NoteRow({ projectId, n }: { projectId: string; n: Note }) {
   const textId = useId();
   const short = preview(n.text);
   const confirm = () =>
-    modals.openConfirmModal({
-      title: `Delete the note ${n.key}?`,
-      children: <Text fz="md">The manager, workers and routines won't see it again.</Text>,
-      labels: { confirm: "Delete", cancel: "Keep it" },
-      confirmProps: { color: "danger" },
-      cancelProps: { variant: "default", "data-autofocus": true },
-      onConfirm: () => del.mutate(n.key),
-    });
+    confirmDelete({ title: `Delete the note ${n.key}?`, body: "The manager, workers and routines won't see it again.", onConfirm: () => del.mutate(n.key) });
   return (
     <Stack gap="xs" role="listitem" data-note={n.key}>
       <Row gap="sm">

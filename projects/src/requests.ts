@@ -142,6 +142,8 @@ export const UpdateRoutine = z.strictObject(Object.fromEntries(Object.entries(Ro
  * page checks them too (src/reviewers.ts, the reviewers' module, re-exports them; the page may import only this one).
  */
 export const REVIEWER_LIMITS = { name: 80, instructions: 8000, dimensions: 6, dimension: 60 } as const;
+/** Reviewers a project holds. */
+export const MAX_REVIEWERS = 8;
 /** Why a reviewer's dimensions can't be, or null: names unique without case (and surrounding spaces). */
 export function dimensionsProblem(dimensions: readonly string[]): string | null {
   const seen = new Set<string>();
@@ -155,12 +157,18 @@ export function dimensionsProblem(dimensions: readonly string[]): string | null 
 /** The presets a reviewer can be added from: `code`, the built-in "Code review" (src/reviewers.ts). */
 export const REVIEWER_PRESETS = ["code"] as const;
 export type ReviewerPreset = (typeof REVIEWER_PRESETS)[number];
+/** Each preset's id (a project has it once), name and dimensions, which the page offers it by (src/reviewers.ts adds its instructions). */
+export const REVIEWER_PRESET_REFS: Record<ReviewerPreset, { id: string; name: string; dimensions: readonly string[] }> = {
+  code: { id: "code-review", name: "Code review", dimensions: ["Correctness", "Quality", "Architectural cohesiveness"] },
+};
 const RL = REVIEWER_LIMITS;
 /** A project's reviewer (README.md#reviewers): what it judges (its dimensions) and how (its instructions). */
 const ReviewerFields = {
-  name: z.string().trim().min(1).max(RL.name).describe(`The reviewer's name (at most ${RL.name} characters).`),
-  instructions: z.string().trim().min(1).max(RL.instructions).describe(`What it judges and how: its brief carries them (at most ${RL.instructions} characters).`),
-  dimensions: z.array(z.string().trim().min(1).max(RL.dimension)).min(1).max(RL.dimensions)
+  // Each bound in words, as the page shows a draft's problems and the API its refusal.
+  name: z.string().trim().min(1, "a name is needed").max(RL.name, `at most ${RL.name} characters`).describe(`The reviewer's name (at most ${RL.name} characters).`),
+  instructions: z.string().trim().min(1, "instructions are needed").max(RL.instructions, `at most ${RL.instructions} characters`).describe(`What it judges and how: its brief carries them (at most ${RL.instructions} characters).`),
+  dimensions: z.array(z.string().trim().min(1, "a dimension needs a name").max(RL.dimension, `at most ${RL.dimension} characters`))
+    .min(1, "at least one dimension").max(RL.dimensions, `at most ${RL.dimensions} dimensions`)
     .superRefine((ds, ctx) => {
       const bad = dimensionsProblem(ds);
       if (bad) ctx.addIssue({ code: "custom", message: bad });
