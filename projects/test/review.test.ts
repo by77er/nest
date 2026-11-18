@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME, signGithub } from "../src/github";
 import { MAX_RETRIES } from "../src/do/review";
+import { roleTemplate } from "../src/catalog";
 import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
@@ -135,7 +136,9 @@ describe("a PR's review", () => {
     const [check] = gh.runsOf(p.repo, s);
     expect(check).toMatchObject({ name: CHECK_NAME, head_sha: s, status: "in_progress" });
     const a = fake.agents.get(reviewer)!;
+    // No model chosen: the shared template, as this release has it (Claude Code's default model).
     expect(a.template).toBe("projects/reviewer");
+    expect(fake.catalog.get("templates/projects/reviewer")).not.toHaveProperty("launch.model");
     expect(a.labels).toMatchObject({ project: p.id, role: "reviewer", pr: "3", sha: s });
     expect(a.sandbox).toMatch(/^sbx_/);
     // It reads the repo and pushes to none.
@@ -151,6 +154,44 @@ describe("a PR's review", () => {
     for (const c of made) expect(c.permissions).toEqual({ checks: "write" });
     const r = toolOk(await callTool("review", await reviewerToken(p, reviewer, 3, s), "review_get"));
     expect(r).toMatchObject({ repo: p.repo.toLowerCase(), pr: 3, sha: s, base: "develop", title: "PR 3" });
+  });
+
+  it("on the project's reviewers' model: the project's own template, written before the start names it", async () => {
+    const p = await newProject();
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
+    const { reviewer } = await opened(p, 4);
+    const t = roleTemplate("reviewer", p.id, "claude-haiku-5-5");
+    expect(fake.agents.get(reviewer)!.template).toBe(t.name);
+    expect(fake.catalog.get(`templates/${t.name}`)).toEqual(t.body);
+    const put = fake.calls.findIndex((c) => c.method === "PUT" && c.path === `/v1/catalog/templates/${t.name}`);
+    const create = fake.calls.findIndex((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);
+    expect(put).toBeGreaterThanOrEqual(0);
+    expect(put).toBeLessThan(create);
+    // Back to the default: the next review's reviewer starts from the shared template.
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: null });
+    const next = await opened(p, 5);
+    expect(fake.agents.get(next.reviewer)!.template).toBe("projects/reviewer");
+    // The running one isn't switched.
+    expect(fake.agents.get(reviewer)!.ended).toBe(false);
+  });
+
+  it("an attempt keeps the model it froze when its start is retried after the setting changed, under the same key", async () => {
+    const p = await newProject();
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1 });
+    const s = sha();
+    expect((await push(p, 6, s, "opened")).status).toBe(200);
+    await run(p);
+    expect(live(p, 6)).toEqual([]);
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5" });
+    await dueNow(p);
+    await run(p);
+    const [a] = live(p, 6);
+    expect(a!.template).toBe(roleTemplate("reviewer", p.id, "claude-haiku-5-5").name);
+    const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);
+    expect(creates).toHaveLength(2);
+    expect(creates.map((c) => c.idempotencyKey)).toEqual([`${p.id}/review/6/${s}/1/agent`, `${p.id}/review/6/${s}/1/agent`]);
+    expect(creates[1]!.body).toEqual(creates[0]!.body);
   });
 
   it("a new head supersedes the old one: the old reviewer is stopped, its check cancelled, the new head reviewed", async () => {

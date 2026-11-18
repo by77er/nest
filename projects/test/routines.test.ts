@@ -10,6 +10,7 @@ import { migrate } from "../src/sql";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MAX_START_ATTEMPTS } from "../src/routines";
+import { roleTemplate } from "../src/catalog";
 import { DREAM_MAX_ENTRIES, FIRST_DREAM_WINDOW_MS, firedTrigger, MAX_DREAM_WINDOW_MS, MAX_PROPOSALS_PER_RUN, nextTimerFire, PRESETS, routineSpawnExtras, startVerdict, type Triggers, wallToUtc } from "../src/routines";
 import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, prEvent, shaOf, Signer } from "./fake-nest";
 
@@ -740,6 +741,78 @@ describe("a start's requests are frozen at its first attempt", () => {
     const brief = fake.inbox.find((m) => m.agent === run.agent)!.text;
     expect(brief).toContain("Consolidate the project's memory");
     expect(brief).not.toContain("Something else.");
+  });
+});
+
+describe("the routine runs' model (README.md#models)", () => {
+  const agentsCreated = (run: string) => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run);
+  const sandboxesCreated = (run: string) => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.run === run);
+
+  it("unset: a routine run and a dreaming run start from the shared templates, which name no model", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { max_routine_runs: 2 });
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const run = await liveRun(s, id);
+    expect(fake.agents.get(run.agent)!.template).toBe("projects/routine");
+    expect(fake.catalog.get("templates/projects/routine")).not.toHaveProperty("launch.model");
+    const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
+    const dream = await liveRun(s, d.id);
+    expect(fake.agents.get(dream.agent)!.template).toBe("projects/dreaming");
+  });
+
+  it("set: each run starts from the project's own template on it, a routine's with its sandbox, a dreaming run's with none", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5", max_routine_runs: 2 });
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const run = await liveRun(s, id);
+    const rt = roleTemplate("routine", s.id, "claude-haiku-5-5");
+    const a = fake.agents.get(run.agent)!;
+    expect(a.template).toBe(rt.name);
+    expect(a.sandbox).toMatch(/^sbx_/);
+    expect(fake.sandboxes.get(a.sandbox!)!.layer.guards).toEqual(githubGuards(s.repo, "read"));
+    expect(fake.catalog.get(`templates/${rt.name}`)).toEqual(rt.body);
+    const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
+    const dream = await liveRun(s, d.id);
+    expect(dream.state).toBe("running");
+    const dt = roleTemplate("dreaming", s.id, "claude-haiku-5-5");
+    expect(fake.agents.get(dream.agent)!.template).toBe(dt.name);
+    expect(fake.catalog.get(`templates/${dt.name}`)).toEqual(dt.body);
+    expect(dt.body).toMatchObject({ hands: "forbidden", ephemeral: true });
+    // Still no hands: no sandbox made or named.
+    expect(agentsCreated(dream.id)[0]!.body.sandbox).toBeUndefined();
+    expect(sandboxesCreated(dream.id)).toEqual([]);
+  });
+
+  it("a run frozen before the setting changed retries on its template, under the same key; a running one isn't switched", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5", max_routine_runs: 2 });
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const running = await liveRun(s, id);
+    const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
+    const first = (await runs(s, d.id))[0];
+    expect(first.state).toBe("starting");
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-sonnet-5-5" });
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE id = ?", first.id);
+    });
+    await settle(s);
+    const dream = await liveRun(s, d.id);
+    expect(dream.state).toBe("running");
+    const creates = agentsCreated(dream.id);
+    expect(creates.map((c) => c.body.template)).toEqual([roleTemplate("dreaming", s.id, "claude-haiku-5-5").name, roleTemplate("dreaming", s.id, "claude-haiku-5-5").name]);
+    expect(creates[1]!.idempotencyKey).toBe(creates[0]!.idempotencyKey);
+    expect(creates[1]!.body).toEqual(creates[0]!.body);
+    // The routine run started before the change runs on, on its own.
+    expect(fake.agents.get(running.agent)!.ended).toBe(false);
+    expect(stopsOf(running.agent)).toEqual([]);
+    expect(fake.agents.get(running.agent)!.template).toBe(roleTemplate("routine", s.id, "claude-haiku-5-5").name);
   });
 });
 
