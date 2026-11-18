@@ -250,8 +250,8 @@ export function stepsBySeq(messages: ChatMessage[], turns: FinishedTurn[]): Map<
  * (`failed`, a negative seq) stay last, after the stream. Only the last part is live: it carries the
  * working line (`running` and no call running); a part with nothing to show is left out.
  */
-export function timeline(messages: ChatMessage[], turn: { turn: string; started_ms: number; steps: Step[]; running: boolean } | null, now = Date.now()): LogItem[] {
-  if (!turn) return groupLog(messages, now);
+export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: boolean }) | null, now = Date.now()): LogItem[] {
+  if (!turn) return grouped(messages, now);
   const local = (m: ChatMessage) => m.seq < 0 && (m.status ?? (m.error ? "failed" : "owed")) === "failed";
   const kept = messages.filter((m) => !local(m));
   const { steps } = turn;
