@@ -139,15 +139,45 @@ const template = (capability: Server, prompt: string, subagents = false, timers 
 });
 
 /**
- * A project's own template for its manager or its workers on `model` (README.md#models): the role's
- * template with `launch.model`. Its name is `modelTemplateEntry`'s.
+ * The shared templates, as this release has them. They name no MCP URL (the capabilities do), so they
+ * don't depend on the deployment.
+ */
+function sharedTemplates(): Record<string, Record<string, unknown> & { launch: Record<string, unknown> }> {
+  return {
+    // The manager's and the worker's on the default models (README.md#models). A project's own starts use
+    // its own entries (`roleTemplate`), on the models its settings name. A start frozen before those existed
+    // was frozen before the app's own GitHub access too, so it's begun again (README.md#converging-onto-the-apps-own-access):
+    // no start names these now; they stay for a rollback's.
+    [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, false, true, false, DEFAULT_MODEL.manager),
+    [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, true, false, false, DEFAULT_MODEL.worker),
+    // Ephemeral: a reviewer ends itself once its turn is done, verdict or not (its job's deadline covers one that doesn't).
+    // No model: Claude Code's default, unless the project chooses one (its own entry, `roleTemplate`).
+    [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, false, false, true, undefined, REVIEWER_GUIDANCE),
+    // Reads only, like the manager and reviewers: a routine never pushes.
+    [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, false, false, true),
+    // A dreaming run has no hands (no sandbox, no repo, no web): it needs only the board, recent work,
+    // memory and the transcripts nest's grant lets it read (README.md#routines).
+    [`${NAMESPACE}/dreaming`]: {
+      capabilities: ["nest", `${NAMESPACE}/routine`],
+      launch: { builtin_tools: [...TASK_TOOLS], system_prompt: { mode: "append", text: PROMPTS.dreaming } },
+      hands: "forbidden",
+      credential: CREDENTIAL,
+      ephemeral: true,
+    },
+  };
+}
+
+/**
+ * A project's own template for one of its roles on `model` (README.md#models): the role's shared template
+ * with `launch.model`, and nothing else changed. Its name is `modelTemplateEntry`'s.
  */
 export function roleTemplate(role: ModelRole, project: string, model: string): { name: string; body: unknown } {
-  const body = role === "manager"
-    ? template("board", PROMPTS.manager, false, true, false, model)
-    : template("task", PROMPTS.worker, true, false, false, model);
-  return { name: `${NAMESPACE}/${modelTemplateEntry(role, project, model)}`, body };
+  const shared = sharedTemplates()[TEMPLATE[role]]!;
+  return { name: `${NAMESPACE}/${modelTemplateEntry(role, project, model)}`, body: { ...shared, launch: { ...shared.launch, model } } };
 }
+
+/** Whether a dreaming run starts from `template`: the shared one, or a project's own on its model (no hands either way). */
+export const isDreamingTemplate = (template: string): boolean => template === TEMPLATE.dreaming || template.startsWith(`${TEMPLATE.dreaming}-`);
 
 export interface CatalogEntries {
   capabilities: Record<string, unknown>;
@@ -166,27 +196,7 @@ export function catalogFor(base: string): CatalogEntries {
       [`${NAMESPACE}/review`]: mcpCapability(base, "review", "The projects-review tools read the PR you review and take your verdict."),
       [`${NAMESPACE}/routine`]: mcpCapability(base, "routine", "The projects-routine tools read the project's board and recent work, propose tasks, and keep its memory."),
     },
-    templates: {
-      // The manager's and the worker's on the default models (README.md#models). A project's own starts use
-      // its own entries (`roleTemplate`), on the models its settings name. A start frozen before those existed
-      // was frozen before the app's own GitHub access too, so it's begun again (README.md#converging-onto-the-apps-own-access):
-      // no start names these now; they stay for a rollback's.
-      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, false, true, false, DEFAULT_MODEL.manager),
-      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, true, false, false, DEFAULT_MODEL.worker),
-      // Ephemeral: a reviewer ends itself once its turn is done, verdict or not (its job's deadline covers one that doesn't).
-      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, false, false, true, undefined, REVIEWER_GUIDANCE),
-      // Reads only, like the manager and reviewers: a routine never pushes.
-      [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, false, false, true),
-      // A dreaming run has no hands (no sandbox, no repo, no web): it needs only the board, recent work,
-      // memory and the transcripts nest's grant lets it read (README.md#routines).
-      [`${NAMESPACE}/dreaming`]: {
-        capabilities: ["nest", `${NAMESPACE}/routine`],
-        launch: { builtin_tools: [...TASK_TOOLS], system_prompt: { mode: "append", text: PROMPTS.dreaming } },
-        hands: "forbidden",
-        credential: CREDENTIAL,
-        ephemeral: true,
-      },
-    },
+    templates: sharedTemplates(),
   };
 }
 

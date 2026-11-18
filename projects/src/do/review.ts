@@ -15,7 +15,6 @@
 // until the owner approves that head commit, or dismisses it (`dismissed`).
 
 import { DurableObject } from "cloudflare:workers";
-import { TEMPLATE, writeSharedTemplate } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
 import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, type Verdict, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
@@ -936,11 +935,12 @@ export class ReviewDO extends DurableObject<Env> {
             Date.now(), Date.now() + REVIEW_DEADLINE_MS, pr, sha, runs);
           return;
         }
-        // The shared template as this release has it, naming no repo of nest's, whatever the last catalog sync wrote.
-        await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE.reviewer);
+        // Its template as this release has it, naming no repo of nest's, whatever the last catalog sync wrote: the
+        // project's own on the model the attempt froze (README.md#models), or the shared one. ProjectDO writes it.
+        const template = await projectStub(this.env, project).reviewerTemplate(key);
         if (!current()) return;
         try {
-          agent = await nest.startAgent(TEMPLATE.reviewer, labels, spawnOverrides(spec), key, { ...startEgress([], spec), ...spec.extras }, {}, { newAttemptOnCapacity: true });
+          agent = await nest.startAgent(template, labels, spawnOverrides(spec), key, { ...startEgress([], spec), ...spec.extras }, {}, { newAttemptOnCapacity: true });
         } catch (e) {
           // No room in nest for now: the job waits, queued, and starts again once there is.
           const r = atCapacity(e) ? current() : null;
