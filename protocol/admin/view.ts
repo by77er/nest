@@ -58,6 +58,8 @@ export type AwsView =
 export interface CapacityView {
   vcpus_free: number;
   memory_mib_free: number;
+  /** The host's memory; absent from a nestd before the field. */
+  memory_mib_total?: number;
   hugepages_mib_free: number;
   /** The hugepage pool's size; 0 or absent (a host from before the field) means regular pages. */
   hugepages_mib_total?: number;

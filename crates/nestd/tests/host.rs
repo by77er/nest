@@ -27,6 +27,7 @@ use nest_protocol::host::runner::{RunnerCommand, RunnerEvent};
 use nest_protocol::host::{fdpass, PROTOCOL_VERSION as HOST_PROTOCOL_VERSION};
 use nest_protocol::model::*;
 use nestd::config::Config;
+use nestd::driver::supervise::Exit;
 use nestd::driver::{Driver, Vm, VmSpec};
 use nestd::enroll::Enrolled;
 use nestd::host::Host;
@@ -69,6 +70,9 @@ struct FakeDriver {
     fail_next_start: Arc<AtomicBool>,
     /// The next VM starts, but its guest agent never comes up.
     mute_next_guest: Arc<AtomicBool>,
+    /// The next VM's process dies as its start returns, its guest agent still answering (the
+    /// fake's guest is a task of its own): a death between the start and `running`.
+    die_at_next_start: Arc<AtomicBool>,
     /// The next `pause` of a VM fails.
     fail_next_pause: Arc<AtomicBool>,
     /// Sandboxes whose VM was stopped, in order.
@@ -93,6 +97,16 @@ struct FakeDriver {
     /// Whether a VM is paused (`Vm::pause` to `Vm::resume`): a test's guest writer holds this lock
     /// for each write and writes only while it's false, as a real guest's writes stop in a pause.
     guest_gate: Arc<Mutex<bool>>,
+    /// Each started VM's process, by sandbox: `Some` once it has exited ([`FakeDriver::kill`], or
+    /// the VM's own `stop`, which kills a real one too).
+    exits: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Sender<Option<Exit>>>>>,
+}
+
+impl FakeDriver {
+    /// The VM process of `sandbox` dies by itself, as one the kernel's OOM killer took.
+    fn kill(&self, sandbox: &str) {
+        self.exits.lock().unwrap().get(sandbox).expect("a started VM").send_replace(Some(Exit::Signal(9)));
+    }
 }
 
 #[async_trait]
@@ -117,6 +131,7 @@ impl Driver for FakeDriver {
             latch: self.latch.clone(),
             fail_next_start: self.fail_next_start.clone(),
             mute_next_guest: self.mute_next_guest.clone(),
+            die_at_next_start: self.die_at_next_start.clone(),
             fail_next_pause: self.fail_next_pause.clone(),
             stopped: self.stopped.clone(),
             live: self.live.clone(),
@@ -127,6 +142,8 @@ impl Driver for FakeDriver {
             failing_memory_snapshots: self.failing_memory_snapshots.clone(),
             vm_ops: self.vm_ops.clone(),
             guest_gate: self.guest_gate.clone(),
+            exits: self.exits.clone(),
+            exit: None,
             running: false,
             emu: None,
             guest: None,
@@ -141,6 +158,7 @@ struct FakeVm {
     latch: Option<Arc<AttachLatch>>,
     fail_next_start: Arc<AtomicBool>,
     mute_next_guest: Arc<AtomicBool>,
+    die_at_next_start: Arc<AtomicBool>,
     fail_next_pause: Arc<AtomicBool>,
     stopped: Arc<Mutex<Vec<String>>>,
     live: Arc<AtomicUsize>,
@@ -154,6 +172,8 @@ struct FakeVm {
     failing_memory_snapshots: Arc<AtomicBool>,
     vm_ops: Arc<Mutex<Vec<String>>>,
     guest_gate: Arc<Mutex<bool>>,
+    exits: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Sender<Option<Exit>>>>>,
+    exit: Option<tokio::sync::watch::Sender<Option<Exit>>>,
     running: bool,
     emu: Option<Emulator>,
     guest: Option<tokio::task::JoinHandle<()>>,
@@ -181,6 +201,10 @@ impl Vm for FakeVm {
     fn pauser(&self) -> Option<Arc<dyn nestd::driver::Pauser>> {
         Some(Arc::new(FakePauser(self.paused.clone(), self.spec.sandbox.0.clone(), self.spec.epoch.0, self.vm_ops.clone(), self.pauser_latch.clone())))
     }
+    fn exited(&self) -> Option<nestd::driver::ExitFuture> {
+        let mut rx = self.exit.as_ref()?.subscribe();
+        Some(Box::pin(async move { rx.wait_for(|e| e.is_some()).await.ok().and_then(|e| e.clone()).unwrap_or(Exit::Unknown) }))
+    }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
     }
@@ -188,6 +212,9 @@ impl Vm for FakeVm {
         if self.fail_next_start.swap(false, Ordering::SeqCst) {
             return Err(std::io::Error::other("fake VM failed to start"));
         }
+        let exit = tokio::sync::watch::Sender::new(None);
+        self.exits.lock().unwrap().insert(self.spec.sandbox.0.clone(), exit.clone());
+        self.exit = Some(exit);
         // A slow boot, to race commands and fences against it.
         if self.spec.sandbox.0.starts_with("sbx_slow") {
             tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -204,6 +231,9 @@ impl Vm for FakeVm {
             self.guest = Some(fake_guest(&gdir, self.seen.clone(), self.latch.clone()));
         }
         self.emu = Some(Emulator::start(&self.vsock_uds_path(), &gdir)?);
+        if self.die_at_next_start.swap(false, Ordering::SeqCst) {
+            self.exit.as_ref().expect("set above").send_replace(Some(Exit::Signal(9)));
+        }
         Ok(())
     }
     async fn pause(&mut self) -> std::io::Result<()> {
@@ -243,6 +273,10 @@ impl Vm for FakeVm {
             released.await;
         }
         self.stopped.lock().unwrap().push(self.spec.sandbox.0.clone());
+        // A stop kills the process, which ends its exit future like any other death.
+        if let Some(exit) = &self.exit {
+            exit.send_replace(Some(Exit::Signal(9)));
+        }
         if std::mem::take(&mut self.running) {
             self.live.fetch_sub(1, Ordering::SeqCst);
         }
@@ -2026,6 +2060,115 @@ async fn a_failed_cold_resume_stops_its_vm() {
     h.fleet.commands.send(vec![resume_cmd("cmd_resume_2", "sbx_1")]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_resume_2").await));
     assert_eq!(h.vm.live.load(Ordering::SeqCst), 1, "one VM on the disk");
+}
+
+/// A VM whose process dies by itself (a guest that panicked, a VMM the kernel killed) is fenced:
+/// reported `fenced` with how it ended, forgotten by the gateway, stopped and salvaged. It used
+/// to stay `running`, and the gateway refused every bind as `busy` for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_that_dies_while_running_is_fenced_and_salvaged() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    assert!(matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxUpsert { .. })), "the gateway serves the running sandbox");
+
+    h.vm.kill("sbx_1");
+    let fenced = h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    let HostEventBody::SandboxState { sandbox, epoch, detail, .. } = fenced else { unreachable!() };
+    assert_eq!((sandbox.0.as_str(), epoch, detail.as_deref()), ("sbx_1", Epoch(1), Some("the VM process killed by signal 9")));
+    wait_until("the gateway forgot the sandbox", || matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxRemove { .. }))).await;
+    wait_until("the dead VM is released", || h.vm.stopped.lock().unwrap().contains(&"sbx_1".to_string())).await;
+    h.fleet.wait_event("salvage", |b| matches!(b, HostEventBody::CommitRequest { reason: CommitReason::Salvage, .. })).await;
+    h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+}
+
+/// A VM nestd stops itself (a disk-only suspend) is not a death: nothing is fenced, and the VM
+/// the resume boots is watched in turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_nestd_stops_is_not_reported_dead_and_its_successor_is_watched() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1"), suspend_cmd("cmd_suspend", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_suspend").await));
+    assert_eq!(h.vm.live.load(Ordering::SeqCst), 0, "a disk-only suspend stops the VM (the fake's exit future ended with it)");
+    h.fleet.commands.send(vec![resume_cmd("cmd_resume", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_resume").await));
+    // A round trip later, a fence from the stopped VM's exit would have been reported.
+    checkpoint(&h.fleet, "cmd_checkpoint", "sbx_1", 1).await;
+    assert_no_fence(&h.fleet);
+    assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Running));
+
+    h.vm.kill("sbx_1");
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+}
+
+/// A VM that dies while its boot still waits for the guest is the boot's to report: the create
+/// fails (`failed`), and no fence follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_that_dies_during_its_boot_fails_the_create_without_a_fence() {
+    let h = start_host().await;
+    h.vm.mute_next_guest.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    wait_until("the VM started", || h.vm.live.load(Ordering::SeqCst) == 1).await;
+    h.vm.kill("sbx_1");
+    // Outlasts the guest-ready timeout (GUEST_READY_TIMEOUT_MS): fleet.result waits WAIT.
+    assert!(!is_ok(&h.fleet.result("cmd_create").await), "no guest: the create fails");
+    wait_until("reported failed", || last_state(&h.fleet, "sbx_1") == Some(SandboxState::Failed)).await;
+    // The exit is looked at again every VM_EXIT_RECHECK (200 ms) while the boot runs: well past it.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_no_fence(&h.fleet);
+}
+
+/// A VM that died during a create's boot never reaches the retry of that create at the same
+/// epoch: its exit is the first row's, and the retry's healthy VM runs on. Keyed by epoch alone,
+/// the first VM's exit waited out the failed boot and then fenced the second VM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_vms_exit_never_fences_the_retry_of_its_create() {
+    let h = start_host().await;
+    h.vm.mute_next_guest.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![create("cmd_create_1", "sbx_1")]).unwrap();
+    wait_until("the first VM started", || h.vm.live.load(Ordering::SeqCst) == 1).await;
+    h.vm.kill("sbx_1");
+    assert!(!is_ok(&h.fleet.result("cmd_create_1").await), "no guest: the create fails");
+    // The same epoch again, at once, as SandboxDO re-issues a retryable create.
+    h.fleet.commands.send(vec![create("cmd_create_2", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create_2").await));
+    // Well past VM_EXIT_RECHECK (200 ms): the first VM's exit has looked again by now.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_no_fence(&h.fleet);
+    assert_eq!(last_state(&h.fleet, "sbx_1"), Some(SandboxState::Running));
+    assert_eq!(h.vm.live.load(Ordering::SeqCst), 1, "the retry's VM runs");
+}
+
+/// A VM that dies between its start and `running`, its guest having answered, isn't missed: the
+/// boot reports `running`, and the exit, looked at again, fences it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_that_dies_as_its_boot_ends_is_fenced_once_running() {
+    let h = start_host().await;
+    h.vm.die_at_next_start.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await), "the guest answered: the boot ends well");
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, detail: Some(d), .. } if d == "the VM process killed by signal 9")).await;
+    let states: Vec<SandboxState> = h.fleet.log.lock().unwrap().events.iter().filter_map(|e| match &e.body {
+        HostEventBody::SandboxState { state, .. } => Some(*state),
+        _ => None,
+    }).collect();
+    assert_eq!(states, [SandboxState::Creating, SandboxState::Running, SandboxState::Fenced]);
+}
+
+/// A VM that dies while a resume's cold boot waits for its guest is fenced at once (the row is
+/// `suspended`, which has a VM to lose): the sandbox is placed again rather than left for a
+/// resume that can't succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_that_dies_during_a_resumes_boot_is_fenced() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1"), suspend_cmd("cmd_suspend", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_suspend").await));
+    h.vm.mute_next_guest.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![resume_cmd("cmd_resume", "sbx_1")]).unwrap();
+    wait_until("the resume's VM started", || h.vm.live.load(Ordering::SeqCst) == 1).await;
+    h.vm.kill("sbx_1");
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    assert!(!is_ok(&h.fleet.result("cmd_resume").await), "the resume of a fenced incarnation fails");
 }
 
 /// The last state `sandbox` reported.

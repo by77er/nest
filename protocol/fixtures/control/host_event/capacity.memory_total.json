@@ -1,0 +1,16 @@
+{
+  "ts_ms": 1760270400000,
+  "type": "capacity",
+  "capacity": {
+    "vcpus_free": 6,
+    "memory_mib_free": 12288,
+    "memory_mib_total": 15616,
+    "hugepages_mib_free": 8192,
+    "hugepages_mib_total": 16384,
+    "sandboxes": 2,
+    "agents": 3,
+    "warm": [
+      "gen_01jb7p1k2m"
+    ]
+  }
+}

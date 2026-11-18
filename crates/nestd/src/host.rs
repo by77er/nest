@@ -101,6 +101,17 @@ struct Summary {
     row: u64,
 }
 
+/// A `/proc/meminfo` field's number (kB, or a count), 0 when the field is missing or unreadable.
+fn meminfo_field(meminfo: &str, name: &str) -> u64 {
+    meminfo.lines().find_map(|l| l.strip_prefix(name).and_then(|v| v.split_whitespace().next()?.parse().ok())).unwrap_or(0)
+}
+
+/// The capacity report's memory, MiB, from `/proc/meminfo` (kB): what is available, and the
+/// host's total.
+fn memory_mib(meminfo: &str) -> (u32, u32) {
+    ((meminfo_field(meminfo, "MemAvailable:") / 1024) as u32, (meminfo_field(meminfo, "MemTotal:") / 1024) as u32)
+}
+
 /// The lifecycle machine's state for a reported one, and back.
 fn lifecycle_state(state: SandboxState) -> lifecycle::State {
     match state {
@@ -132,6 +143,9 @@ struct Sbx {
     disk_clean: bool,
     /// Its salvage-and-delete has started (`Inner::retire`): one per incarnation.
     retiring: bool,
+    /// The watch on the VM's process, from its start until nestd stops it ([`Inner::watch_vm`]).
+    /// Declared before `vm`: dropped first, so a VM dropped with its sandbox is never reported.
+    vm_watch: Option<VmWatch>,
     vm: Option<Box<dyn Vm>>,
     /// The VM is paused (not stopped): resume continues processes.
     paused: bool,
@@ -168,6 +182,27 @@ struct Sbx {
     /// if none has since its read (a cut's VM resumes right after the cut).
     runs: u64,
 }
+
+/// The task that waits for one VM's process to exit. Dropped (by [`Inner::stop_vm`], before it
+/// stops the VM, or with the sandbox) it reports nothing: only an exit nestd didn't cause counts.
+struct VmWatch {
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for VmWatch {
+    fn drop(&mut self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.task.abort();
+    }
+}
+
+/// A VM process that exited by itself: the sandbox, the number of the row it started under, its
+/// watch's `stopping` flag (set once nestd has stopped that VM itself) and how it ended.
+type VmExited = (SandboxId, u64, Arc<std::sync::atomic::AtomicBool>, crate::driver::supervise::Exit);
+
+/// How often a VM exit seen during a boot is looked at again (`lifecycle::VmExit::Wait`).
+const VM_EXIT_RECHECK: Duration = Duration::from_millis(200);
 
 impl Sbx {
     #[allow(clippy::too_many_arguments)]
@@ -211,6 +246,7 @@ impl Sbx {
             pending_cut: None,
             shadows: Shadows::new(),
             runs: 0,
+            vm_watch: None,
         }
     }
 
@@ -317,6 +353,8 @@ pub struct Inner {
     tombstones: Tombstones,
     fleet: mpsc::UnboundedSender<FleetInput>,
     guest_events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>,
+    /// VM processes that exited without nestd stopping them ([`Inner::watch_vm`]).
+    vm_exits: mpsc::UnboundedSender<VmExited>,
     summary: Mutex<BTreeMap<SandboxId, Summary>>,
     sandboxes: Mutex<BTreeMap<SandboxId, Arc<tokio::sync::Mutex<Sbx>>>>,
     pending_commits: Mutex<HashMap<RequestId, oneshot::Sender<CommitOutcome>>>,
@@ -585,6 +623,7 @@ impl Host {
         let (fleet_tx, fleet_rx) = mpsc::unbounded_channel();
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
         let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
+        let (vm_exit_tx, mut vm_exit_rx) = mpsc::unbounded_channel();
         let (lease_tx, lease_rx) = watch::channel(None);
 
         // The CA and key the host enrolled with (or saved): installed only if the key is the
@@ -643,6 +682,7 @@ impl Host {
             tombstones,
             fleet: fleet_tx,
             guest_events: guest_tx,
+            vm_exits: vm_exit_tx,
             summary: Mutex::new(summary),
             sandboxes: Mutex::new(BTreeMap::new()),
             pending_commits: Mutex::new(HashMap::new()),
@@ -747,6 +787,16 @@ impl Host {
             tokio::spawn(async move {
                 while let Some((sbx, ev)) = guest_rx.recv().await {
                     inner.on_guest_event(sbx, ev);
+                }
+            });
+        }
+        {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                while let Some((sbx, row, stopped, exit)) = vm_exit_rx.recv().await {
+                    // Each on its own task: one may wait out a boot.
+                    let inner = inner.clone();
+                    tokio::spawn(async move { inner.on_vm_exit(sbx, row, stopped, exit).await });
                 }
             });
         }
@@ -935,14 +985,13 @@ impl Inner {
         let used_vcpus: u32 = summary.values().filter(|s| holds_lease(s.state)).map(|s| s.resources.vcpus).sum();
         let total_vcpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
         let mem = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-        let field = |name: &str| -> u64 {
-            mem.lines().find_map(|l| l.strip_prefix(name).and_then(|v| v.split_whitespace().next()?.parse().ok())).unwrap_or(0)
-        };
+        let field = |name: &str| meminfo_field(&mem, name);
         let huge_free_mib = field("HugePages_Free:") * field("Hugepagesize:") / 1024;
         let huge_total_mib = field("HugePages_Total:") * field("Hugepagesize:") / 1024;
         Capacity {
             vcpus_free: total_vcpus.saturating_sub(used_vcpus),
-            memory_mib_free: (field("MemAvailable:") / 1024) as u32,
+            memory_mib_free: memory_mib(&mem).0,
+            memory_mib_total: memory_mib(&mem).1,
             hugepages_mib_free: huge_free_mib as u32,
             hugepages_mib_total: huge_total_mib as u32,
             sandboxes: summary.values().filter(|s| holds_lease(s.state)).count() as u32,
@@ -1755,6 +1804,8 @@ impl Inner {
     /// false` is persisted first, so a restart salvages. On any error the VM is stopped again: a
     /// stranded one would share the disk with the next boot.
     async fn launch(&self, s: &mut Sbx, fork: Option<ForkIdentity>) -> anyhow::Result<()> {
+        // A VM this replaces is dropped (and killed) by the assignment: nestd's own doing.
+        s.vm_watch = None;
         s.vm = Some(self.driver.create(s.vm_spec()).await.context("create VM")?);
         let r = self.start_vm(s, fork).await;
         if r.is_err() {
@@ -1773,6 +1824,7 @@ impl Inner {
         self.register_pauser(&s.id, s.epoch, vm.as_ref());
         self.shadow(&s.id, s.epoch, lifecycle::Input::Start);
         let uds = vm.vsock_uds_path();
+        self.watch_vm(s);
         self.unless_fenced(s, "guest connection")?;
         let guest = GuestCtl::spawn(uds, s.id.clone(), s.epoch, hostname(&s.id), s.agent_slots(), self.guest_events.clone());
         if fork.is_some() {
@@ -1784,8 +1836,60 @@ impl Inner {
         Ok(())
     }
 
+    /// Watch `s`'s started VM for an exit nestd doesn't cause: a guest that panicked or rebooted
+    /// (Firecracker exits with it), or a VMM the kernel killed. Nothing else tells: the row stays
+    /// `running`, and the gateway refuses every bind as `busy` for good. The exit goes to
+    /// [`Self::on_vm_exit`]; [`Self::stop_vm`] ends the watch first, so nestd's own stops are
+    /// never reported.
+    fn watch_vm(&self, s: &mut Sbx) {
+        let Some(exited) = s.vm.as_ref().and_then(|vm| vm.exited()) else {
+            tracing::warn!(sandbox = %s.id, epoch = s.epoch.0, "this VM's process can't be watched: its exit would go unnoticed");
+            return;
+        };
+        // The row's own number, not its epoch: a failed create is retried at the same epoch, and
+        // the first VM's exit must never reach the retry's row.
+        let Some(row) = self.with_row(&s.id, s.epoch, |x| x.row) else { return };
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, tx, id) = (stopping.clone(), self.vm_exits.clone(), s.id.clone());
+        let task = tokio::spawn(async move {
+            let exit = exited.await;
+            // Set before nestd kills a VM: an exit seen with it set is nestd's own.
+            if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = tx.send((id, row, flag, exit));
+            }
+        });
+        s.vm_watch = Some(VmWatch { stopping, task });
+    }
+
+    /// A VM's process exited and nestd didn't stop it: fence its incarnation (the row numbered
+    /// `row`, while it is still the sandbox's), unless it is final already or a create's boot is
+    /// still deciding (`lifecycle::vm_exited`). The fence reports `fenced` with how the process
+    /// ended, the control plane places the sandbox again from its head, and the dead VM's disk is
+    /// salvaged.
+    async fn on_vm_exit(self: &Arc<Self>, id: SandboxId, row: u64, stopped: Arc<std::sync::atomic::AtomicBool>, exit: crate::driver::supervise::Exit) {
+        loop {
+            // nestd has stopped that VM since (a suspend of the row while this waited out its boot):
+            // whatever VM the row has now is another one.
+            if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let found = self.summary.lock().expect("summary").get(&id).filter(|s| s.row == row).map(|s| (s.epoch, s.state));
+            let Some((epoch, state)) = found else { return };
+            match lifecycle::vm_exited(lifecycle_state(state)) {
+                lifecycle::VmExit::Ignore => return,
+                lifecycle::VmExit::Wait => tokio::time::sleep(VM_EXIT_RECHECK).await,
+                lifecycle::VmExit::Fence => {
+                    tracing::error!(sandbox = %id, epoch = epoch.0, ?state, %exit, "the VM process exited by itself; fencing its incarnation");
+                    return self.fence_sandbox(&id, epoch, &format!("the VM process {exit}"), true).await;
+                }
+            }
+        }
+    }
+
     /// Stop `s`'s VM, if any, with its guest connection and pause handle.
     async fn stop_vm(&self, s: &mut Sbx) {
+        // First: the stop below is nestd's own, not an exit to report.
+        s.vm_watch = None;
         if let Some(g) = s.guest.take() {
             g.shutdown();
         }
@@ -3283,6 +3387,21 @@ async fn refreeze_fenced(id: &SandboxId, epoch: Epoch, vm: &mut dyn Vm) -> bool 
 mod tests {
     use super::LapseGuard;
     use nest_protocol::control::{EgressAuditRecord, EgressVerdict};
+
+    /// The capacity report's memory figures come from `/proc/meminfo` by field name: a missing
+    /// or unreadable field is 0, which the wire leaves out (a host that doesn't say).
+    #[test]
+    fn meminfo_fields_are_read_by_name_and_default_to_zero() {
+        let meminfo = "MemTotal:       16170396 kB\nMemFree:          210000 kB\nMemAvailable:   12345678 kB\nHugePages_Total:       0\n";
+        assert_eq!(super::meminfo_field(meminfo, "MemTotal:"), 16170396);
+        assert_eq!(super::meminfo_field(meminfo, "MemAvailable:"), 12345678);
+        assert_eq!(super::meminfo_field(meminfo, "HugePages_Total:"), 0);
+        assert_eq!(super::meminfo_field(meminfo, "SwapTotal:"), 0);
+        assert_eq!(super::meminfo_field("MemTotal: lots kB\n", "MemTotal:"), 0);
+        // What the report carries: available and total, in MiB.
+        assert_eq!(super::memory_mib(meminfo), (12056, 15791));
+        assert_eq!(super::memory_mib(""), (0, 0));
+    }
 
     struct NoPause;
     #[async_trait::async_trait]

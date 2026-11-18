@@ -6,7 +6,7 @@
 |---|---|---|---|
 | DO SQLite | Heads, epochs, agent epochs, leases and placement markers, segment and generation indexes (with pins), current state, grants, tunnel ids per sandbox host (FleetDO); designed: loss records, the base-generation index and the three desired versions per cell (FleetDO) | Control plane | — |
 | R2 | Session segments (native Claude Code session files, `sessions/`), bodies under `channels/` that no code reads (an operator delete, [deploy](../../dev/deploy.md#rollout-rules)), audit logs (egress under `audit/<host>/`, credential issuance under `audit/broker/`); designed: UI artifacts (diffs, screenshots), exported journals | DOs, UI, agents, me | The Worker's and DOs' bindings only |
-| S3, per cell (one versioned Standard bucket; Express One Zone for hot data is designed) | Disk chunks, memory pages, generation manifests (base generations designed) | Hosts | Instance role |
+| S3, per cell (one versioned Standard bucket; Express One Zone for hot data is designed) | Disk chunks, memory pages, generation manifests (base generations designed); sandbox hosts' journals under `logs/`, expired after 14 days ([provisioning](../compute/provisioning/#host-logs)) | Hosts | Instance role |
 
 - **Cross-cloud traffic is small text:** transcripts from brain hosts to Cloudflare, session files back from R2 when a brain starts on a new host, and hands frames between a brain and its sandbox's gateway over the tunnel. No bulk data crosses.
 - **Bindings are verified, not stored.** SandboxDO has them signed with the cell's binding key, which BrokerDO holds; FleetDO pushes the public keys to each sandbox host's gateway; nothing records an issued binding. See [../sandbox/gateway/](../sandbox/gateway/).

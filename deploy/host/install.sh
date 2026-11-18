@@ -86,7 +86,55 @@ if ! echo "$CLOUDFLARED_SHA256  $CLOUDFLARED_BIN" | sha256sum -c --quiet --statu
   install -m 0755 "$STAGE/cloudflared" "$CLOUDFLARED_BIN"
 fi
 
-# Until logs ship elsewhere, the services also write to the serial console (`aws ec2 get-console-output`).
+# The journal to the cell's bucket each minute (docs/compute/provisioning/#host-logs).
+cat >/opt/nest/bin/nest-logship <<'LOGSHIP'
+#!/bin/bash
+set -u
+S=/var/lib/nest/logship
+M=http://169.254.169.254/latest
+mkdir -p $S
+id() {
+  local t
+  t=$(curl -sf -m 5 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' $M/api/token) || return 1
+  curl -sf -m 5 -H "X-aws-ec2-metadata-token: $t" $M/meta-data/instance-id
+}
+ship() {
+  rm -f $S/next $S/batch.gz
+  local first=-b
+  if [ -s $S/cursor ]; then cp $S/cursor $S/next; first=; fi
+  journalctl $first --no-pager -q -o short-iso-precise --cursor-file $S/next >$S/batch || { echo "journalctl failed: starting over"; rm -f $S/cursor; return 0; }
+  [ -s $S/batch ] || return 0
+  gzip -f $S/batch
+  aws s3 cp --region "@REGION@" --only-show-errors $S/batch.gz "s3://@BUCKET@/@LOG_PREFIX@$ID/$(date -u +%F/%H%M%S-%N).log.gz" && mv $S/next $S/cursor
+}
+until ID=$(id) && [ -n "$ID" ]; do sleep 5; done
+stop=
+trap 'stop=1; kill "${!:-}" 2>/dev/null' TERM INT
+while :; do
+  ship
+  [ -z "$stop" ] || { ship; exit 0; }
+  sleep 60 &
+  wait $!
+done
+LOGSHIP
+chmod 0755 /opt/nest/bin/nest-logship
+cat >/etc/systemd/system/nest-logship.service <<'EOF'
+[Unit]
+Description=nest host logs to the cell's bucket
+After=network-online.target
+Before=nestd.service nest-proxy.service nest-gateway.service nest-runner.service
+[Service]
+ExecStart=/opt/nest/bin/nest-logship
+KillMode=mixed
+TimeoutStopSec=30
+Nice=10
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# The services also write to the serial console (its last 64 KB).
 cat >/etc/systemd/system/nest-proxy.service <<'EOF'
 [Unit]
 Description=nest egress proxy

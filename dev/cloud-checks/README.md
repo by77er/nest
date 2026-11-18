@@ -44,7 +44,7 @@ CHECK_SINCE=2026-11-03T22:03:00Z python3 -I dev/cloud-checks/new_host_check.py
 | **Passes when** | no launch ended with `enroll_timeout`, and no console shows the user data failing or unread. A launch still within its enroll window isn't judged |
 | **Creates, changes** | nothing |
 
-EC2 keeps a console's latest snapshot for a while after termination. A snapshot can lag by many minutes (`dev/measure-cut/run.sh`), so run it again when one looks empty.
+A sandbox host's whole journal is in the cell's bucket under `logs/<instance id>/` for 14 days ([host logs](../../docs/compute/provisioning/README.md#host-logs)); the console is what a host that never finished its bootstrap leaves. EC2 keeps a console's latest snapshot for a while after termination. A snapshot can lag by many minutes (`dev/measure-cut/run.sh`), so run it again when one looks empty.
 
 ## `hands_probe_check.py`
 

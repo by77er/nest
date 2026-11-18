@@ -659,6 +659,8 @@ export const ROUTES: Route[] = [
     }),
   }),
   route({ method: "POST", path: "/v1/admin/hosts/:host/confirm-dead", auth: "admin", run: ({ env, cell, p }) => fleet(env, cell).confirmHostDead(p.host) }),
+  // An operator's drain: the host's sandboxes are suspended to the object store and leave, and the host retires once empty.
+  route({ method: "POST", path: "/v1/admin/hosts/:host/drain", auth: "admin", run: ({ env, cell, p }) => newMethod("FleetDO.drainHost", () => fleet(env, cell).drainHost(p.host)) }),
   route({ method: "GET", path: "/v1/admin/hosts/:host", auth: "admin", run: ({ env, cell, p }) => fleet(env, cell).hostStatus(p.host) }),
   route({ method: "GET", path: "/v1/admin/fleet", auth: "admin", run: ({ env, cell }) => fleet(env, cell).fleetView() }),
   route({ method: "GET", path: "/v1/admin/images", auth: "admin", run: ({ env, cell }) => fleet(env, cell).images() }),

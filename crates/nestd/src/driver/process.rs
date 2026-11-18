@@ -81,7 +81,7 @@ impl Driver for ProcessDriver {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "process driver: empty guest_command"));
         }
         super::access::create_searchable(&self.run_dir, &spec.vm_dir)?;
-        Ok(Box::new(ProcessVm { cmd: self.guest_command.clone(), mount_disk: self.mount_disk, gateway_gid: self.gateway_gid, spec, child: None, tree: None, emulator: None }))
+        Ok(Box::new(ProcessVm { cmd: self.guest_command.clone(), mount_disk: self.mount_disk, gateway_gid: self.gateway_gid, spec, child: None, exit: None, tree: None, emulator: None }))
     }
 }
 
@@ -91,6 +91,7 @@ pub struct ProcessVm {
     gateway_gid: Option<u32>,
     spec: VmSpec,
     child: Option<std::process::Child>,
+    exit: Option<super::supervise::ExitWatch>,
     /// The guest's process tree, shared with the lock-free pauser (`tree.rs`).
     tree: Option<SharedTree>,
     emulator: Option<Emulator>,
@@ -134,6 +135,9 @@ impl Vm for ProcessVm {
     fn pauser(&self) -> Option<Arc<dyn Pauser>> {
         self.tree.as_ref().map(|t| Arc::new(TreePauser(t.clone())) as Arc<dyn Pauser>)
     }
+    fn exited(&self) -> Option<super::ExitFuture> {
+        self.exit.as_ref().and_then(|e| e.exited().ok())
+    }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
     }
@@ -169,8 +173,10 @@ impl Vm for ProcessVm {
         // what it starts stays a member of its tree (`supervise.rs`, `tree.rs`).
         let child = super::supervise::spawn_in_session(cmd, self.spec.netns.clone())?;
         let pid = child.id();
+        let exit = super::supervise::ExitWatch::of(&child);
         // Held first: on any error below, stop or drop reaps it.
         self.child = Some(child);
+        self.exit = Some(exit?);
         self.tree = Some(Arc::new(std::sync::Mutex::new(Tree::new(pid as i32)?)));
         super::supervise::write_pidfile(&self.spec.vm_dir, pid)?;
         Ok(())
@@ -269,6 +275,35 @@ mod tests {
         for d in &chain {
             assert_eq!(std::fs::metadata(d).unwrap().permissions().mode() & 0o777, 0o711, "{}", d.display());
         }
+    }
+
+    /// The process driver's VM tells when its guest process dies by itself: nothing while it
+    /// runs, then how it ended.
+    #[tokio::test]
+    async fn a_guest_that_dies_by_itself_ends_the_vms_exit_future() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm_dir = dir.path().join("vm/sbx_exit/1");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let driver = ProcessDriver { guest_command: vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()], mount_disk: false, gateway_gid: None, run_dir: dir.path().into() };
+        let spec = VmSpec {
+            sandbox: nest_protocol::model::SandboxId("sbx_exit".into()),
+            epoch: nest_protocol::model::Epoch(1),
+            image: "test".into(),
+            resources: nest_protocol::model::Resources { vcpus: 1, memory_mib: 128, disk_gib: 1 },
+            vm_dir: vm_dir.clone(),
+            disk_path: dir.path().join("disk.img"),
+            netns: None,
+        };
+        let mut vm = driver.create(spec).await.unwrap();
+        assert!(vm.exited().is_none(), "nothing to watch before the start");
+        vm.start().await.unwrap();
+        let mut exited = vm.exited().expect("a started VM can be watched");
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), &mut exited).await.is_err(), "a running guest counted as exited");
+        let pid: i32 = std::fs::read_to_string(vm_dir.join("pid")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGKILL).unwrap();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(10), exited).await.expect("the guest was killed");
+        assert_eq!(exit, crate::driver::supervise::Exit::Signal(9));
+        vm.stop().await.unwrap();
     }
 
     /// Kills, when dropped, every process that carries its mark in its environment (set by `env`
