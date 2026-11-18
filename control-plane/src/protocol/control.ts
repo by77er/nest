@@ -92,6 +92,8 @@ export type LeaseClaim = z.output<typeof LeaseClaim>;
 export const Capacity = z.object({
   vcpus_free: z.number().int().nonnegative(),
   memory_mib_free: z.number().int().nonnegative(),
+  /** The host's memory (`MemTotal`); absent from a nestd before the field. */
+  memory_mib_total: z.number().int().nonnegative().optional(),
   hugepages_mib_free: z.number().int().nonnegative(),
   /** The pool's size; 0 or absent means regular pages (placement packs by `memory_mib_free`). */
   hugepages_mib_total: z.number().int().nonnegative().optional(),

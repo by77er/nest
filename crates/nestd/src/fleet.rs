@@ -383,7 +383,8 @@ mod tests {
         let all = fixtures("host_event");
         assert!(all.len() >= 10, "the fixtures are there");
         for (name, v) in all {
-            let (kind, rank) = match name.as_str() {
+            // `<variant>` or `<variant>.<case>`: a case of a variant reads as that variant.
+            let (kind, rank) = match name.split('.').next().unwrap_or_default() {
                 "egress_audit" => (EventKind::Audit { records: 4 }, Some(0)),
                 "capacity" => (EventKind::Capacity, Some(0)),
                 "workstream" => (EventKind::PortOpened, Some(1)),

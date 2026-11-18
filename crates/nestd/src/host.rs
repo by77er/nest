@@ -101,6 +101,17 @@ struct Summary {
     row: u64,
 }
 
+/// A `/proc/meminfo` field's number (kB, or a count), 0 when the field is missing or unreadable.
+fn meminfo_field(meminfo: &str, name: &str) -> u64 {
+    meminfo.lines().find_map(|l| l.strip_prefix(name).and_then(|v| v.split_whitespace().next()?.parse().ok())).unwrap_or(0)
+}
+
+/// The capacity report's memory, MiB, from `/proc/meminfo` (kB): what is available, and the
+/// host's total.
+fn memory_mib(meminfo: &str) -> (u32, u32) {
+    ((meminfo_field(meminfo, "MemAvailable:") / 1024) as u32, (meminfo_field(meminfo, "MemTotal:") / 1024) as u32)
+}
+
 /// The lifecycle machine's state for a reported one, and back.
 fn lifecycle_state(state: SandboxState) -> lifecycle::State {
     match state {
@@ -974,14 +985,13 @@ impl Inner {
         let used_vcpus: u32 = summary.values().filter(|s| holds_lease(s.state)).map(|s| s.resources.vcpus).sum();
         let total_vcpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
         let mem = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-        let field = |name: &str| -> u64 {
-            mem.lines().find_map(|l| l.strip_prefix(name).and_then(|v| v.split_whitespace().next()?.parse().ok())).unwrap_or(0)
-        };
+        let field = |name: &str| meminfo_field(&mem, name);
         let huge_free_mib = field("HugePages_Free:") * field("Hugepagesize:") / 1024;
         let huge_total_mib = field("HugePages_Total:") * field("Hugepagesize:") / 1024;
         Capacity {
             vcpus_free: total_vcpus.saturating_sub(used_vcpus),
-            memory_mib_free: (field("MemAvailable:") / 1024) as u32,
+            memory_mib_free: memory_mib(&mem).0,
+            memory_mib_total: memory_mib(&mem).1,
             hugepages_mib_free: huge_free_mib as u32,
             hugepages_mib_total: huge_total_mib as u32,
             sandboxes: summary.values().filter(|s| holds_lease(s.state)).count() as u32,
@@ -3377,6 +3387,21 @@ async fn refreeze_fenced(id: &SandboxId, epoch: Epoch, vm: &mut dyn Vm) -> bool 
 mod tests {
     use super::LapseGuard;
     use nest_protocol::control::{EgressAuditRecord, EgressVerdict};
+
+    /// The capacity report's memory figures come from `/proc/meminfo` by field name: a missing
+    /// or unreadable field is 0, which the wire leaves out (a host that doesn't say).
+    #[test]
+    fn meminfo_fields_are_read_by_name_and_default_to_zero() {
+        let meminfo = "MemTotal:       16170396 kB\nMemFree:          210000 kB\nMemAvailable:   12345678 kB\nHugePages_Total:       0\n";
+        assert_eq!(super::meminfo_field(meminfo, "MemTotal:"), 16170396);
+        assert_eq!(super::meminfo_field(meminfo, "MemAvailable:"), 12345678);
+        assert_eq!(super::meminfo_field(meminfo, "HugePages_Total:"), 0);
+        assert_eq!(super::meminfo_field(meminfo, "SwapTotal:"), 0);
+        assert_eq!(super::meminfo_field("MemTotal: lots kB\n", "MemTotal:"), 0);
+        // What the report carries: available and total, in MiB.
+        assert_eq!(super::memory_mib(meminfo), (12056, 15791));
+        assert_eq!(super::memory_mib(""), (0, 0));
+    }
 
     struct NoPause;
     #[async_trait::async_trait]

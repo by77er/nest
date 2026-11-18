@@ -1470,6 +1470,54 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     expect(await sandboxStub(idle.sandbox).info()).toMatchObject({ host: null, state: "suspended" });
   });
 
+  it("an operator's drain is a spot notice's, by hand: suspends go out, the host takes nothing new, and a second ask repeats them", async () => {
+    const cell = uniqueCell();
+    const fleet = fleetStub(cell);
+    const a = await connectHost(cell);
+    const busy = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create" && c.sandbox === busy.sandbox);
+    const ran = state(a.ws, busy.sandbox, 1, "running");
+    await a.ws.next("ack", (m) => m.up_to >= ran);
+    await sandboxStub(busy.sandbox).attach("agt_opdrain00000000000000000000");
+    await sandboxStub(busy.sandbox).agentActivity("agt_opdrain00000000000000000000", true);
+    const b = await connectHost(cell);
+
+    const status = await adminJson<{ status: string; leases: number }>(`/v1/admin/hosts/${a.host}/drain?cell=${cell}`, { body: {} });
+    expect(status).toMatchObject({ status: "draining", leases: 1 });
+    const cmds = await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+    expect(cmds.filter((c) => c.type === "sandbox_suspend")).toMatchObject([{ sandbox: busy.sandbox, epoch: 1, mode: "disk_only" }]);
+    // A draining host takes no new sandbox: the next one goes to the other host.
+    const next = await createSandbox(cell);
+    expect(next.host).toBe(b.host);
+    // Asked again (a suspend that was lost), it sends the suspend again and stays draining.
+    await adminJson(`/v1/admin/hosts/${a.host}/drain?cell=${cell}`, { body: {} });
+    const again = await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+    expect(again.filter((c) => c.type === "sandbox_suspend").map((c) => c.sandbox)).toEqual([busy.sandbox]);
+
+    // Suspended to the object store, the busy sandbox is placed again on the other host from its head.
+    const head = await commitHead(a.ws, busy.sandbox, 1, "req_opdrain1");
+    state(a.ws, busy.sandbox, 1, "suspended");
+    const [recreate] = await nextCommands(b.ws, (c) => c.type === "sandbox_create" && c.sandbox === busy.sandbox);
+    expect(recreate).toMatchObject({ sandbox: busy.sandbox, epoch: 2, from: { id: head.id } });
+    expect((await fleet.hostStatus(a.host))!.status).toBe("draining");
+  });
+
+  it("an operator's drain refuses a host that isn't there or can't be told", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const missing = await adminJson<{ error: { code: string } }>(`/v1/admin/hosts/hst_00000000000000000000000000/drain?cell=${cell}`, { body: {} }, 404);
+    expect(missing.error.code).toBe("not_found");
+    await adminJson(`/v1/admin/hosts/${a.host}/confirm-dead?cell=${cell}`, { body: {} });
+    const dead = await adminJson<{ error: { code: string; message: string } }>(`/v1/admin/hosts/${a.host}/drain?cell=${cell}`, { body: {} }, 409);
+    expect(dead.error).toMatchObject({ code: "conflict" });
+    expect(dead.error.message).toContain("is dead");
+    // A brain host's drain moves every brain: not by this route.
+    const brain = await connectHost(cell, "brain");
+    const refused = await adminJson<{ error: { code: string; message: string } }>(`/v1/admin/hosts/${brain.host}/drain?cell=${cell}`, { body: {} }, 409);
+    expect(refused.error.message).toContain("only a sandbox host");
+    expect((await fleetStub(cell).hostStatus(brain.host))!.status).toBe("active");
+  });
+
   it("a spot drain survives a blip: a host back from STONITH by fence, or from expiry, is still draining (B-3)", async () => {
     const cell = uniqueCell();
     const fleet = fleetStub(cell);

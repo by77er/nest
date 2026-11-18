@@ -121,7 +121,7 @@ The operator API takes scoped bearer tokens. Built: one `ADMIN_TOKEN` with every
 |---|---|
 | `observe` | Reading state, logs, transcripts and effective policy |
 | `approve` | `observe`, plus answering questions and approvals, and temporary egress grants |
-| `admin` | Everything else: policy layers, secrets, enrollment tokens, share links, terminals and port-forwards, confirm-dead, launch records |
+| `admin` | Everything else: policy layers, secrets, enrollment tokens, share links, terminals and port-forwards, a host's drain and confirm-dead, launch records |
 
 - **Format:** a recognisable prefix per scope (`nest_obs_`, `nest_apr_`, `nest_adm_`) plus 256 random bits, so a leaked token is easy to spot in logs and for secret scanners.
 - **Stored only as SHA-256 hashes** (a Worker secret) and compared in constant time. A fast hash is enough because the tokens are random, not passwords. Revoking one removes its hash.
