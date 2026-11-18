@@ -7,7 +7,7 @@ A model of a sandbox host's forced drain ([autoscaling](../../../docs/compute/au
 - SandboxDO's wake and what it is told of an eviction;
 - AWS taking the instance at the notice's deadline, and a clock.
 
-`HostDrain.tla` maps each action to code in its header, and constants switch the code's guards off or a fix shape on. Results, conformance and what it abstracts: [docs/verification/host-drain/](../../../docs/verification/host-drain/).
+`HostDrain.tla` maps each action to code in its header, and constants switch the code's guards and the fixes of 2026-11-18 off, or a fix shape on. Results, conformance and what it abstracts: [docs/verification/host-drain/](../../../docs/verification/host-drain/).
 
 ## Running
 
@@ -18,4 +18,4 @@ java -XX:+UseParallelGC -Xmx3g -cp ../../.tools/tla2tools-1.7.4.jar tlc2.TLC -wo
   -metadir /var/tmp/tlc-host-drain -config MC_spot.cfg HostDrain.tla
 ```
 
-Every config is in `expect.tsv` with its expected outcome; all are `ci` (the largest has about 26,000 distinct states).
+Every config is in `expect.tsv` with its expected outcome; all are `ci` (the largest has about 116,000 distinct states).

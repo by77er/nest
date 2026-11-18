@@ -1,6 +1,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FleetDO } from "../src/do/fleet";
+import { SandboxDO } from "../src/do/sandbox";
 import { CapacityError, QuotaError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { adminJson, connectHost, eventually, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
@@ -1574,6 +1575,140 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await a.ws.next("ack");
     await createSandbox(cell, 202);
     expect(ec2.launched).toHaveLength(1);
+  });
+
+  /** A cell that can retire its hosts: EC2 mocked, and `host` given an instance. `tick(shift)` runs FleetDO's tick with every idle host `shift` ms idler. */
+  async function retirable(cell: string, host: string, instance: string) {
+    const ec2 = new MockEc2("running", "terminated");
+    const config: AwsCellConfig = {
+      region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["c8i.large"],
+      spot: true, max_hosts: 1, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
+    };
+    const fleet = fleetStub(cell);
+    const tick = async (shift = 0) => {
+      await runInDurableObject(fleet, (inst: FleetDO, st) => {
+        inst.ec2Override = ec2;
+        inst.cellConfigOverride = config;
+        st.storage.sql.exec("UPDATE hosts SET instance_id = ? WHERE host = ? AND instance_id IS NULL", instance, host);
+        st.storage.sql.exec("UPDATE hosts SET idle_since = idle_since - ? WHERE idle_since IS NOT NULL", shift);
+        st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('tick', 0)");
+      });
+      await runDue(fleet);
+    };
+    await tick();
+    return { ec2, tick };
+  }
+
+  const resumesFor = (cell: string, sandbox: string) => runInDurableObject(fleetStub(cell), (_i: FleetDO, st) =>
+    st.storage.sql.exec("SELECT cmd FROM commands WHERE type = 'sandbox_resume' AND sandbox = ?", sandbox).toArray().length);
+
+  // use1, 2026-11-18: a destroyed sandbox's host fenced it on a heartbeat before its sandbox_destroy
+  // ran; the destroy then deleted the incarnation under its retire, which reports nothing, and the
+  // stale row kept the draining host for the 11-minute salvage window (HostDrain.tla, MC_old_destroyed).
+  it("a destroyed sandbox's fenced incarnation doesn't keep a draining host for the salvage window", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const { ec2, tick } = await retirable(cell, a.host, "i-0destroyed");
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    state(a.ws, sbx.sandbox, 1, "running");
+    await adminJson(`/v1/sandboxes/${sbx.sandbox}`, { method: "DELETE" });
+    await nextCommands(a.ws, (c) => c.type === "sandbox_destroy");
+    // The heartbeat's revoked lease got there first: fenced, and never reported retired.
+    const fenced = state(a.ws, sbx.sandbox, 1, "fenced");
+    await a.ws.next("ack", (m) => m.up_to >= fenced);
+
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await eventually("the host is draining", async () => (await fleetStub(cell).hostStatus(a.host))!.status === "draining");
+    await tick();
+    await tick();
+    expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("dead");
+    expect(ec2.terminated).toContain("i-0destroyed");
+  });
+
+  // HostDrain.tla, MC_old_wake: Drain, Wake, HostResume, Write, Retire.
+  it("a wake between a draining host's eviction and SandboxDO hearing of it sends no resume to the old host", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    state(a.ws, sbx.sandbox, 1, "running");
+    await commitHead(a.ws, sbx.sandbox, 1, "req_wakerace1");
+    const suspended = state(a.ws, sbx.sandbox, 1, "suspended");
+    await a.ws.next("ack", (m) => m.up_to >= suspended);
+
+    // SandboxDO's `evicted` is held: FleetDO has dropped the lease, and SandboxDO still has the sandbox on the host.
+    let reached = false;
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    const orig = SandboxDO.prototype.evicted;
+    SandboxDO.prototype.evicted = async function (this: SandboxDO, ...args: Parameters<SandboxDO["evicted"]>) {
+      reached = true;
+      await held;
+      return orig.apply(this, args);
+    };
+    try {
+      sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+      await eventually("the eviction is being told", () => reached);
+      expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toBeNull();
+      expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ host: a.host, state: "suspended" });
+
+      // The wake is refused, retryably, and nothing is sent to the host that no longer holds the lease.
+      await expect(Promise.resolve().then(() => sandboxStub(sbx.sandbox).wake())).rejects.toThrow(/holds no lease/);
+      expect(await resumesFor(cell, sbx.sandbox)).toBe(0);
+    } finally {
+      release();
+      SandboxDO.prototype.evicted = orig;
+    }
+    // Once SandboxDO was told, the wake places it from its head on another host.
+    await eventually("SandboxDO heard of the eviction", async () => (await sandboxStub(sbx.sandbox).info()).host === null);
+    const b = await connectHost(cell);
+    expect((await sandboxStub(sbx.sandbox).wake()).host).toBe(b.host);
+    expect(await resumesFor(cell, sbx.sandbox)).toBe(0);
+  });
+
+  // HostDrain.tla, MC_wake_lease_only: Wake, HostResume, Drain, Write, Retire.
+  it("a drain suspends, rather than evicts, a sandbox whose resume is unanswered", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const suspended = state(a.ws, sbx.sandbox, 1, "suspended");
+    await a.ws.next("ack", (m) => m.up_to >= suspended);
+    await sandboxStub(sbx.sandbox).wake();
+    const [resume] = await nextCommands(a.ws, (c) => c.type === "sandbox_resume");
+
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    const cmds = await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+    expect(cmds.filter((c) => c.type === "sandbox_suspend")).toMatchObject([{ sandbox: sbx.sandbox, epoch: 1 }]);
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 1 });
+
+    // Answered without a `running` before it (the resume failed): suspended as reported, so a second drain evicts it.
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "command_result", cmd: resume.cmd, outcome: { status: "error", error: { code: "internal", message: "resume failed", retryable: false } } }]);
+    await eventually("the resume is answered", async () => (await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", resume.cmd).toArray().length)) === 1);
+    await adminJson(`/v1/admin/hosts/${a.host}/drain?cell=${cell}`, { body: {} });
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toBeNull();
+  });
+
+  // Hosts inventory B8: the same resume in flight, at an idle retirement.
+  it("a host isn't retired as idle while a resume it was sent is unanswered", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const { ec2, tick } = await retirable(cell, a.host, "i-0resuming");
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const suspended = state(a.ws, sbx.sandbox, 1, "suspended");
+    await a.ws.next("ack", (m) => m.up_to >= suspended);
+    await tick();
+    await sandboxStub(sbx.sandbox).wake();
+    await nextCommands(a.ws, (c) => c.type === "sandbox_resume");
+
+    await tick(61_000);
+    await tick(61_000);
+    expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("active");
+    expect(ec2.terminated).toEqual([]);
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host });
   });
 });
 

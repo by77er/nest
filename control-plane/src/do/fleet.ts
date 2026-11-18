@@ -1248,8 +1248,23 @@ export class FleetDO extends DurableObject<Env> {
       sandbox, host, epoch, Date.now(), clean ? 1 : 0);
   }
 
+  private sandboxDestroyedHere(sandbox: string): boolean {
+    return this.sql.exec("SELECT 1 FROM sandboxes WHERE sandbox = ? AND destroyed_ms IS NOT NULL", sandbox).toArray().length > 0;
+  }
+
   /**
-   * Destroy each stale incarnation once clean or past its salvage window: one `sandbox_destroy` at its
+   * Sandboxes with a `sandbox_resume` no host has answered. Such a lease still reads `suspended`
+   * (nestd reports `running` once the guest is up, and the command's result follows that report
+   * on the same channel), but its VM may already run and hold work: it isn't evicted or moved as
+   * suspended, and it keeps its host from retiring as idle.
+   */
+  private resumesUnanswered(): Set<string> {
+    return new Set(this.sql.exec<{ sandbox: string }>(
+      "SELECT sandbox FROM commands WHERE type = 'sandbox_resume' AND result IS NULL AND sandbox IS NOT NULL").toArray().map((r) => r.sandbox));
+  }
+
+  /**
+   * Destroy each stale incarnation once clean, past its salvage window, or its sandbox destroyed: one `sandbox_destroy` at its
    * old epoch, never repeated. One superseded by a newer epoch on the same host is dropped (nestd
    * salvages and replaces it when it creates the new one).
    */
@@ -1266,7 +1281,10 @@ export class FleetDO extends DurableObject<Env> {
         drop();
         continue;
       }
-      if (!r.clean && now - r.first_seen_ms < SALVAGE_WINDOW_MS) continue;
+      // A destroyed sandbox has nothing to salvage (its commit would be refused), and its own
+      // `sandbox_destroy` may have deleted the incarnation under its retire, which then reports
+      // nothing: waiting out the window would only keep the host from retiring or finishing a drain.
+      if (!r.clean && !this.sandboxDestroyedHere(r.sandbox) && now - r.first_seen_ms < SALVAGE_WINDOW_MS) continue;
       const [cmd] = this.issueCommands(r.host, [{ type: "sandbox_destroy", sandbox: r.sandbox, epoch: r.epoch }]);
       this.sql.exec("UPDATE stale_incarnations SET cmd = ? WHERE sandbox = ? AND host = ? AND epoch = ?", cmd!, r.sandbox, r.host, r.epoch);
       console.log(`FleetDO: destroying the stale ${r.sandbox}@${r.epoch} on ${r.host}`);
@@ -1670,6 +1688,16 @@ export class FleetDO extends DurableObject<Env> {
         }
       }
     }
+    // A resume goes only to the lease holder. SandboxDO addresses the host it last heard of, and an
+    // eviction (a drain, or room made for a placement) drops the lease before SandboxDO is told: a
+    // resume sent in that gap would run a VM no lease covers, whose host can be retired with what it
+    // writes, or whose salvage is refused once the sandbox is placed elsewhere. Refused retryably:
+    // by the retry SandboxDO has heard, and the wake places it from its head.
+    for (const b of bodies) {
+      if (b.type === "sandbox_resume" && !this.holds(host, b.sandbox, b.epoch)) {
+        throw new NestError(ErrorCodes.SANDBOX_NOT_READY, `host ${host} holds no lease on ${b.sandbox} at epoch ${b.epoch}: no sandbox_resume goes there`, 503, true);
+      }
+    }
     const commands = bodies.map((body) => ({ cmd: newId("cmd_"), issued_ms: now, ...body }));
     // A command for a dead or unknown host is stored (an `issueKill` retry finds it) and answered at
     // once, without failure handling; never queued.
@@ -1755,12 +1783,9 @@ export class FleetDO extends DurableObject<Env> {
     // change could bring the other (the sandbox's own host is judged then).
     const basic = hasBasicBinding(req.policy.inject ?? []) || usesAt(all);
     const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(opens ? ["guard_injected_any = 1"] : []), ...(basic ? [ENFORCES_AT] : [])].join(" AND ");
-    // A sandbox whose resume is in flight still reads `suspended` (nestd reports `running` once the
-    // guest is up): it isn't moved to make room.
-    const resuming = () => new Set(this.sql.exec<{ sandbox: string }>(
-      "SELECT sandbox FROM commands WHERE type = 'sandbox_resume' AND result IS NULL AND sandbox IS NOT NULL").toArray().map((r) => r.sandbox));
+    // A sandbox whose resume is in flight still reads `suspended`: it isn't moved to make room.
     const facts = () => {
-      const waking = resuming();
+      const waking = this.resumesUnanswered();
       return this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
         .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
         .map((h) => {
@@ -2472,7 +2497,8 @@ export class FleetDO extends DurableObject<Env> {
         // Nor is a host retired while it holds an incarnation not yet salvaged and destroyed (a failed
         // sandbox's, released): its uncommitted work would go with the instance.
         const salvaging = this.sql.exec("SELECT 1 FROM stale_incarnations WHERE host = ? AND cmd IS NULL", h.host).toArray().length > 0;
-        const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended") || this.brainsOn(h.host) > 0 || salvaging;
+        const waking = this.resumesUnanswered();
+        const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended" || waking.has(l.sandbox)) || this.brainsOn(h.host) > 0 || salvaging;
         const step = idleStep(busy, h.idle_since, now, grace);
         if (step === "busy") {
           if (h.idle_since !== null) this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", h.host);
@@ -2550,11 +2576,17 @@ export class FleetDO extends DurableObject<Env> {
     this.move(host, "drain");
     console.warn(`FleetDO: ${host} draining (${why})`);
     const leases = this.leasesOf(host).filter((l) => !l.expired);
-    await this.evict(host, leases.filter((l) => l.state === "suspended").map((l) => l.sandbox));
-    const running = leases.filter((l) => l.state !== "suspended");
+    // Read in this step, before the evictions' await: a lease with a resume unanswered is told to
+    // suspend like a running one (the host runs its commands in order, the resume first).
+    const waking = this.resumesUnanswered();
+    const suspended = (l: { state: string | null; sandbox: string }) => l.state === "suspended" && !waking.has(l.sandbox);
+    const running = leases.filter((l) => !suspended(l));
+    // The leases that go and the suspends are decided and written in one step; SandboxDO is told after.
+    this.recordEvictions(host, leases.filter(suspended).map((l) => l.sandbox));
     if (running.length) {
       this.issueCommands(host, running.map((l) => ({ type: "sandbox_suspend" as const, sandbox: l.sandbox, epoch: l.epoch, mode: "disk_only" as const })));
     }
+    await this.processEvictions();
     // Its brains move now, in the background (the event batch isn't held for brain starts).
     this.ctx.waitUntil(this.tellDraining(host));
     await this.armTick();
