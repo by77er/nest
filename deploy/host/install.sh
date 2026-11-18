@@ -108,9 +108,11 @@ ship() {
   aws s3 cp --region "@REGION@" --only-show-errors $S/batch.gz "s3://@BUCKET@/@LOG_PREFIX@$ID/$(date -u +%F/%H%M%S-%N).log.gz" && mv $S/next $S/cursor
 }
 until ID=$(id) && [ -n "$ID" ]; do sleep 5; done
-trap 'ship; exit 0' TERM INT
+stop=
+trap 'stop=1; kill "${!:-}" 2>/dev/null' TERM INT
 while :; do
   ship
+  [ -z "$stop" ] || { ship; exit 0; }
   sleep 60 &
   wait $!
 done
@@ -120,6 +122,7 @@ cat >/etc/systemd/system/nest-logship.service <<'EOF'
 [Unit]
 Description=nest host logs to the cell's bucket
 After=network-online.target
+Before=nestd.service nest-proxy.service nest-gateway.service nest-runner.service
 [Service]
 ExecStart=/opt/nest/bin/nest-logship
 KillMode=mixed

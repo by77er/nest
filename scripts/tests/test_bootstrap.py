@@ -356,7 +356,7 @@ class LogShipping(unittest.TestCase):
             (fake / "var/lib/nest/logship").mkdir(parents=True)
             (fake / "var/lib/nest/logship/cursor").write_text(cursor)
         # The journal: two lines after no cursor, one more after each `more` file, else nothing; a
-        # cursor it doesn't know fails, as journalctl does (`Failed to seek to cursor`).
+        # malformed cursor fails, as journalctl does (`Failed to seek to cursor`).
         stub(bin_dir, "journalctl", f"""for a in "$@"; do f="$a"; done
 [ -f "$f" ] && at=$(cat "$f") || at=0
 case "$at" in *[!0-9]*) echo "Failed to seek to cursor" >&2; exit 1;; esac
@@ -416,8 +416,8 @@ cp "$6" {fake}/upload.tmp && mv {fake}/upload.tmp {uploads}/$n.gz && echo "$7" >
         self.assertEqual((fake / "var/lib/nest/logship/cursor").read_text().strip(), "2")
 
 
-    def test_a_cursor_the_journal_no_longer_has_starts_over(self):
-        """It used to fail every minute for good, saying nothing."""
+    def test_a_cursor_journalctl_cannot_read_starts_over(self):
+        """A corrupt cursor file (or a failed export): without this it failed every minute for good, saying nothing."""
         fake, proc = self.start(cursor="gone\n")
         self.wait_for("the upload after starting over", lambda: len(list((fake / "uploads").iterdir())) == 1)
         self.assertEqual(self.uploaded(fake), ["line 1\nline 2\n"])

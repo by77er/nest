@@ -369,7 +369,12 @@ def expiresLogs : ExprNode → Bool
       match fields.lookup block with
       | some (.array [.object inner]) => (inner.lookup name).bind ExprNode.literal?
       | _ => none
-    match (fields.lookup "status").bind ExprNode.literal?, field? "filter" "prefix", field? "expiration" "days" with
+    -- The prefix is the filter's only condition: a size or tag beside it would spare most logs.
+    let prefix? : Option Value :=
+      match fields.lookup "filter" with
+      | some (.array [.object [("prefix", p)]]) => p.literal?
+      | _ => none
+    match (fields.lookup "status").bind ExprNode.literal?, prefix?, field? "expiration" "days" with
     | some (.string "Enabled"), some (.string p), some (.number d) =>
       p == logPrefix && Lean.JsonNumber.fromNat 0 < d && d < Lean.JsonNumber.fromNat (maxLogRetentionDays + 1)
     | _, _, _ => false
@@ -395,7 +400,10 @@ with a rule that expires the log prefix within `maxLogRetentionDays` and one tha
 expired versions. Without them every host's journal would pile up for ever. -/
 def logsExpire : Policy :=
   Policy.graph "logs-expire" fun g =>
-    match g.resources.filter (·.resourceType == "aws_s3_bucket_lifecycle_configuration") with
+    -- A directory of its own: an empty prefix would expire the whole bucket, sandbox disks included.
+    if logPrefix.length < 2 || !logPrefix.endsWith "/" || logPrefix.startsWith "/" then
+      some s!"the log prefix {logPrefix.quote} must be a directory of its own, like `logs/`"
+    else match g.resources.filter (·.resourceType == "aws_s3_bucket_lifecycle_configuration") with
     | [r] =>
       if (r.argument? "bucket").bind ExprNode.referencedAddress? != some (.resource "aws_s3_bucket" "cell") then
         some "the lifecycle configuration must be the cell bucket's"
