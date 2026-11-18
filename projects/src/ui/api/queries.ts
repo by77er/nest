@@ -33,8 +33,8 @@ export const keys = {
 /** A task as the board's list holds it (`GET …/tasks`): a write's answer without its body and spec. */
 const summary = ({ body: _b, spec: _s, ...t }: Task): TaskSummary => t;
 
-/** How often each live view polls, in ms. */
-export const POLL = { board: 5_000, chat: 3_000, asks: 5_000, project: 10_000, task: 5_000, manager: 10_000, reviews: 15_000, routines: 10_000 } as const;
+/** How often each live view polls, in ms; `unread`: the sidebar's unread count, off the Manager page (which polls the chat itself). */
+export const POLL = { board: 5_000, chat: 3_000, unread: 10_000, asks: 5_000, project: 10_000, task: 5_000, manager: 10_000, reviews: 15_000, routines: 10_000 } as const;
 
 // --- reads ------------------------------------------------------------------------------------------
 
@@ -56,8 +56,12 @@ export const useTask = (id: string, task: string | undefined) =>
     placeholderData: keepPreviousData,
   });
 
-/** The chat's latest page; `enabled: false` (or no id) asks nothing (the sidebar outside a project). */
-export const useChat = (id: string, enabled = true) => useQuery({ queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: POLL.chat, enabled: enabled && id !== "" });
+/**
+ * The chat's latest page; `enabled: false` (or no id) asks nothing (the sidebar outside a project). `every`:
+ * this observer's own interval (each observer polls on its own, so the fastest one sets the pace).
+ */
+export const useChat = (id: string, enabled = true, every: number | false = POLL.chat) =>
+  useQuery({ queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: every, enabled: enabled && id !== "" });
 
 /** Stop the manager's current turn (Stop, while one runs). */
 export function useInterruptManager(id: string) {
