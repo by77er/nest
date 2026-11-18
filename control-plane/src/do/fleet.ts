@@ -1266,14 +1266,24 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * On a draining host, the leases that read `suspended` with no resume unanswered leave: dropped and
-   * their evictions owed, in one step (the caller tells SandboxDO, `processEvictions`). The drain
-   * does this once; again whenever such a lease can appear later: a resume that failed leaves its
-   * VM suspended, and nestd answers the drain's suspend "already suspended" with no report.
+   * A forced drain (a spot notice or an operator's): draining, and not only because the host runs
+   * the previous release's nestd (`drainBrains`, which leaves its sandboxes as they are).
    */
-  private evictSuspendedOf(host: string): void {
+  private forcedDrain(h: HostRow | undefined): boolean {
+    return h?.status === "draining" && h.brain_epochs === 1;
+  }
+
+  /**
+   * On a draining host, the leases that read `suspended` with no resume unanswered leave (`only`:
+   * just that sandbox's): dropped and their evictions owed, in one step (the caller tells
+   * SandboxDO, `processEvictions`). A forced drain does this once, then whenever such a lease can
+   * appear: a resume that failed leaves its VM suspended, and nestd answers the drain's suspend
+   * "already suspended" with no report.
+   */
+  private evictSuspendedOf(host: string, only?: string): void {
     const waking = this.resumesUnanswered(host);
-    this.recordEvictions(host, this.leasesOf(host).filter((l) => !l.expired && l.state === "suspended" && !waking(l)).map((l) => l.sandbox));
+    this.recordEvictions(host, this.leasesOf(host)
+      .filter((l) => !l.expired && l.state === "suspended" && !waking(l) && (only === undefined || l.sandbox === only)).map((l) => l.sandbox));
   }
 
   /**
@@ -1470,7 +1480,7 @@ export class FleetDO extends DurableObject<Env> {
         // this step, before SandboxDO hears `suspended` (a wake it sends from then on is refused,
         // not sent to a host about to lose the lease), and SandboxDO is told of the eviction after.
         const leaving = ev.state === "suspended" && this.host(host)?.status === "draining";
-        if (leaving) this.evictSuspendedOf(host);
+        if (leaving) this.evictSuspendedOf(host, ev.sandbox);
         await this.sandbox(ev.sandbox).reportState(host, ev.epoch, ev.state, ev.detail ?? null, ev.guest ?? null);
         if (ev.state === "fenced") await this.holderFenced(host, ev.sandbox, ev.epoch, false);
         else if (leaving) await this.processEvictions();
@@ -1591,7 +1601,7 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ?, followup_ms = ?, followup_attempts = 0 WHERE cmd = ?",
       JSON.stringify(outcome), Date.now(), answeredBy, owed ? Date.now() : null, cmd);
     // A resume answered on a draining host: its lease, if it still reads `suspended`, can leave now.
-    const left = row.type === "sandbox_resume" && this.host(host)?.status === "draining";
+    const left = row.type === "sandbox_resume" && this.forcedDrain(this.host(host));
     if (left) this.evictSuspendedOf(host);
     if (owed) await this.deadlines.set(ALARM_FOLLOWUPS, Date.now() + followupBackoff(1), true);
     if (left) await this.processEvictions();
@@ -1715,9 +1725,16 @@ export class FleetDO extends DurableObject<Env> {
     // resume sent in that gap would run a VM no lease covers, whose host can be retired with what it
     // writes, or whose salvage is refused once the sandbox is placed elsewhere. Refused retryably:
     // by the retry SandboxDO has heard, and the wake places it from its head.
+    // Nor to a host in a forced drain: the drain's suspend was already sent, and a VM resumed after
+    // it would run until the host is taken, with nothing to suspend it again. Its lease leaves once it
+    // reads `suspended` with every earlier resume answered.
     for (const b of bodies) {
-      if (b.type === "sandbox_resume" && !this.holds(host, b.sandbox, b.epoch)) {
+      if (b.type !== "sandbox_resume") continue;
+      if (!this.holds(host, b.sandbox, b.epoch)) {
         throw new NestError(ErrorCodes.SANDBOX_NOT_READY, `host ${host} holds no lease on ${b.sandbox} at epoch ${b.epoch}: no sandbox_resume goes there`, 503, true);
+      }
+      if (this.forcedDrain(target)) {
+        throw new NestError(ErrorCodes.SANDBOX_NOT_READY, `host ${host} is draining: no sandbox_resume goes there`, 503, true);
       }
     }
     const commands = bodies.map((body) => ({ cmd: newId("cmd_"), issued_ms: now, ...body }));
@@ -2080,6 +2097,9 @@ export class FleetDO extends DurableObject<Env> {
       if (ws && h.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, h.host);
     }
     await this.processReassign();
+    // Evictions SandboxDO hasn't been told (its call failed, or the event that owed it was redelivered
+    // after the lease was gone): here, whatever the cell's settings.
+    await this.processEvictions();
     // Brains of a lost host whose agent wasn't told yet (its call failed), and owed exits of brains a
     // hello no longer reported.
     for (const h of this.sql.exec<{ host: string }>(LOST_WITH_BRAINS).toArray()) await this.brainsLost(h.host);
@@ -2535,8 +2555,8 @@ export class FleetDO extends DurableObject<Env> {
     // A draining host of any kind goes once empty, rather than at its deadline: never with a lease,
     // an indexed brain (alive until its exit), or a stale incarnation not yet salvaged.
     for (const h of this.hostsBy({ status: "draining" })) {
-      // What became evictable since the drain (a failed resume's result): told below, with the rest.
-      this.evictSuspendedOf(h.host);
+      // What became evictable since a forced drain (a failed resume's result): told below, with the rest.
+      if (this.forcedDrain(h)) this.evictSuspendedOf(h.host);
       if (this.leasesOf(h.host).length) continue;
       if (this.sql.exec("SELECT 1 FROM host_agents WHERE host = ?", h.host).toArray().length) continue;
       if (this.sql.exec("SELECT 1 FROM stale_incarnations WHERE host = ? AND cmd IS NULL", h.host).toArray().length) continue;

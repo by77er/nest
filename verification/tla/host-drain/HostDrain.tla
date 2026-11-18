@@ -8,8 +8,8 @@
 (* notice's deadline.                                                      *)
 (*                                                                         *)
 (* The fixes of 2026-11-18 are switches (ReapDestroyed, ResumeNeedsLease,  *)
-(* ResumeIsBusy, EvictBeforeTold, SweepSuspended): off, each reproduces    *)
-(* its bug.                                                                *)
+(* NoResumeToDraining, ResumeIsBusy, EvictBeforeTold, SweepSuspended):     *)
+(* off, each reproduces its bug.                                           *)
 (*                                                                         *)
 (* One host. Each sandbox starts as a resident (running or suspended, as   *)
 (* FleetDO last heard) or, if in `StaleSbx`, as an incarnation its lease   *)
@@ -80,6 +80,7 @@ CONSTANTS
                       \* sandbox_destroy deleted the incarnation under its retire, which then reports nothing (use1, 2026-11-18 15:58)
   ReapDestroyed,      \* TRUE: reapStale doesn't wait the window for a destroyed sandbox's incarnation. FALSE: before the fix
   ResumeNeedsLease,   \* TRUE: issueCommands refuses a sandbox_resume for a sandbox its host holds no lease on. FALSE: before the fix
+  NoResumeToDraining, \* TRUE: nor for a host in a forced drain. FALSE: before the fix
   EvictBeforeTold,    \* TRUE: a `suspended` report's eviction is recorded before SandboxDO hears the report. FALSE: after (before the fix)
   SweepSuspended,     \* TRUE: a draining host's leases that read suspended, with no resume unanswered, are evicted whenever
                       \* they appear (a resume's result, the tick). FALSE: only at the drain and at a `suspended` report
@@ -99,7 +100,7 @@ VARIABLES
   \* SandboxDO
   place,      \* s -> "here", "unplaced", "elsewhere", "released" (StaleSbx: no longer this host's)
   sview,      \* s -> the state SandboxDO has: "running", "suspended"
-  resume,     \* s -> the sandbox_resume: "none", "sent", "done" (the host ran it), "answered" (FleetDO has its result)
+  resume,     \* s -> the sandbox_resume: "none" (never sent, or answered), "sent", "done" (the host ran it; FleetDO hasn't its result)
   \* the host
   inst,       \* "up", "retired" (FleetDO terminated it), "killed" (AWS did)
   vm,         \* s -> "running", "suspended", "fenced", "retired", "gone"
@@ -143,11 +144,14 @@ Write(s) ==
   /\ dirty' = [dirty EXCEPT ![s] = TRUE] /\ Spend("write")
   /\ UNCHANGED <<fleetVars, sbxVars, inst, vm, now, noticeAt, lost, emptyAtKill>>
 
+\* issueCommands' refusals of a sandbox_resume.
+Refused(s) == (ResumeNeedsLease /\ lease[s] = "none") \/ (NoResumeToDraining /\ status = "draining")
+
 \* An agent needs a suspended sandbox: SandboxDO sends sandbox_resume to its holder.
 Wake(s) ==
   /\ place[s] = "here" /\ sview[s] = "suspended" /\ resume[s] = "none" /\ budget.wake > 0
   \* Without the lease the command is refused (retryable): the wake fails, and is asked again once SandboxDO was told.
-  /\ resume' = [resume EXCEPT ![s] = IF ResumeNeedsLease /\ lease[s] = "none" THEN "none" ELSE "sent"] /\ Spend("wake")
+  /\ resume' = [resume EXCEPT ![s] = IF Refused(s) THEN "none" ELSE "sent"] /\ Spend("wake")
   /\ UNCHANGED <<fleetVars, place, sview, hostVars, now, noticeAt, lost, emptyAtKill>>
 
 -----------------------------------------------------------------------------
@@ -215,13 +219,13 @@ ReportRunning(s) ==
   /\ lease[s] = "suspended" /\ vm[s] = "running" /\ inst = "up"
   /\ lease' = [lease EXCEPT ![s] = "running"] /\ sview' = [sview EXCEPT ![s] = "running"]
   \* The resume's result follows the report on the same ordered channel: one step here.
-  /\ resume' = [resume EXCEPT ![s] = IF @ = "done" THEN "answered" ELSE @]
+  /\ resume' = [resume EXCEPT ![s] = IF @ = "done" THEN "none" ELSE @]
   /\ UNCHANGED <<status, susp, owed, stale, staleAt, place, hostVars, now, noticeAt, lost, emptyAtKill, budget>>
 
 \* A resume's result with no `running` before it: it failed, or its sandbox is no longer this host's.
 ResumeAnswered(s) ==
   /\ resume[s] = "done" /\ inst = "up" /\ ~(lease[s] = "suspended" /\ vm[s] = "running")
-  /\ resume' = [resume EXCEPT ![s] = "answered"]
+  /\ resume' = [resume EXCEPT ![s] = "none"]
   /\ UNCHANGED <<fleetVars, place, sview, hostVars, now, noticeAt, lost, emptyAtKill, budget>>
 
 \* drain(): suspended leases leave now, the rest are told to suspend.
@@ -261,7 +265,11 @@ ReportSuspended(s) ==
      \/ ~ReportAfterCommit /\ susp[s] = "sent" /\ vm[s] = "running"
   /\ sview' = [sview EXCEPT ![s] = "suspended"]
   /\ IF EvictBeforeTold
-       THEN Evict(s) /\ susp' = [susp EXCEPT ![s] = "noop"]
+       THEN /\ susp' = [susp EXCEPT ![s] = "noop"]
+            \* evictSuspendedOf: not while a resume of it is unanswered (the sweep takes it once that is answered).
+            /\ IF resume[s] \in {"sent", "done"}
+                 THEN lease' = [lease EXCEPT ![s] = "suspended"] /\ UNCHANGED <<owed, stale, staleAt>>
+                 ELSE Evict(s)
        ELSE /\ lease' = [lease EXCEPT ![s] = "suspended"] /\ susp' = [susp EXCEPT ![s] = "reported"]
             /\ UNCHANGED <<owed, stale, staleAt>>
   /\ UNCHANGED <<status, place, resume, hostVars, now, noticeAt, lost, emptyAtKill, budget>>
@@ -387,14 +395,20 @@ NoStrandedLease ==
   ~(status = "draining" /\ inst = "up" /\ ~ENABLED System
     /\ \E s \in Sandboxes : lease[s] = "suspended" /\ resume[s] \notin {"sent", "done"})
 
-\* No VM runs on a resume while its host holds no lease on it.
-NoResumeOffLease == \A s \in Sandboxes : ~(vm[s] = "running" /\ lease[s] = "none" /\ resume[s] \in {"done", "answered"})
+\* No VM runs while its host holds no lease on it.
+NoResumeOffLease == \A s \in Sandboxes : ~(inst = "up" /\ vm[s] = "running" /\ lease[s] = "none")
+
+\* A draining host never comes to rest with a VM running that nothing has told, or will tell, to suspend
+\* (one whose suspend commit failed is the exception: lost by design).
+NoRunningLeft ==
+  ~(status = "draining" /\ inst = "up" /\ ~ENABLED System
+    /\ \E s \in Sandboxes : vm[s] = "running" /\ lease[s] # "none" /\ susp[s] \notin {"sent", "failed"})
 
 \* Reachability (each expected to be violated: the state happens).
 NeverRetired == inst # "retired"
 NeverKilledHolding == ~(inst = "killed" /\ \E s \in Sandboxes : lease[s] # "none")
 NeverKillLoss == \A s \in Sandboxes : "kill" \notin lost[s]
 NeverReplaced == \A s \in Sandboxes : place[s] # "elsewhere"
-NeverResumed == \A s \in Sandboxes : resume[s] \notin {"done", "answered"}
+NeverResumed == \A s \in Sandboxes : ~(vm[s] = "running" /\ lease[s] = "suspended")
 NeverResumeFailed == budget.rfail = MaxResumeFail
 =============================================================================

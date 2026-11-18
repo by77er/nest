@@ -1693,6 +1693,76 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     await eventually("SandboxDO heard of the eviction", async () => (await sandboxStub(sbx.sandbox).info()).host === null);
   });
 
+  it("a wake after the drain's suspend sends no second resume to the draining host", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const suspended = state(a.ws, sbx.sandbox, 1, "suspended");
+    await a.ws.next("ack", (m) => m.up_to >= suspended);
+    await sandboxStub(sbx.sandbox).wake();
+    await nextCommands(a.ws, (c) => c.type === "sandbox_resume");
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+
+    // SandboxDO still has it suspended on the host (no `running` yet): a retried wake would queue a
+    // resume behind the suspend, and the VM would run again with nothing left to suspend it.
+    await expect(Promise.resolve().then(() => sandboxStub(sbx.sandbox).wake())).rejects.toThrow(/is draining/);
+    expect(await resumesFor(cell, sbx.sandbox)).toBe(1);
+  });
+
+  it("the tick takes a lease that reads suspended off a draining host, and tells SandboxDO", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const { ec2, tick } = await retirable(cell, a.host, "i-0sweep");
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const suspended = state(a.ws, sbx.sandbox, 1, "suspended");
+    await a.ws.next("ack", (m) => m.up_to >= suspended);
+    // Draining with the lease still there, as a failed resume answered before this release would leave it.
+    await runInDurableObject(fleetStub(cell), (_i: FleetDO, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'draining', drain_ms = ? WHERE host = ?", Date.now(), a.host);
+    });
+    await tick();
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toBeNull();
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ host: null, state: "suspended" });
+    await tick();
+    expect((await fleetStub(cell).hostStatus(a.host))!.status).toBe("dead");
+    expect(ec2.terminated).toContain("i-0sweep");
+  });
+
+  it("an eviction whose `suspended` report failed at SandboxDO is told at the next tick, in a cell with no settings too", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const ran = state(a.ws, sbx.sandbox, 1, "running");
+    await a.ws.next("ack", (m) => m.up_to >= ran);
+    sendEvents(a.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_suspend");
+
+    let failed = 0;
+    const orig = SandboxDO.prototype.reportState;
+    SandboxDO.prototype.reportState = async function (this: SandboxDO, ...args: Parameters<SandboxDO["reportState"]>) {
+      if (args[0] === a.host && args[2] === "suspended") {
+        failed++;
+        throw new Error("SandboxDO unreachable");
+      }
+      return orig.apply(this, args);
+    };
+    try {
+      state(a.ws, sbx.sandbox, 1, "suspended");
+      // The lease went with the report; the batch failed, and its redelivery finds no holder.
+      await eventually("the report failed", () => failed > 0);
+      await eventually("the lease left", async () => (await fleetStub(cell).leaseOf(sbx.sandbox)) === null);
+      expect((await sandboxStub(sbx.sandbox).info()).host).toBe(a.host);
+    } finally {
+      SandboxDO.prototype.reportState = orig;
+    }
+    await runAlarm(fleetStub(cell), "tick");
+    await eventually("SandboxDO heard of the eviction", async () => (await sandboxStub(sbx.sandbox).info()).host === null);
+  });
+
   it("a wake while SandboxDO is hearing `suspended` from a draining host sends no resume there", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
