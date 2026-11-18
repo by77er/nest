@@ -166,9 +166,10 @@ describe("timeline", () => {
   it("keeps the split once the turn has ended and is held for its reply, with no working line", () => {
     expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000)], turn([call("a", T0 + 1_000), said("b", T0 + 3_000)], false), NOW))).toEqual(["owner 1", "stream a", "owner 2", "stream b"]);
     expect(shape(timeline([asked, msg(2, "owner", T0 + 5_000)], turn([call("a", T0 + 1_000)], false), NOW))).toEqual(["owner 1", "stream a", "owner 2"]);
-    // Its reply landed (kept while the reader reads back): the earlier parts stay, the reply takes the last one's place.
-    const landed = { ...turn([call("a", T0 + 1_000), said("b", T0 + 3_000)], false), landed: true };
-    expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "manager", T0 + 4_000)], landed, NOW))).toEqual(["owner 1", "stream a", "owner 2", "manager 3"]);
+    // Its reply (3) landed, the turn kept while the reader reads back: the earlier parts stay, the reply takes
+    // the last one's place, and what comes after the reply (a note, a message from elsewhere) never splits it again.
+    const landed = { ...turn([call("a", T0 + 1_000), said("b", T0 + 3_000)], false), landed: 3 };
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "manager", T0 + 4_000), msg(4, "app", T0 + 6_000), msg(5, "owner", T0 + 7_000)], landed, NOW))).toEqual(["owner 1", "stream a", "owner 2", "manager 3", "app 4", "owner 5"]);
   });
 });
 

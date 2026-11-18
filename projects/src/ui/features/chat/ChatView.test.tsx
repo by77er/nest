@@ -712,6 +712,13 @@ describe("the chat", () => {
     await waitFor(() => expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(1));
     expect(below(read(), mine())).toBe(true);
     expect(seqs()).toEqual(["1", "2", "3"]);
+    // A note after the reply doesn't bring the turn's last part back.
+    api.chat.push({ seq: 4, at_ms: AT + 9_000, sender: "app", text: "The manager restarted (upgrade).", delivered: true, status: "done" as const, error: null });
+    await queryClient.refetchQueries();
+    const note = await within(c).findByText("The manager restarted (upgrade).");
+    expect(below(reply, note)).toBe(true);
+    expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(1);
+    expect(within(c).queryByRole("button", { name: "Bash npm test, done" })).toBeNull();
     // …until they're back at the end: then it goes.
     await user.click(within(c).getByRole("button", { name: /^Jump to latest/ }));
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());

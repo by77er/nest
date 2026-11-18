@@ -369,21 +369,23 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   }, [live]); // `lastManagerSeq` is read at each turn's start only
   // The held turn as it ended (a call it never answered reads stopped), while the ring has it.
   const heldEnd = !live && held ? (finished.find((t) => t.turn === held.turn) ?? null) : null;
-  // Let go once its message is in the log (by what it says; by seq if the ring has lost the turn), at
-  // once if it ended without a reply (stopped), and after HOLD_MAX_MS whatever happens. Landed, it isn't
-  // shown again (under its own reply) while the release waits for the effect. Reading back, its parts
-  // before the messages sent during it stay until the reader is back at the end: the log doesn't shrink
-  // under their line (their steps are behind the reply too).
-  const landed = !!held && !live && (heldEnd ? !heldEnd.reply || messages.some((m) => m.sender === "manager" && m.text.trim() === heldEnd.reply) : lastManagerSeq > held.sinceSeq);
+  // Its message, once in the log: by what it says (the newest saying it), or the newest of the manager's
+  // if the ring has lost the turn.
+  const reply = !held || live ? undefined : heldEnd ? (heldEnd.reply ? messages.filter((m) => m.sender === "manager" && m.text.trim() === heldEnd.reply).at(-1) : undefined) : lastManagerSeq > held.sinceSeq ? messages.find((m) => m.seq === lastManagerSeq) : undefined;
+  // Let go once its message is in the log, or it ended without one (stopped), and the reader is at the end;
+  // and after HOLD_MAX_MS if its message never comes. Landed, it isn't shown again (under its own reply)
+  // while the release waits for the effect. Reading back, it stays (its parts before the messages sent
+  // during it, all of a stopped one's) until the reader is back at the end: the log doesn't shrink under
+  // their line.
+  const landed = !!held && !live && (reply !== undefined || (heldEnd !== null && !heldEnd.reply));
   useEffect(() => {
-    if (!held || live) return;
-    if (landed) {
-      if (atBottom) setHeld(null);
-      return;
-    }
+    if (held && !live && landed && atBottom) setHeld(null);
+  }, [held, live, landed, atBottom]);
+  useEffect(() => {
+    if (!held || live || landed) return;
     const t = setTimeout(() => setHeld(null), HOLD_MAX_MS);
     return () => clearTimeout(t);
-  }, [held, live, landed, atBottom]);
+  }, [held, live, landed]);
 
   // The reader opened something: the end is no longer followed (scroll anchoring holds their line).
   const stopFollowing = useCallback(() => {
@@ -527,7 +529,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const phone = usePhone();
   // The turn in the log where it is in time (README.md#the-manager-chat): split by the messages sent
   // during it; a held one keeps its split until its reply lands.
-  const turn = live ? { ...live, running } : held && !(landed && atBottom) ? { turn: held.turn, steps: heldEnd?.steps ?? held.steps, running: false, landed } : null;
+  const turn = live ? { ...live, running } : held && !(landed && atBottom) ? { turn: held.turn, steps: heldEnd?.steps ?? held.steps, running: false, landed: reply?.seq } : null;
   const items = timeline(messages, turn);
   const replySteps = stepsBySeq(messages, finished);
   // One spinner in the log: the most recent of the owner's messages in flight.

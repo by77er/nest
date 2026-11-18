@@ -244,10 +244,11 @@ export function stepsBySeq(messages: ChatMessage[], turns: FinishedTurn[]): Map<
  * shown. The manager's own messages never split it: each is a turn's reply, timed when nest reported it,
  * which can be after a later turn has begun. Messages nest never took (`failed`, a negative seq) stay
  * last, after the stream. Only the last part is live: it carries the working line (`running` and no call
- * running); a part with nothing to show is left out. A turn whose reply has `landed` (kept while the reader
- * reads back) shows only its earlier parts: the last one's place is its reply's.
+ * running); a part with nothing to show is left out. A turn whose reply has landed (`landed`: its seq; the
+ * turn kept while the reader reads back) shows only its earlier parts: the last one's place is its reply's,
+ * and nothing after the reply splits it again.
  */
-export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: boolean; landed?: boolean }) | null, now = Date.now()): LogItem[] {
+export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: boolean; landed?: number }) | null, now = Date.now()): LogItem[] {
   if (!turn) return groupLog(messages, now);
   const local = (m: ChatMessage) => m.seq < 0 && (m.status ?? (m.error ? "failed" : "owed")) === "failed";
   const kept = messages.filter((m) => !local(m));
@@ -263,14 +264,15 @@ export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: b
   for (const m of kept) {
     // Never back before a message already placed: the messages keep their order.
     const after = steps.findIndex((s) => s.ts_ms > m.at_ms);
-    const at = m.sender === "manager" ? cut : m.seq < 0 ? steps.length : after < 0 ? steps.length : after;
+    const late = turn.landed !== undefined && (m.seq < 0 || m.seq > turn.landed);
+    const at = m.sender === "manager" || late ? cut : m.seq < 0 ? steps.length : after < 0 ? steps.length : after;
     if (at > cut) {
       part(cut, at, false);
       cut = at;
     }
     entries.push(m);
   }
-  if (!turn.landed) part(cut, steps.length, true);
+  if (turn.landed === undefined) part(cut, steps.length, true);
   return grouped([...entries, ...messages.filter(local)], now);
 }
 
