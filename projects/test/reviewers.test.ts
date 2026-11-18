@@ -105,6 +105,8 @@ describe("a review job's end in a word (await_pr)", () => {
     expect(reviewConclusion({ state: "done", verdict: { reviews: [code("pass"), { ...security, dimensions: [{ ...security.dimensions[0]!, verdict: "pass" }] }] } })).toBe("passed");
     expect(reviewConclusion({ state: "done", verdict: { reviews: [code("pass"), security] } })).toBe("failed");
     expect(reviewConclusion({ state: "failed", verdict: null })).toBe("failed without a verdict");
+    // No reviewer was enabled: done, with no verdict, and not failed.
+    expect(reviewConclusion({ state: "done", verdict: null })).toBe("no reviewer enabled");
     expect(verdictPassed({ reviews: [] })).toBe(false);
   });
 });

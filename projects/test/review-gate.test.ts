@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME } from "../src/github";
 import { MAX_HELD, MAX_OVERFLOW, reviewDecision, trustedAuthor } from "../src/review-trust";
-import { AccessTeam, api, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, repoIdOf, Signer } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, repoIdOf, Signer, submitArgs } from "./fake-nest";
 
 describe("who is trusted (pure)", () => {
   const ids = { comments_from: 11, repo_owner: 22, app_bot: 33 };
@@ -38,6 +38,7 @@ const fake = new FakeNest();
 const gh = fake.github;
 let restore: () => void;
 let token: string;
+let nest: Signer;
 
 beforeAll(async () => {
   const team = await AccessTeam.create();
@@ -45,7 +46,8 @@ beforeAll(async () => {
   restore = installFetch(fake, () => certs);
   resetAccessKeys();
   token = await team.token();
-  fake.jwks = { keys: [await (await Signer.create("k1")).jwk()] };
+  nest = await Signer.create("k1");
+  fake.jwks = { keys: [await nest.jwk()] };
 });
 afterAll(() => restore());
 
@@ -209,6 +211,32 @@ describe("the owner's approval is for one head commit", () => {
     expect((await job(p, 1, s1)).state).toBe("superseded");
     expect(reviewers(p).filter((a) => !a.ended)).toEqual([]);
     expect(reviewers(p).some((a) => a.labels.sha === s2)).toBe(false);
+  });
+
+  it("an approval covers the run with all its reviewers: nothing reaches any before it, then each reviews in turn", async () => {
+    const p = await newProject();
+    const sec = { name: "Security", instructions: "Look for injection.", dimensions: ["Injection"], enabled: true };
+    expect((await api(token, "POST", `/api/projects/${p.id}/reviewers`, sec)).status).toBe(201);
+    const s = sha();
+    await push(p, 1, s, "opened", { headRepo: "mallory/fork", user: stranger });
+    await run(p);
+    expect(reviewers(p)).toEqual([]);
+    expect(inboxes(p)).toEqual([]);
+    expect((await approve(p, 1, s)).status).toBe(200);
+    await run(p);
+    const submit = async (agent: string, args: unknown) =>
+      callTool("review", await nest.sign(agentClaims("review", agent, { project: p.id, role: "reviewer", pr: "1", sha: s, start: "1" })), "submit_review", args);
+    const first = reviewers(p).filter((a) => !a.ended);
+    expect(first).toHaveLength(1);
+    expect((await submit(first[0]!.agent, submitArgs())).result.isError).toBeFalsy();
+    await run(p);
+    const second = reviewers(p).filter((a) => !a.ended);
+    expect(second).toHaveLength(1);
+    expect(second[0]!.agent).not.toBe(first[0]!.agent);
+    expect((await submit(second[0]!.agent, { verdicts: [{ dimension: "Injection", verdict: "pass", notes: "none" }], summary: "ok" })).result.isError).toBeFalsy();
+    await run(p);
+    expect(await job(p, 1, s)).toMatchObject({ state: "done", approved_ms: expect.any(Number) });
+    expect(gh.runsOf(p.repo, s).map((c) => [c.status, c.conclusion])).toEqual([["completed", "action_required"], ["completed", "success"]]);
   });
 
   it("a commit that is no longer the open PR's head can't be approved", async () => {

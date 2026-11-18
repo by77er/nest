@@ -400,9 +400,9 @@ describe("no reviewer enabled", () => {
     expect(await job(p, 1, s)).toMatchObject({ state: "done", verdict: null, reviewers: [], reviews: [] });
     // PR upkeep reads no verdict at that head: nothing failed to tell its worker of.
     expect(await reviews(p).verdictsAt([{ pr: 1, sha: s }])).toEqual({});
-    const project = env.PROJECT.get(env.PROJECT.idFromName(p.id));
-    // What a routine's recent_activity answers.
-    const activity = await (runInDurableObject as (s: unknown, f: (o: any) => unknown) => Promise<any>)(project, (o) => o.recentActivity(7));
+    // What a routine's recent_activity answers (ProjectDO's own, read in it).
+    const inProject = runInDurableObject as unknown as (s: unknown, f: (o: { recentActivity(days: number): Promise<any> }) => Promise<any>) => Promise<any>;
+    const activity = await inProject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (o) => o.recentActivity(7));
     expect(activity.reviews).toEqual([expect.objectContaining({ pr: 1, sha: s, state: "done", verdict: null, conclusion: "no reviewer enabled" })]);
     const wait = toolOk(await callTool("board", await nest.sign(agentClaims("board", p.manager, { project: p.id, role: "manager", start: "1" })), "await_pr", { pr: 1, until: "review_done", timeout_s: 600 }));
     expect(wait).toMatchObject({ status: "met", detail: "PR #1: its review is done (no reviewer enabled)" });
