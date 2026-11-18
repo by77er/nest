@@ -6,6 +6,7 @@
 
 import { verifyAccessJwt } from "./access";
 import { handleApi } from "./api";
+import { conditional, timed } from "./conditional";
 import { withSecurityHeaders } from "./csp";
 import { directory, type Env, project, review } from "./env";
 import { githubHook } from "./github-hook";
@@ -119,7 +120,11 @@ export default {
     const who = await admitted(request, env);
     if (!who) return json({ error: "a Cloudflare Access login for this app is required" }, 403);
     if (who === "service" && !serviceMayCall(request.method, path)) return json({ error: "a service token may only read the projects and their managers" }, 403);
-    if (path.startsWith("/api/")) return handleApi(request, env, url);
+    if (path.startsWith("/api/")) {
+      // Conditional and timed (src/conditional.ts); the trace's routes are left out of the ETags.
+      const start = Date.now();
+      return timed(await conditional(request, await handleApi(request, env, url), path.startsWith("/api/agents/")), start);
+    }
     const asset = await env.ASSETS.fetch(request);
     // `vite build` replaces the flag with `false`: the deployed Worker always sends them.
     return import.meta.env.DEV ? asset : withSecurityHeaders(asset);
