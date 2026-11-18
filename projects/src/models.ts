@@ -1,10 +1,11 @@
-// The models a project's manager and its workers run on (README.md#models): the owner's choice per
-// project, applied through nest's generic client interface. A client's spawn can't override a template's
+// The models a project's agents run on (README.md#models): the owner's choice per project, for the
+// manager, the workers, the reviewers and the routine runs, applied through nest's generic client interface. A client's spawn can't override a template's
 // launch (nest refuses it: a different launch is a template in the client's namespace), so each choice is
 // a template of the app's own, named by the project, the role and the model, with `launch.model`: what
 // Claude Code gets as `--model`. Pure, so the names and the rules are tested on their own.
 
-export type ModelRole = "manager" | "worker";
+/** The roles whose model a project chooses; a routine setting covers both routine templates. */
+export type ModelRole = "manager" | "worker" | "reviewer" | "routine" | "dreaming";
 
 /** The models offered by name; any other id is the owner's own to type ("Custom"). */
 export const MODELS = [
@@ -14,8 +15,13 @@ export const MODELS = [
   { id: "claude-haiku-5-5", label: "Haiku 5.5" },
 ] as const;
 
-/** The owner's defaults (2026-11-09): the manager on Fable 5.2, workers on Opus 5.5. */
-export const DEFAULT_MODEL: Record<ModelRole, string> = { manager: "claude-fable-5-2", worker: "claude-opus-5-5" };
+/**
+ * The owner's defaults: the manager on Fable 5.2, workers on Opus 5.5 (2026-11-09); reviewers and routine
+ * runs on Opus 5.5 (2026-11-18).
+ */
+export const DEFAULT_MODEL: Record<"manager" | "worker" | "reviewer" | "routine", string> = {
+  manager: "claude-fable-5-2", worker: "claude-opus-5-5", reviewer: "claude-opus-5-5", routine: "claude-opus-5-5",
+};
 
 /**
  * A model id as Claude Code's `--model` takes one: an id or an alias (`claude-opus-5-5`, `opus`,

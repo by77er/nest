@@ -48,6 +48,9 @@ export const Settings = z.strictObject({
   // The models the manager and the workers run on (README.md#models): an id or alias Claude Code's --model takes.
   manager_model: z.string().trim().regex(MODEL_ID, "a model id: letters, digits and . _ : @ / [ ] -").optional(),
   worker_model: z.string().trim().regex(MODEL_ID, "a model id: letters, digits and . _ : @ / [ ] -").optional(),
+  // The reviewers' and the routine runs' (dreaming included).
+  reviewer_model: z.string().trim().regex(MODEL_ID, "a model id: letters, digits and . _ : @ / [ ] -").optional(),
+  routine_model: z.string().trim().regex(MODEL_ID, "a model id: letters, digits and . _ : @ / [ ] -").optional(),
 });
 export const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });

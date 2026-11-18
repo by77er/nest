@@ -5,7 +5,7 @@
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-sending" (the owner's messages still being sent), "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created), "models-custom" (a custom model id for the workers), "workflows-refused" (workers may change workflows, which the App's installation doesn't grant),
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created), "models-custom" (custom model ids for the workers and reviewers, a listed one for the routines), "workflows-refused" (workers may change workflows, which the App's installation doesn't grant),
 // "board-many" (forty more tasks in every state, long titles), "board-empty" (a project with no tasks),
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
@@ -322,9 +322,12 @@ const RICH = [
     // Whose issues come into triage (README.md#triage), and (triage-dropped) how many the cap left out.
     issues_from: variant === "issues-anyone" || variant === "triage-dropped" ? "anyone" : "trusted",
     issues_dropped: variant === "triage-dropped" ? { count: 17, last_ms: now - 25 * 60_000 } : null,
-    // The models (README.md#models): the defaults, or (models-custom) a long custom id for the workers.
+    // The models (README.md#models): the defaults, or (models-custom) a long custom id for the workers, a custom id
+    // for the reviewers and another listed model for the routines.
     manager_model: "claude-fable-5-2",
     worker_model: variant === "models-custom" ? "us.anthropic.claude-opus-5-5-20260915-v1:0[1m]" : "claude-opus-5-5",
+    reviewer_model: variant === "models-custom" ? "my-org-reviewer-v2" : "claude-opus-5-5",
+    routine_model: variant === "models-custom" ? "claude-haiku-5-5" : "claude-opus-5-5",
     ...(variant === "workflows-refused" ? { workers_edit_workflows: true } : {}),
     // A switch of the running manager waiting for its turn to end (manager-switching).
     // manager-switching-now: due now, between turns.

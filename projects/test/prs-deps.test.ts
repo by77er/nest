@@ -356,7 +356,9 @@ describe("the migration", () => {
       sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_gen");
       sql.exec("ALTER TABLE settings DROP COLUMN converge_next_ms");
       sql.exec("DROP TABLE abandoned_starts");
-      expect(step).toBe(MIGRATIONS.length - 20);
+      // And the reviewers' and routine runs' models' step (README.md#models).
+      for (const c of ["reviewer_model", "routine_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      expect(step).toBe(MIGRATIONS.length - 21);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, pr_node, am_status, created_ms, updated_ms) VALUES ('tsk_old', 't', '', 'in_review', 1, 7, 'PR_x', '{"state":"enabled"}', 1, 2)`);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, created_ms, updated_ms) VALUES ('tsk_done', 't', '', 'done', 2, 8, 1, 2)`);

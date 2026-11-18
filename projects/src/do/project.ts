@@ -65,6 +65,12 @@ export interface ProjectSettings {
   manager_model: string;
   worker_model: string;
   /**
+   * The models reviewers and routine runs (dreaming included) run on (README.md#models): a change applies to
+   * reviews and runs started after it.
+   */
+  reviewer_model: string;
+  routine_model: string;
+  /**
    * A switch of the running manager onto `manager_model` (README.md#models), while one is owed: now, or
    * (`after_turn`) once the turn it's in ends. Null when it runs on the setting's model, or there's none.
    */
@@ -672,6 +678,14 @@ export const MIGRATIONS = [
     `CREATE TABLE abandoned_starts (labels TEXT PRIMARY KEY, reason TEXT NOT NULL, passes INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, error TEXT)`,
   ],
+  [
+    // The models reviewers and routine runs run on (README.md#models); null: the default (DEFAULT_MODEL). A run's
+    // model as its first attempt froze it (null: none, frozen before it); its `template` keeps the
+    // shared name, which a previous release reads (`runTemplate`).
+    "ALTER TABLE settings ADD COLUMN reviewer_model TEXT",
+    "ALTER TABLE settings ADD COLUMN routine_model TEXT",
+    "ALTER TABLE routine_runs ADD COLUMN model TEXT",
+  ],
 ] as const;
 
 /** The roles an ask's agent may carry in its labels (as the webhook routes them); any other reads as none. */
@@ -689,6 +703,12 @@ const NEXT_MANAGER = "manager:next";
 const MID_TURN = new Set(["working", "waiting_permission", "compacting", "quota_parked", "stalled"]);
 /** While a switch waits for the manager's turn to end, it looks again this often (its `turn_completed` may be missed). */
 const SWITCH_RECHECK_MS = 60_000;
+/**
+ * A reviewer's model template is kept this long after each time it's recorded (README.md#models, `reviewerModel`):
+ * ReviewDO writes it and starts reviewers, out of ProjectDO's sight. Far longer than the write and the two requests
+ * of a start (CALL_TIMEOUT_MS each, tried at most three times).
+ */
+export const START_LEASE_MS = 10 * 60_000;
 /**
  * A manager on nest's repos is replaced only once the chat has been quiet this long (README.md#converging-onto-the-apps-own-access):
  * no message of the owner's or turn of its own in it, so its conversation is at a pause.
@@ -746,6 +766,11 @@ export class ProjectDO extends DurableObject<Env> {
   private prunedMs = 0;
   /** Whether this drain already went round again for a changed grant (`grantSeen`). */
   private reowed = false;
+  /**
+   * Each model template's delete at nest now (`sweepModelTemplates`), until its answer: a start writing that
+   * template meanwhile waits for it, so the delete can't land after the write (in memory, as the request is).
+   */
+  private readonly templateDeletes = new Map<string, Promise<unknown>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -793,6 +818,7 @@ export class ProjectDO extends DurableObject<Env> {
       attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null,
       auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod, workers_edit_workflows: r.workers_edit_workflows === 1,
       manager_model: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, worker_model: (r.worker_model as string | null) ?? DEFAULT_MODEL.worker,
+      reviewer_model: (r.reviewer_model as string | null) ?? DEFAULT_MODEL.reviewer, routine_model: (r.routine_model as string | null) ?? DEFAULT_MODEL.routine,
       manager_switch: r.switch_next_ms === null || r.switch_next_ms === undefined ? null
         : { from: (r.manager_running_model as string | null) ?? null, to: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, after_turn: r.switch_after_turn === 1 },
       manager_switch_given_up: (r.switch_gave_up_model as string | null) ?? null,
@@ -828,12 +854,12 @@ export class ProjectDO extends DurableObject<Env> {
   async updateSettings(u: {
     auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
     comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean; max_routine_runs?: number;
-    manager_model?: string; worker_model?: string; issues_from?: IssuesFrom;
+    manager_model?: string; worker_model?: string; reviewer_model?: string; routine_model?: string; issues_from?: IssuesFrom;
   }): Promise<Result<ProjectSettings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
     // The models (README.md#models): checked before anything is written; the next start of each role uses them.
-    for (const m of [u.manager_model, u.worker_model]) {
+    for (const m of [u.manager_model, u.worker_model, u.reviewer_model, u.routine_model]) {
       const bad = m === undefined ? null : modelProblem(m);
       if (bad) return fail(400, `a model is ${bad}`);
     }
@@ -891,6 +917,8 @@ export class ProjectDO extends DurableObject<Env> {
       this.oweManagerSwitch();
     }
     if (u.worker_model !== undefined) this.sql.exec("UPDATE settings SET worker_model = ?", u.worker_model);
+    if (u.reviewer_model !== undefined) this.sql.exec("UPDATE settings SET reviewer_model = ?", u.reviewer_model);
+    if (u.routine_model !== undefined) this.sql.exec("UPDATE settings SET routine_model = ?", u.routine_model);
     if (u.workers_edit_workflows !== undefined) this.sql.exec("UPDATE settings SET workers_edit_workflows = ?", u.workers_edit_workflows ? 1 : 0);
     if (u.issues_from !== undefined) this.sql.exec("UPDATE settings SET issues_from = ?", u.issues_from);
     if (u.max_routine_runs !== undefined) {
@@ -2152,8 +2180,9 @@ export class ProjectDO extends DurableObject<Env> {
       // The guards with the sandbox: they hold while it lives, before its agent is made and after it ends.
       const extras: SandboxExtras = { inject: [...inject, github.inject], env: { ...env, ...github.env }, guards: github.guards };
       // The role's model as the settings have it now (README.md#models): frozen with the attempt, so its
-      // retries name the same template, whatever the settings say by then.
-      const model = role === "manager" ? s.manager_model : role === "worker" ? s.worker_model : undefined;
+      // retries name the same template, whatever the settings say by then. A routine run freezes its own with
+      // its run (`startRun`).
+      const model = role === "manager" ? s.manager_model : role === "worker" ? s.worker_model : role === "reviewer" ? s.reviewer_model : null;
       frozen = {
         extras, names: mine.map((m) => m.name), brief: secretsBrief(mine) + githubBrief(github.kind, github.repo), rev: this.rules().rev,
         ...(model ? { model } : {}), github: { egress: github.egress, guards: github.guards }, overrides: NARROWED,
@@ -2175,20 +2204,54 @@ export class ProjectDO extends DurableObject<Env> {
       await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE[role]);
       return TEMPLATE[role];
     }
-    const s = this.settings()!;
-    const t = roleTemplate(role, s.id, spec.model);
-    // Recorded before it's written: one written and never recorded would be left in nest for good. A new
-    // `at_ms` each time, so a sweep whose delete was in flight sees the row is this start's now.
-    this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = MAX(excluded.at_ms, model_templates.at_ms + 1), del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, spec.model, Date.now());
+    return this.writeModelTemplate(nest, role, spec.model);
+  }
+
+  /**
+   * The project's own template for `role` on `model` (README.md#models), recorded and written to nest's
+   * catalog: the same body every time, so writing it again changes nothing.
+   */
+  private async writeModelTemplate(nest: Nest, role: ModelRole, model: string): Promise<string> {
+    const t = await this.recordModelTemplate(role, model);
     await nest.putCatalog("templates", t.name, t.body);
     return t.name;
+  }
+
+  /**
+   * The project's own template for `role` on `model`, recorded as about to be written (`writeModelTemplate`,
+   * or ReviewDO for a reviewer's), once no delete of it is in flight at nest.
+   */
+  private async recordModelTemplate(role: ModelRole, model: string): Promise<{ name: string; body: unknown }> {
+    const t = roleTemplate(role, this.settings()!.id, model);
+    // Recorded before it's written: one written and never recorded would be left in nest for good. A new
+    // `at_ms` each time, so a sweep whose delete was in flight sees the row is this start's now (and a
+    // reviewer's is kept for START_LEASE_MS from it).
+    this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = MAX(excluded.at_ms, model_templates.at_ms + 1), del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, model, Date.now());
+    // A delete of it already at nest is answered first, so it can't land after the write.
+    await this.templateDeletes.get(t.name);
+    return t;
+  }
+
+  /**
+   * The model a reviewer's start attempt (`key`, its spec frozen by `reviewerSpec`) froze, its template
+   * recorded first: ReviewDO writes the template (the project's own on it, `roleTemplate`) and starts the
+   * reviewer, so nest's refusal of the write reaches the job as one. Null: frozen with none (before models
+   * were chosen: the shared template).
+   */
+  async reviewerModel(key: string): Promise<string | null> {
+    const model = this.settings() ? this.frozenSpec(key)?.model : undefined;
+    if (!model) return null;
+    await this.recordModelTemplate("reviewer", model);
+    return model;
   }
 
   /**
    * Delete from nest's catalog each model template of this project's that no start uses any more
    * (README.md#models): not the role's current setting, and not the one a live agent started from (nest
    * may read an agent's template again; unverified, so it's kept while that agent lives). Nothing is
-   * swept while a start is owed (it may be about to name one). `all`: every one (the project is gone).
+   * swept while a manager's or worker's start is owed (it may be about to name one); a routine run's is
+   * kept from its first attempt until it has ended, and a reviewer's for START_LEASE_MS after each time it's recorded
+   * (ReviewDO's starts are out of sight here). `all`: every one (the project is gone).
    * A delete nest can't take now is tried again with backoff (from the alarm, not at every drain); one it
    * refuses for good is recorded among the project's errors and not tried again.
    */
@@ -2202,10 +2265,14 @@ export class ProjectDO extends DurableObject<Env> {
       if (!r) return;
       tried.add(r.name);
       let failed: { permanent: boolean; error: string } | null = null;
+      const deleting = nest.deleteCatalog("templates", r.name);
+      this.templateDeletes.set(r.name, deleting.catch(() => undefined));
       try {
-        await nest.deleteCatalog("templates", r.name);
+        await deleting;
       } catch (e) {
         failed = verdict(e);
+      } finally {
+        this.templateDeletes.delete(r.name);
       }
       // Written again by a start meanwhile (`templateFor`): the row is that start's, and so is the template.
       const cur = this.sql.exec<{ at_ms: number }>("SELECT at_ms FROM model_templates WHERE name = ?", r.name).toArray()[0];
@@ -2238,6 +2305,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (!rows.length) return [];
     const s = all ? null : this.settings();
     const keep = new Set<string>();
+    const now = Date.now();
     if (s) {
       const owed = this.settingsRow()!.manager_next_ms !== null || this.sql.exec("SELECT 1 FROM tasks WHERE state = 'assigned' LIMIT 1").toArray().length > 0;
       if (owed) return [];
@@ -2246,9 +2314,19 @@ export class ProjectDO extends DurableObject<Env> {
         if (live.has(a.agent)) keep.add(a.name);
         else this.sql.exec("DELETE FROM agent_templates WHERE agent = ?", a.agent);
       }
-      for (const r of rows) if (r.model === (r.role === "manager" ? s.manager_model : s.worker_model)) keep.add(r.name);
+      const setting: Record<string, string | null> = { manager: s.manager_model, worker: s.worker_model, reviewer: s.reviewer_model, routine: s.routine_model, dreaming: s.routine_model };
+      for (const r of rows) {
+        if (r.model === setting[r.role]) keep.add(r.name);
+        // A reviewer's start may be between the write and its request (or its agent not yet reported live):
+        // longer than a start's requests can take (CALL_TIMEOUT_MS each).
+        else if (r.role === "reviewer" && now - r.at_ms < START_LEASE_MS) keep.add(r.name);
+      }
+      // A routine run's, frozen with it before it's written: until the run has ended and its agent's stop isn't owed.
+      for (const t of this.sql.exec<{ template: string; model: string }>(
+        "SELECT DISTINCT template, model FROM routine_runs WHERE template IS NOT NULL AND model IS NOT NULL AND (state != 'ended' OR agent IN (SELECT agent FROM stops))").toArray()) {
+        keep.add(runTemplate(s.id, t.template === TEMPLATE.dreaming, t.model));
+      }
     }
-    const now = Date.now();
     const out: (OutboxRow & { name: string; at_ms: number })[] = [];
     for (const r of rows) {
       if (keep.has(r.name)) {
@@ -2326,6 +2404,8 @@ export class ProjectDO extends DurableObject<Env> {
   async reviewerStarted(agent: string, key: string): Promise<void> {
     const spec = this.frozenSpec(key);
     if (!this.settings() || !spec) return;
+    // Its template is kept while it lives (`staleTemplates`); the shared one isn't swept.
+    if (spec.model) this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, roleTemplate("reviewer", this.settings()!.id, spec.model).name);
     this.recordHolder(agent, "reviewer", spec.names);
     this.trackLayer(agent, "reviewer", spec.rev ?? 0, !!spec.github);
     await this.arm();
@@ -3990,25 +4070,33 @@ export class ProjectDO extends DurableObject<Env> {
       const deadline = now + (routine.max_minutes as number) * 60_000;
       const kind = routine.kind as RoutineKind;
       const extras = routineSpawnExtras({ kind, project: s.id, deadline_ms: deadline, last_start_ms: (routine.prev_start_ms as number | null) ?? null, now });
-      this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ?, template = ?, brief = ? WHERE id = ? AND spawn IS NULL",
-        JSON.stringify(extras), deadline, kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine, briefOf(extras), id);
+      // Its model as the settings have it now (README.md#models), beside the shared template's name (`runTemplate`).
+      this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ?, template = ?, model = ?, brief = ? WHERE id = ? AND spawn IS NULL",
+        JSON.stringify(extras), deadline, kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine, s.routine_model, briefOf(extras), id);
     }
     const frozen = this.runRow(id)!;
     const spawn = JSON.parse(frozen.spawn as string) as Record<string, unknown>;
-    const template = (frozen.template as string | null) ?? (routine.kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine);
+    const dreaming = ((frozen.template as string | null) ?? (routine.kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine)) === TEMPLATE.dreaming;
+    // Frozen before the column existed: none (the shared template).
+    const model = (frozen.model as string | null | undefined) ?? null;
+    const template = runTemplate(s.id, dreaming, model);
     try {
       let agent = (before.agent as string | null) ?? null;
       if (!agent) {
         // No secrets and no egress beyond nest's own and the repo's: a routine reads the repo and the board.
         // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
-        if (template === TEMPLATE.dreaming) {
-          agent = (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent;
+        if (dreaming) {
+          // On a model of the project's: its own template, written first.
+          if (model) await this.writeModelTemplate(nest, "dreaming", model);
+          agent = (await nest.createAgent({ ...spawn, template, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent;
         } else {
           // Its GitHub access only (README.md#repo-authority): no secrets of the owner's, no egress beyond the repo's.
           const spec = await this.sandboxSpec(nest, "routine", `${s.id}/routine/${id}`);
-          // The shared template as this release has it, naming no repo of nest's, whatever the last catalog sync wrote.
-          await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE.routine);
-          agent = await nest.startAgent(TEMPLATE.routine, labels, spawnOverrides(spec), `${s.id}/routine/${id}`, { ...startEgress([], spec), ...spec.extras }, spawn);
+          // The template as this release has it, naming no repo of nest's, whatever the last catalog sync wrote:
+          // the project's own on the run's model, or the shared one.
+          if (model) await this.writeModelTemplate(nest, "routine", model);
+          else await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE.routine);
+          agent = await nest.startAgent(template, labels, spawnOverrides(spec), `${s.id}/routine/${id}`, { ...startEgress([], spec), ...spec.extras }, spawn);
         }
         // Named on the run in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
@@ -5562,6 +5650,14 @@ const COMMENTS_SEEN_KEEP_MS = 30 * 86_400_000;
 export const REVISE_MAX = 3;
 const REVISE_WINDOW_MS = 3_600_000;
 
+/**
+ * The template a routine run starts from (README.md#models): the project's own on the model it froze, or the
+ * shared one. `routine_runs.template` keeps the shared name (a previous release starts a dreaming run by it,
+ * without hands), and `routine_runs.model` the model.
+ */
+const runTemplate = (project: string, dreaming: boolean, model: string | null): string =>
+  model ? roleTemplate(dreaming ? "dreaming" : "routine", project, model).name : dreaming ? TEMPLATE.dreaming : TEMPLATE.routine;
+
 /** A line of text that can't add lines of its own to the frame: control characters (newlines too) go. */
 const oneLine = (s: string) => s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").slice(0, 300);
 
@@ -5593,7 +5689,10 @@ export interface StartSpec {
   names: string[];
   brief: string;
   rev: number;
-  /** The model the manager or worker starts on (README.md#models). Absent: frozen before models were chosen (the role's shared template then). */
+  /**
+   * The model the manager, a worker or a reviewer starts on (README.md#models). Absent: frozen before models were
+   * chosen (the role's shared template then).
+   */
   model?: string;
   /**
    * The app's own GitHub access (README.md#the-sandboxes-github-access): the egress the API needs and the guards,

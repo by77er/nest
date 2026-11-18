@@ -6,13 +6,14 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { OUTBOX } from "../src/outbox";
 import { resetAccessKeys } from "../src/access";
-import { roleTemplate, TEMPLATE } from "../src/catalog";
+import { catalogFor, REVIEWER_GUIDANCE, roleTemplate, TEMPLATE } from "../src/catalog";
+import { START_LEASE_MS } from "../src/do/project";
 import { DEFAULT_MODEL, MODELS, modelLabel, modelProblem, modelTemplateEntry } from "../src/models";
-import { AccessTeam, api, deliver, FakeNest, installFetch } from "./fake-nest";
+import { AccessTeam, api, deliver, deliverGithub, FakeNest, installFetch, prEvent } from "./fake-nest";
 
 describe("model ids", () => {
-  it("the defaults are the owner's: the manager on Fable 5.2, workers on Opus 5.5, both among the listed ones", () => {
-    expect(DEFAULT_MODEL).toEqual({ manager: "claude-fable-5-2", worker: "claude-opus-5-5" });
+  it("the defaults are the owner's: the manager on Fable 5.2, workers, reviewers and routine runs on Opus 5.5, all among the listed ones", () => {
+    expect(DEFAULT_MODEL).toEqual({ manager: "claude-fable-5-2", worker: "claude-opus-5-5", reviewer: "claude-opus-5-5", routine: "claude-opus-5-5" });
     expect(MODELS.map((m) => m.id)).toEqual(["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
     expect(modelLabel("claude-fable-5-2")).toBe("Fable 5.2");
     expect(modelLabel("my-own")).toBe("my-own");
@@ -38,6 +39,30 @@ describe("model ids", () => {
     expect(modelTemplateEntry("worker", "prj_abc123", lookalike.replace("--", "-"))).not.toBe(hashed);
     // Another project's are its own.
     expect(modelTemplateEntry("worker", "prj_other", "opus")).not.toBe(modelTemplateEntry("worker", "prj_abc123", "opus"));
+  });
+
+  it("the reviewers', the routines' and the dreaming runs' templates are named within nest's entry names too", () => {
+    const ids = ["claude-opus-5-5", "Claude-Opus-5-5", "claude.opus.5.5", "claude-opus-5-5[1m]", "x".repeat(100), "opus"];
+    const names = ids.flatMap((m) => (["reviewer", "routine", "dreaming"] as const).map((r) => modelTemplateEntry(r, "prj_0123456789abcdef", m)));
+    for (const n of names) expect(n, n).toMatch(/^[a-z][a-z0-9-]{0,62}$/);
+    expect(new Set(names).size).toBe(names.length);
+    expect(modelTemplateEntry("dreaming", "prj_abc123", "claude-haiku-5-5")).toBe("dreaming-abc123-claude-haiku-5-5");
+  });
+
+  it("a reviewer's, routine's or dreaming run's own template is its shared template with launch.model, nothing else", () => {
+    const shared = catalogFor("https://projects.example").templates as Record<string, { launch: Record<string, unknown> }>;
+    for (const role of ["reviewer", "routine", "dreaming"] as const) {
+      const base = shared[TEMPLATE[role]]!;
+      // The shared ones name the default, as the manager's and the worker's do.
+      expect(base.launch.model, role).toBe("claude-opus-5-5");
+      const t = roleTemplate(role, "prj_abc123", "claude-haiku-5-5");
+      expect(t.name).toBe(`projects/${role}-abc123-claude-haiku-5-5`);
+      expect(t.body, role).toEqual({ ...base, launch: { ...base.launch, model: "claude-haiku-5-5" } });
+    }
+    expect(roleTemplate("reviewer", "prj_abc123", "opus").body).toMatchObject({ ephemeral: true, hands: "required", launch: { system_prompt: { text: expect.stringContaining(REVIEWER_GUIDANCE) } } });
+    expect(roleTemplate("dreaming", "prj_abc123", "opus").body).toMatchObject({
+      ephemeral: true, hands: "forbidden", launch: { builtin_tools: ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"] },
+    });
   });
 
   it("a role's template carries the model as launch.model, and never a repo of nest's", () => {
@@ -877,5 +902,166 @@ describe("a project's models", () => {
     expect(direct).toMatchObject({ ok: false, status: 400 });
     const s = (await api(token, "GET", `/api/projects/${p.id}`)).body.settings;
     expect(s).toMatchObject({ worker_model: "claude-opus-5-5", manager_model: "claude-fable-5-2" });
+  });
+
+  describe("the reviewers' and the routine runs' models", () => {
+    const settingsOf = async (p: P) => (await api(token, "GET", `/api/projects/${p.id}/settings`)).body;
+    const sha = () => [...crypto.getRandomValues(new Uint8Array(20))].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const reviewTemplate = (p: P, model: string) => `projects/${modelTemplateEntry("reviewer", p.id, model)}`;
+    const reviewersOf = (p: P) => [...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "reviewer");
+    /** A PR opened and its review's next step run (by ReviewDO's own drain). */
+    async function openPr(p: P, number: number) {
+      expect((await deliverGithub("pull_request", prEvent({ repo: p.repo, number, sha: sha(), action: "opened", updated_at: new Date().toISOString() }))).status).toBe(200);
+      return env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
+    }
+    const deletesOf = (name: string) => fake.callsTo("DELETE", new RegExp(`^/v1/catalog/templates/${name}$`)).length;
+    /** Each reviewer template's write as if made longer ago than a start can be in flight. */
+    const leaseOver = (p: P) => runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE model_templates SET at_ms = ? WHERE role = 'reviewer'", Date.now() - START_LEASE_MS - 1); });
+
+    it("read Opus 5.5 until set; PATCH sets each; null or a bad id is refused and nothing is written", async () => {
+      const p = await newProject();
+      expect(p.settings).toMatchObject({ reviewer_model: "claude-opus-5-5", routine_model: "claude-opus-5-5" });
+      expect(await settingsOf(p)).toMatchObject({ reviewer_model: "claude-opus-5-5", routine_model: "claude-opus-5-5" });
+      let r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5", routine_model: "us.anthropic.claude-haiku-5-5" });
+      expect(r.status).toBe(200);
+      expect(r.body).toMatchObject({ reviewer_model: "claude-sonnet-5-5", routine_model: "us.anthropic.claude-haiku-5-5" });
+      for (const field of ["reviewer_model", "routine_model"]) {
+        for (const bad of ["-p", "opus 5", "x".repeat(101), null]) {
+          expect((await api(token, "PATCH", `/api/projects/${p.id}/settings`, { [field]: bad, worker_model: "claude-haiku-5-5" })).status, `${field} ${bad}`).toBe(400);
+        }
+      }
+      // ProjectDO checks it itself too, whoever calls it.
+      expect(await stub(p).updateSettings({ routine_model: "--model", worker_model: "claude-haiku-5-5" })).toMatchObject({ ok: false, status: 400 });
+      expect(await settingsOf(p)).toMatchObject({ reviewer_model: "claude-sonnet-5-5", routine_model: "us.anthropic.claude-haiku-5-5", worker_model: "claude-opus-5-5" });
+      r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-opus-5-5" });
+      expect(r.body).toMatchObject({ reviewer_model: "claude-opus-5-5", routine_model: "us.anthropic.claude-haiku-5-5" });
+    });
+
+    it("a reviewer's template goes once it's neither the setting nor a live reviewer's, and its write's lease is over", async () => {
+      const p = await newProject();
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
+      await openPr(p, 1);
+      const haiku = reviewTemplate(p, "claude-haiku-5-5");
+      const [reviewer] = reviewersOf(p);
+      expect(reviewer!.template).toBe(haiku);
+      // The setting moves on: the live reviewer keeps its template, its lease over or not.
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5" });
+      await leaseOver(p);
+      await stub(p).drain();
+      expect(fake.catalog.has(`templates/${haiku}`)).toBe(true);
+      // Its reviewer gone (ReviewDO stops it, with its sandbox, and says so): deleted at the next sweep.
+      await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: reviewer!.agent, reason: "exited" });
+      await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
+      expect(fake.agents.get(reviewer!.agent)!.ended).toBe(true);
+      await stub(p).drain();
+      expect(fake.catalog.has(`templates/${haiku}`)).toBe(false);
+      expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT name FROM model_templates WHERE role = 'reviewer'").toArray())).toEqual([]);
+    });
+
+    it("a reviewer's start between its template's write and its request: the sweep leaves the template", async () => {
+      const p = await newProject();
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
+      const haiku = reviewTemplate(p, "claude-haiku-5-5");
+      let release!: () => void;
+      // ReviewDO's start held after the write, at its sandbox's create.
+      const hold = { match: /^POST \/v1\/sandboxes$/, release: new Promise<void>((r) => { release = r; }), reached: false };
+      fake.holds.push(hold);
+      const reviewing = openPr(p, 2);
+      for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(hold.reached).toBe(true);
+      expect(fake.catalog.has(`templates/${haiku}`)).toBe(true);
+      // The setting moves on, which runs a sweep: no live reviewer names it yet.
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5" });
+      await stub(p).drain();
+      expect(deletesOf(haiku)).toBe(0);
+      release();
+      await reviewing;
+      const [reviewer] = reviewersOf(p);
+      expect(reviewer!.template).toBe(haiku);
+      expect(fake.catalog.has(`templates/${haiku}`)).toBe(true);
+    });
+
+    it("a start writing a template whose delete is at nest waits for the delete's answer, so the template stays", async () => {
+      const p = await newProject();
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
+      const haiku = reviewTemplate(p, "claude-haiku-5-5");
+      const reviews = env.REVIEW.get(env.REVIEW.idFromName(p.id));
+      // The attempt is frozen on Haiku, its create failing for now.
+      fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+      await openPr(p, 4);
+      expect(reviewersOf(p)).toEqual([]);
+      // The setting moves on and the write's lease runs out: the sweep's delete goes to nest, and is held there.
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5" });
+      await leaseOver(p);
+      let release!: () => void;
+      const hold = { match: new RegExp(`^DELETE /v1/catalog/templates/${haiku}$`), release: new Promise<void>((r) => { release = r; }), reached: false };
+      fake.holds.push(hold);
+      const sweeping = stub(p).drain();
+      for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(hold.reached).toBe(true);
+      // The attempt's retry writes the template again meanwhile.
+      fake.failures = [];
+      await runInDurableObject(reviews, (_o, st) => { st.storage.sql.exec("UPDATE jobs SET next_ms = 0 WHERE next_ms IS NOT NULL"); });
+      const recorded = () => runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT at_ms FROM model_templates WHERE name = ?", haiku).one().at_ms as number);
+      const before = await recorded();
+      const reviewing = reviews.drain();
+      // Once the retry has recorded the template (its write next), the write has room to go out early; it mustn't.
+      for (let i = 0; i < 400 && (await recorded()) === before; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(await recorded()).not.toBe(before);
+      await new Promise((r) => setTimeout(r, 50));
+      release();
+      await Promise.all([sweeping, reviewing]);
+      const [reviewer] = reviewersOf(p);
+      expect(reviewer!.template).toBe(haiku);
+      expect(fake.catalog.has(`templates/${haiku}`)).toBe(true);
+      expect(deletesOf(haiku)).toBe(1);
+    });
+
+    it("a routine run's template stays from its first attempt until the run ends; then it goes", async () => {
+      const p = await newProject();
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { routine_model: "claude-haiku-5-5" });
+      const r = (await api(token, "POST", `/api/projects/${p.id}/routines`, { preset: "dreaming" })).body;
+      const dreaming = `projects/${modelTemplateEntry("dreaming", p.id, "claude-haiku-5-5")}`;
+      // Its create fails for now: the run is starting, frozen on Haiku.
+      fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+      await api(token, "POST", `/api/projects/${p.id}/routines/${r.id}/run`);
+      expect(fake.catalog.has(`templates/${dreaming}`)).toBe(true);
+      // Frozen as the shared template's name and the model: the release before reads it as a dreaming run still.
+      expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT template, model FROM routine_runs").one()))
+        .toEqual({ template: "projects/dreaming", model: "claude-haiku-5-5" });
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { routine_model: "claude-sonnet-5-5" });
+      await stub(p).drain();
+      expect(deletesOf(dreaming)).toBe(0);
+      fake.failures = [];
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'"); });
+      await stub(p).drain();
+      const run = (await api(token, "GET", `/api/projects/${p.id}/routines/${r.id}/runs`)).body[0];
+      expect(run.state).toBe("running");
+      expect(fake.agents.get(run.agent)!.template).toBe(dreaming);
+      expect(fake.agents.get(run.agent)!.sandbox).toBeFalsy();
+      await stub(p).drain();
+      expect(fake.catalog.has(`templates/${dreaming}`)).toBe(true);
+      // The run ends (its agent ends itself): its template goes.
+      await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: run.agent, turn: 1, text: "Done." });
+      await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: run.agent, reason: "done", text: "" });
+      await stub(p).drain();
+      expect(fake.catalog.has(`templates/${dreaming}`)).toBe(false);
+    });
+
+    it("a project that's gone takes its reviewers' and routines' templates with it", async () => {
+      const p = await newProject();
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5", routine_model: "claude-sonnet-5-5" });
+      await openPr(p, 3);
+      const r = (await api(token, "POST", `/api/projects/${p.id}/routines`, { preset: "dreaming" })).body;
+      await api(token, "POST", `/api/projects/${p.id}/routines/${r.id}/run`);
+      const mine = () => [...fake.catalog.keys()].filter((k) => k.includes(`-${p.id.replace("prj_", "")}-`));
+      expect(mine().sort()).toEqual([
+        `templates/${reviewTemplate(p, "claude-haiku-5-5")}`, `templates/projects/${modelTemplateEntry("dreaming", p.id, "claude-sonnet-5-5")}`, `templates/${entry(p, "manager", "claude-fable-5-2")}`,
+      ].sort());
+      await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => { st.storage.sql.exec("DELETE FROM projects WHERE id = ?", p.id); });
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET listed_ms = NULL"); });
+      await alarm(p);
+      expect(mine()).toEqual([]);
+    });
   });
 });

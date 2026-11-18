@@ -246,7 +246,7 @@ describe("the models in the settings", () => {
     expect(dialog).not.toHaveTextContent("cut and redone");
     expect(dialog.querySelector("[data-slot=manager-switch]")).toBeNull();
     expect(dialog).toHaveTextContent("workers started from now on; running ones keep theirs");
-    expect(dialog).toHaveTextContent("Reviewers and routine runs keep nest's default model.");
+    expect(dialog).not.toHaveTextContent("Reviewers and routine runs keep nest's default model.");
     await user.click(select(dialog, "Workers' model"));
     await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
     await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
@@ -279,5 +279,90 @@ describe("the models in the settings", () => {
     expect(select(dialog, "Workers' model")).toHaveValue("Custom…");
     expect(within(dialog).getByLabelText("Workers' model: model id")).toHaveValue("my-org-model-v2");
     expect(within(dialog).queryByLabelText("Manager's model: model id")).toBeNull();
+  });
+
+  it("the reviewers' and the routines' start on Opus 5.5, and offer what the manager's and the workers' do", async () => {
+    const api = new FakeApi();
+    const { user, dialog } = await openSettings(api);
+    expect(select(dialog, "Reviewers' model")).toHaveValue("Opus 5.5");
+    expect(select(dialog, "Routines' model")).toHaveValue("Opus 5.5");
+    expect(dialog).toHaveTextContent("A change applies to reviews started from now on; running ones keep theirs.");
+    expect(dialog).toHaveTextContent("For every routine run, including dreaming runs. A change applies to runs started from now on.");
+    expect(dialog).not.toHaveTextContent("Claude Code's default");
+    for (const label of ["Manager's model", "Workers' model", "Reviewers' model", "Routines' model"]) {
+      await user.click(select(dialog, label));
+      const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
+      expect(options, label).toEqual(["Fable 5.2", "Opus 5.5", "Sonnet 5.5", "Haiku 5.5", "Custom…"]);
+      await user.keyboard("{Escape}");
+    }
+    // Untouched, neither is sent.
+    await user.click(select(dialog, "Workers' model"));
+    await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    expect(api.writes[0]!.body).toMatchObject({ worker_model: "claude-sonnet-5-5" });
+    expect(api.writes[0]!.body).not.toHaveProperty("reviewer_model");
+    expect(api.writes[0]!.body).not.toHaveProperty("routine_model");
+  });
+
+  it("sends a listed model, a custom id, and Opus 5.5 again", async () => {
+    const api = new FakeApi();
+    const { user, dialog } = await openSettings(api);
+    const save = async (n: number) => {
+      await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+      await waitFor(() => expect(api.writes).toHaveLength(n));
+      return api.writes[n - 1]!.body;
+    };
+    await user.click(select(dialog, "Reviewers' model"));
+    await user.click(await screen.findByRole("option", { name: "Haiku 5.5" }));
+    const first = await save(1);
+    expect(first).toMatchObject({ reviewer_model: "claude-haiku-5-5" });
+    expect(first).not.toHaveProperty("routine_model");
+    // Custom starts from the id it had, and a bad id isn't saved.
+    await user.click(select(dialog, "Routines' model"));
+    await user.click(await screen.findByRole("option", { name: "Custom…" }));
+    const id = within(dialog).getByLabelText("Routines' model: model id");
+    expect(id).toHaveValue("claude-opus-5-5");
+    await user.clear(id);
+    await user.type(id, "--bad");
+    expect(dialog).toHaveTextContent("A model id is letters, digits");
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    expect(api.writes).toHaveLength(1);
+    await user.clear(id);
+    await user.type(id, "my-org-model-v2");
+    expect(await save(2)).toMatchObject({ reviewer_model: "claude-haiku-5-5", routine_model: "my-org-model-v2" });
+    await user.click(select(dialog, "Reviewers' model"));
+    await user.click(await screen.findByRole("option", { name: "Opus 5.5" }));
+    await user.click(select(dialog, "Routines' model"));
+    await user.click(await screen.findByRole("option", { name: "Opus 5.5" }));
+    expect(within(dialog).queryByLabelText("Routines' model: model id")).toBeNull();
+    expect(await save(3)).toMatchObject({ reviewer_model: "claude-opus-5-5", routine_model: "claude-opus-5-5" });
+  });
+
+  it("a reviewers' or routines' model the server leaves out reads as Opus 5.5, and isn't sent unless changed", async () => {
+    const api = new FakeApi();
+    const settings = api.projects[0]!.settings as Partial<typeof api.projects[0]["settings"]>;
+    delete settings.reviewer_model;
+    delete settings.routine_model;
+    const { user, dialog } = await openSettings(api);
+    expect(select(dialog, "Reviewers' model")).toHaveValue("Opus 5.5");
+    expect(select(dialog, "Routines' model")).toHaveValue("Opus 5.5");
+    await user.click(select(dialog, "Workers' model"));
+    await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    expect(api.writes[0]!.body).toMatchObject({ worker_model: "claude-sonnet-5-5" });
+    expect(api.writes[0]!.body).not.toHaveProperty("reviewer_model");
+    expect(api.writes[0]!.body).not.toHaveProperty("routine_model");
+  });
+
+  it("an unlisted reviewers' or routines' model shows as Custom with its id", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings.routine_model = "us.anthropic.claude-haiku-5-5";
+    api.projects[0]!.settings.reviewer_model = "claude-sonnet-5-5";
+    const { dialog } = await openSettings(api);
+    expect(select(dialog, "Reviewers' model")).toHaveValue("Sonnet 5.5");
+    expect(select(dialog, "Routines' model")).toHaveValue("Custom…");
+    expect(within(dialog).getByLabelText("Routines' model: model id")).toHaveValue("us.anthropic.claude-haiku-5-5");
   });
 });

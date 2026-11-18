@@ -8,6 +8,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import pushFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.app_github_push.json";
 import readFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.app_github_read.json";
 import { resetAccessKeys } from "../src/access";
+import { roleTemplate } from "../src/catalog";
+import { DEFAULT_MODEL } from "../src/models";
 import { DirectoryDO } from "../src/do/directory";
 import { AppTokens } from "../src/github-app";
 import {
@@ -340,11 +342,13 @@ describe("the sandbox of each role", () => {
     expect(create!.body.guards).toEqual(githubGuards(p.repo, "read"));
   });
 
-  it("a shared template not synced since the deploy, still naming every repo, is written again before a start from it: it names no repo of nest's, whatever the spawn narrows", async () => {
+  it("a template not written since the deploy, still naming every repo, is written again before a start from it: it names no repo of nest's, whatever the spawn narrows", async () => {
     const p = await newProject();
-    const names = ["templates/projects/reviewer", "templates/projects/routine"];
-    const synced = names.map((n) => fake.catalog.get(n));
-    // As the catalog sync of a release before B3 wrote them.
+    // The project's own on the default model (README.md#models), as this release has them.
+    const own = (["reviewer", "routine"] as const).map((r) => roleTemplate(r, p.id, DEFAULT_MODEL[r]));
+    const names = own.map((t) => `templates/${t.name}`);
+    const synced = own.map((t) => t.body);
+    // As a release before B3 would have written them.
     names.forEach((n, i) => fake.catalog.set(n, { ...(synced[i] as object), read_repos: ["someone/else", p.repo] }));
     try {
       await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 5, sha: sha(), action: "opened" }));

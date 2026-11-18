@@ -17,7 +17,7 @@ import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
-import { MODELS, modelLabel, modelProblem } from "../../../models";
+import { DEFAULT_MODEL, MODELS, modelLabel, modelProblem } from "../../../models";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { type RefObject, useEffect, useRef, useState } from "react";
 
@@ -38,8 +38,9 @@ export function ModelField({ label, description, value, onChange, error }: { lab
   const listed = MODELS.some((m) => m.id === value);
   const [custom, setCustom] = useState(!listed);
   const problem = custom ? modelProblem(value) : null;
+  // The id field close under its own dropdown (proximity), the fields apart at the group's gap.
   return (
-    <FieldGroup>
+    <Stack gap="sm">
       <Select
         label={label}
         description={description}
@@ -65,7 +66,7 @@ export function ModelField({ label, description, value, onChange, error }: { lab
           error={value && problem ? `A model id is ${problem}` : error}
         />
       )}
-    </FieldGroup>
+    </Stack>
   );
 }
 
@@ -73,7 +74,9 @@ const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", 
 
 const values = (s: Settings) => ({
   auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows,
-  manager_model: s.manager_model, worker_model: s.worker_model, issues_from: s.issues_from,
+  manager_model: s.manager_model, worker_model: s.worker_model,
+  // One a server leaves out (a release before them) reads as the default, as the server's own unset one does.
+  reviewer_model: s.reviewer_model ?? DEFAULT_MODEL.reviewer, routine_model: s.routine_model ?? DEFAULT_MODEL.routine, issues_from: s.issues_from,
   comments_from_login: s.comments_from?.login ?? null,
   // "Use the repo owner": the server takes the repo's owner by id, never this login.
   comments_from_repo_owner: false,
@@ -121,10 +124,13 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
 
   return (
     <form
-      onSubmit={form.onSubmit(({ comments_from_login, comments_from_repo_owner, ...v }) =>
+      onSubmit={form.onSubmit(({ comments_from_login, comments_from_repo_owner, reviewer_model, routine_model, ...v }) =>
         // Whose comments count is sent only when changed: an id with no login known shows as an empty field.
+        // So are the reviewers' and routines' models: a server that leaves them out (a release before them) takes none.
         update.mutate({
           ...v,
+          ...(form.isDirty("reviewer_model") ? { reviewer_model } : {}),
+          ...(form.isDirty("routine_model") ? { routine_model } : {}),
           ...(hold !== held ? { untrusted_reviews: hold ? ("hold" as const) : ("review" as const) } : {}),
           ...(comments_from_repo_owner ? { comments_from_repo_owner: true as const }
             : form.isDirty("comments_from_login") ? { comments_from_login: comments_from_login?.trim() || null } : {}),
@@ -185,9 +191,20 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                   onChange={(v) => form.setFieldValue("worker_model", v)}
                   error={form.errors.worker_model}
                 />
-                <Text fz="sm" c="dimmed">
-                  Reviewers and routine runs keep nest&apos;s default model.
-                </Text>
+                <ModelField
+                  label="Reviewers' model"
+                  description="A change applies to reviews started from now on; running ones keep theirs."
+                  value={form.getValues().reviewer_model}
+                  onChange={(v) => form.setFieldValue("reviewer_model", v)}
+                  error={form.errors.reviewer_model}
+                />
+                <ModelField
+                  label="Routines' model"
+                  description="For every routine run, including dreaming runs. A change applies to runs started from now on."
+                  value={form.getValues().routine_model}
+                  onChange={(v) => form.setFieldValue("routine_model", v)}
+                  error={form.errors.routine_model}
+                />
               </FieldGroup>
             </Section>
           </Panel>

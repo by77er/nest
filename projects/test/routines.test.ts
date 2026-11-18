@@ -10,6 +10,7 @@ import { migrate } from "../src/sql";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MAX_START_ATTEMPTS } from "../src/routines";
+import { roleTemplate } from "../src/catalog";
 import { DREAM_MAX_ENTRIES, FIRST_DREAM_WINDOW_MS, firedTrigger, MAX_DREAM_WINDOW_MS, MAX_PROPOSALS_PER_RUN, nextTimerFire, PRESETS, routineSpawnExtras, startVerdict, type Triggers, wallToUtc } from "../src/routines";
 import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, prEvent, shaOf, Signer } from "./fake-nest";
 
@@ -180,7 +181,8 @@ describe("firing", () => {
     const run = await liveRun(s, id);
     expect(run).toMatchObject({ state: "running", trigger: "timer", n: 1 });
     const a = fake.agents.get(run.agent)!;
-    expect(a.template).toBe("projects/routine");
+    // The project's own on the default model (README.md#models).
+    expect(a.template).toBe(roleTemplate("routine", s.id, "claude-opus-5-5").name);
     // A sandbox of its own, to read the repo.
     expect(a.sandbox).toMatch(/^sbx_/);
     expect(a.labels).toEqual({ project: s.id, role: "routine", routine: id, run: run.id });
@@ -456,8 +458,10 @@ describe("cost guards", () => {
       for (const c of ["gh_unreachable", "gh_repo_id", "gh_repo_gen", "converge_next_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
+      for (const c of ["reviewer_model", "routine_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      sql.exec("ALTER TABLE routine_runs DROP COLUMN model");
       sql.exec("DELETE FROM start_specs");
-      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 2);
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 3);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT nest_repos FROM routine_runs WHERE id = ?", r0.id).one().nest_repos).toBe(1);
       sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'");
@@ -706,8 +710,8 @@ describe("the transcript grant at a dreaming run's spawn", () => {
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id);
     expect(creates).toHaveLength(2);
     expect(creates[1]!.body).toEqual(creates[0]!.body);
-    // No hands: the dreaming template, and no sandbox made or named.
-    expect(creates[0]!.body.template).toBe("projects/dreaming");
+    // No hands: the dreaming template (the project's own on the default model), and no sandbox made or named.
+    expect(creates[0]!.body.template).toBe(roleTemplate("dreaming", s.id, "claude-opus-5-5").name);
     expect(creates[0]!.body.sandbox).toBeUndefined();
     expect(fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.run === run.id)).toEqual([]);
     expect(creates[0]!.body.grants).toEqual([{
@@ -734,12 +738,121 @@ describe("a start's requests are frozen at its first attempt", () => {
     const run = await liveRun(s, r.id);
     expect(run.state).toBe("running");
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id);
-    expect(creates.map((c) => c.body.template)).toEqual(["projects/dreaming", "projects/dreaming"]);
+    expect(creates.map((c) => c.body.template)).toEqual(Array(2).fill(roleTemplate("dreaming", s.id, "claude-opus-5-5").name));
     expect(creates[1]!.body).toEqual(creates[0]!.body);
     expect(fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.run === run.id)).toEqual([]);
     const brief = fake.inbox.find((m) => m.agent === run.agent)!.text;
     expect(brief).toContain("Consolidate the project's memory");
     expect(brief).not.toContain("Something else.");
+  });
+});
+
+describe("the routine runs' model (README.md#models)", () => {
+  const agentsCreated = (run: string) => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run);
+  const sandboxesCreated = (run: string) => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.run === run);
+
+  it("by default: a routine run and a dreaming run start on Opus 5.5, from the project's own templates", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { max_routine_runs: 2 });
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const run = await liveRun(s, id);
+    const rt = roleTemplate("routine", s.id, "claude-opus-5-5");
+    expect(fake.agents.get(run.agent)!.template).toBe(rt.name);
+    expect(fake.catalog.get(`templates/${rt.name}`)).toMatchObject({ launch: { model: "claude-opus-5-5" } });
+    const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
+    const dream = await liveRun(s, d.id);
+    expect(fake.agents.get(dream.agent)!.template).toBe(roleTemplate("dreaming", s.id, "claude-opus-5-5").name);
+  });
+
+  it("set: each run starts from the project's own template on it, a routine's with its sandbox, a dreaming run's with none", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5", max_routine_runs: 2 });
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const run = await liveRun(s, id);
+    const rt = roleTemplate("routine", s.id, "claude-haiku-5-5");
+    const a = fake.agents.get(run.agent)!;
+    expect(a.template).toBe(rt.name);
+    expect(a.sandbox).toMatch(/^sbx_/);
+    expect(fake.sandboxes.get(a.sandbox!)!.layer.guards).toEqual(githubGuards(s.repo, "read"));
+    expect(fake.catalog.get(`templates/${rt.name}`)).toEqual(rt.body);
+    const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
+    const dream = await liveRun(s, d.id);
+    expect(dream.state).toBe("running");
+    const dt = roleTemplate("dreaming", s.id, "claude-haiku-5-5");
+    expect(fake.agents.get(dream.agent)!.template).toBe(dt.name);
+    expect(fake.catalog.get(`templates/${dt.name}`)).toEqual(dt.body);
+    expect(dt.body).toMatchObject({ hands: "forbidden", ephemeral: true });
+    // Still no hands: no sandbox made or named.
+    expect(agentsCreated(dream.id)[0]!.body.sandbox).toBeUndefined();
+    expect(sandboxesCreated(dream.id)).toEqual([]);
+  });
+
+  it("a run frozen before the setting changed retries on its template, under the same key; a running one isn't switched", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5", max_routine_runs: 2 });
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const running = await liveRun(s, id);
+    const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
+    const first = (await runs(s, d.id))[0];
+    expect(first.state).toBe("starting");
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-sonnet-5-5" });
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE id = ?", first.id);
+    });
+    await settle(s);
+    const dream = await liveRun(s, d.id);
+    expect(dream.state).toBe("running");
+    const creates = agentsCreated(dream.id);
+    expect(creates.map((c) => c.body.template)).toEqual([roleTemplate("dreaming", s.id, "claude-haiku-5-5").name, roleTemplate("dreaming", s.id, "claude-haiku-5-5").name]);
+    expect(creates[1]!.idempotencyKey).toBe(creates[0]!.idempotencyKey);
+    expect(creates[1]!.body).toEqual(creates[0]!.body);
+    // The routine run started before the change runs on, on its own.
+    expect(fake.agents.get(running.agent)!.ended).toBe(false);
+    expect(stopsOf(running.agent)).toEqual([]);
+    expect(fake.agents.get(running.agent)!.template).toBe(roleTemplate("routine", s.id, "claude-haiku-5-5").name);
+  });
+
+  it("a run frozen before runs had a model (none in its row) starts from the shared template, written first; a dreaming run's still without hands", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5", max_routine_runs: 2 });
+    const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
+    const first = (await runs(s, d.id))[0];
+    expect(first.state).toBe("starting");
+    fake.failures = [];
+    // As the migration leaves a row frozen before the column: no model.
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET model = NULL, next_ms = 0 WHERE id = ?", first.id);
+    });
+    await settle(s);
+    const dream = await liveRun(s, d.id);
+    expect(dream.state).toBe("running");
+    expect(fake.agents.get(dream.agent)!.template).toBe("projects/dreaming");
+    expect(sandboxesCreated(dream.id)).toEqual([]);
+    // A routine run's: the shared template, written as this release has it whatever the catalog held.
+    const id = await create(s);
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const r0 = (await runs(s, id))[0];
+    expect(r0.state).toBe("starting");
+    fake.failures = [];
+    const shared = fake.catalog.get("templates/projects/routine") as Record<string, unknown>;
+    fake.catalog.set("templates/projects/routine", { ...shared, read_repos: ["someone/else"] });
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET model = NULL, next_ms = 0 WHERE id = ?", r0.id);
+    });
+    await settle(s);
+    const run = await liveRun(s, id);
+    expect(fake.agents.get(run.agent)!.template).toBe("projects/routine");
+    expect(fake.catalog.get("templates/projects/routine")).toEqual(shared);
   });
 });
 
