@@ -12,11 +12,11 @@ import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSID
 import { prNumberOf } from "./prs";
 import { attachableRepos, repoAttachable } from "./installations";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, problems, PutSecret, Settings as SettingsBody, Spec, UpdateRoutine, UpdateTask } from "./requests";
+import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateReviewer, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, problems, PutSecret, Settings as SettingsBody, Spec, UpdateReviewer, UpdateRoutine, UpdateTask } from "./requests";
 import type { RepoBinding } from "./do/directory";
 import type { ProjectSettings, Settings } from "./do/project";
 import { githubFor, PERMISSIONS } from "./github";
-import { legacyView } from "./reviewers";
+import { legacyView, REVIEWER_PRESETS } from "./reviewers";
 import { PRESETS } from "./routines";
 import type { UntrustedPolicy } from "./review-trust";
 import type { Result } from "./sql";
@@ -251,6 +251,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   const route = rest[0] === "secrets" && rest.length === 2 ? `${m} secrets/:name`
     : rest[0] === "secret-requests" && rest.length === 3 ? `${m} secret-requests/:id/${rest[2]}`
     : rest[0] === "memory" && rest.length === 2 ? `${m} memory/:key`
+    : rest[0] === "reviewers" && rest.length === 2 ? `${m} reviewers/:reviewer`
     : rest[0] === "reviews" && rest.length === 4 && /^[1-9][0-9]{0,9}$/.test(rest[1]!) && /^[0-9a-f]{40}$/.test(rest[2]!) ? `${m} reviews/:pr/:sha/${rest[3]}`
     : rest[0] === "stops" && (rest.length === 2 || rest.length === 3) && /^agt_[A-Za-z0-9]{1,64}$/.test(rest[1]!) ? `${m} ${["stops", ":agent", ...rest.slice(2)].join("/")}`
     : `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : ID.routine.test(s) ? ":routine" : ID.run.test(s) ? ":run" : ID.proposal.test(s) ? ":proposal" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
@@ -428,6 +429,26 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       return done(await review(env, pid).approve(Number(rest[1]), rest[2]!));
     case "POST reviews/:pr/:sha/dismiss":
       return done(await review(env, pid).dismiss(Number(rest[1]), rest[2]!));
+    // The project's reviewers (README.md#reviewers), ReviewDO's: the owner's writes, untainted.
+    case "GET reviewers":
+      return json(await review(env, pid).reviewers());
+    case "POST reviewers": {
+      const b = await body(req, CreateReviewer);
+      if (!b.ok) return b.res;
+      if ("preset" in b.value) {
+        const preset = REVIEWER_PRESETS[b.value.preset];
+        return done(await review(env, pid).createReviewer({ ...preset, dimensions: [...preset.dimensions], enabled: true }, { preset }), 201);
+      }
+      return done(await review(env, pid).createReviewer(b.value), 201);
+    }
+    case "GET reviewers/:reviewer":
+      return done(await review(env, pid).getReviewer(rest[1]!));
+    case "PATCH reviewers/:reviewer": {
+      const b = await body(req, UpdateReviewer);
+      return b.ok ? done(await review(env, pid).updateReviewer(rest[1]!, b.value)) : b.res;
+    }
+    case "DELETE reviewers/:reviewer":
+      return done(await review(env, pid).deleteReviewer(rest[1]!));
     case "GET tasks":
       return done(await p.listTasks());
     case "POST tasks": {

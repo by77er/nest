@@ -83,12 +83,13 @@ export interface Job {
   fork: boolean;
   /** When the owner approved this head commit's review; null for one that needed no approval, or has none. */
   approved_ms: number | null;
+  // Always in this release's answers; optional for the page's types, whose fixtures predate them.
   /** The reviewers it runs, frozen when it started (README.md#running-the-reviewers); null before it starts. None: no reviewer was enabled. */
-  reviewers: FrozenReviewer[] | null;
+  reviewers?: FrozenReviewer[] | null;
   /** Which of them is at work (0-based), while running. */
-  step: number;
+  step?: number;
   /** The reviews given so far, in order: all of them once done; those given before it failed. */
-  reviews: Review[];
+  reviews?: Review[];
   created_ms: number;
   updated_ms: number;
 }
