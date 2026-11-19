@@ -69,6 +69,25 @@
    the glyph column and word wrapping take (`--nest-log-cols`, ScrollLog's), and its gaps. The last turn
    (the one growing, which the log follows) is always drawn. Its paint may reach a little past its box, as
    a focus ring at its edge does. */
+/* The estimate's inputs are the turn's own (not inherited): a turn growing restyles none of its lines. */
+@property --nest-turn-rows {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
+@property --nest-turn-chars {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
+@property --nest-turn-gaps {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
 .turn {
   content-visibility: auto;
   contain-intrinsic-block-size: auto calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 20px + var(--nest-turn-gaps) * var(--mantine-spacing-md));

@@ -24,6 +24,12 @@ import { useTrace } from "./useTrace";
 /** Within this many px of the bottom counts as at the bottom (a fraction of a line); of the top, as asking for more. */
 const NEAR_BOTTOM = 24;
 const NEAR_TOP = 80;
+/**
+ * For this many frames after new lines arrive while following, the log's content growing is theirs being
+ * drawn: a line fading in takes its height when it shows (a frame or two on), and a turn's estimated height
+ * (TermTurn) becomes its own when the browser first draws it. Its own commit, its fade-in's, then a margin.
+ */
+const SETTLE_FRAMES = 4;
 
 const STATUS: Record<TraceStatus, { label: string; color: "success" | "gray" | "warning" }> = {
   live: { label: "Live", color: "success" },
@@ -269,6 +275,9 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
+  // Following: new lines arrived and are still being drawn (SETTLE_FRAMES); jumping: "Jump to live" is on its way down.
+  const settling = useRef(0);
+  const jumping = useRef(false);
   const [unseen, setUnseen] = useState(0);
   const seen = useRef(state.last);
   const heightBefore = useRef<number | null>(null);
@@ -300,10 +309,27 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       }
     });
     seen.observe(v);
+    // The log's content resized. While what just arrived is drawn, the log stays at the bottom it follows; a
+    // jump goes on to the bottom as it is now (turns it passes are drawn on the way, at their own heights).
+    // Anything else (a result expanded, a page loaded above) leaves the reader where they are, as before.
+    const grown = new ResizeObserver(() => {
+      if (v.clientHeight === 0 || hidden) return;
+      if (jumping.current) v.scrollTo({ top: v.scrollHeight, behavior: "smooth" });
+      else if (settling.current > 0 && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
+    });
+    if (v.firstElementChild) grown.observe(v.firstElementChild);
+    // The reader taking the scroll back ends a jump.
+    const root = v.parentElement ?? v;
+    const takeBack = () => {
+      jumping.current = false;
+    };
+    const taking = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+    for (const t of taking) root.addEventListener(t, takeBack, { passive: true });
     const onScroll = () => {
       if (v.clientHeight === 0 || hidden) return;
       lastTop = v.scrollTop;
       const near = v.scrollHeight - v.scrollTop - v.clientHeight <= NEAR_BOTTOM;
+      if (near) jumping.current = false;
       atBottomRef.current = near;
       setAtBottom(near);
       if (near) setUnseen(0);
@@ -313,7 +339,10 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     v.addEventListener("scroll", onScroll, { passive: true });
     return () => {
       v.removeEventListener("scroll", onScroll);
+      for (const t of taking) root.removeEventListener(t, takeBack);
       seen.disconnect();
+      grown.disconnect();
+      settling.current = 0;
     };
   }, []);
 
@@ -336,13 +365,24 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     seen.current = state.last;
     if (!added) return;
     const v = viewport.current;
-    if (atBottomRef.current) v?.scrollTo({ top: v.scrollHeight });
-    else setUnseen((n) => n + added);
+    if (atBottomRef.current) {
+      v?.scrollTo({ top: v.scrollHeight });
+      // Held at the bottom while it's drawn (the ResizeObserver above), for SETTLE_FRAMES frames from the last arrival.
+      const mine = ++settling.current;
+      let frames = 0;
+      const tick = () => {
+        if (settling.current !== mine) return; // newer lines took over, or unmounted
+        if (++frames < SETTLE_FRAMES) requestAnimationFrame(tick);
+        else settling.current = 0;
+      };
+      requestAnimationFrame(tick);
+    } else setUnseen((n) => n + added);
   }, [state.events, state.last]);
 
   const jump = () => {
     const v = viewport.current;
     v?.scrollTo({ top: v.scrollHeight, behavior: "smooth" });
+    jumping.current = true;
     atBottomRef.current = true;
     setAtBottom(true);
     setUnseen(0);
