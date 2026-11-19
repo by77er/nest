@@ -7,7 +7,7 @@
 // error (2), never on slow numbers.
 //
 //   node scripts/ui-review/perf.mjs <out-dir> (--dist DIR | --base-url URL) [--shape summary|full] [--cpu 4]
-//        [--rate 20] [--idle 15] [--api-ms 40] [--only a,b] [--label NAME] [--commit SHA] [--compare other.json]
+//        [--rate 20] [--idle 15] [--api-ms 40] [--assets worker|workers-assets] [--only a,b] [--label NAME] [--commit SHA] [--compare other.json]
 //   node scripts/ui-review/perf.mjs --compare before.json after.json
 
 import { createServer } from "node:http";
@@ -38,7 +38,7 @@ const { values: opt, positionals } = parseArgs({
     rate: { type: "string", default: "20" },
     idle: { type: "string", default: "15" },
     "api-ms": { type: "string", default: "40" },
-    "asset-cache-control": { type: "string", default: "public, max-age=0, must-revalidate" },
+    assets: { type: "string", default: "worker" },
     only: { type: "string" },
     label: { type: "string" },
     commit: { type: "string" },
@@ -47,8 +47,11 @@ const { values: opt, positionals } = parseArgs({
     help: { type: "boolean", short: "h" },
   },
 });
-const USAGE = "usage: perf.mjs <out-dir> (--dist DIR | --base-url URL) [--shape summary|full] [--cpu 4] [--rate 20] [--idle 15] [--api-ms 40] [--only a,b] [--label NAME] [--commit SHA] [--compare other.json]\n       perf.mjs --compare before.json after.json";
-if (opt.help) die(USAGE);
+const USAGE = "usage: perf.mjs <out-dir> (--dist DIR | --base-url URL) [--shape summary|full] [--cpu 4] [--rate 20] [--idle 15] [--api-ms 40] [--assets worker|workers-assets] [--only a,b] [--label NAME] [--commit SHA] [--compare other.json]\n       perf.mjs --compare before.json after.json";
+if (opt.help) {
+  console.log(USAGE);
+  process.exit(0);
+}
 
 // --- results: the headline numbers, Markdown tables, and before/after ------------------------------------
 
@@ -106,7 +109,7 @@ function markdown(report) {
   return [
     `# projects perf: ${report.label}`,
     "",
-    `Commit ${report.commit ?? "?"} · CPU ${report.cpu}× · API shape \`${report.shape}\` · API latency ${report.apiMs} ms · trace stream ${report.rate} events/s · idle window ${report.idleSeconds} s · ${report.at}`,
+    `Commit ${report.commit ?? "?"} · CPU ${report.cpu}× · API shape \`${report.shape}\` · API latency ${report.apiMs} ms · assets cached as \`${report.assets ?? "?"}\` · trace stream ${report.rate} events/s · idle window ${report.idleSeconds} s · ${report.at}`,
     "",
     head,
     ...body,
@@ -140,6 +143,8 @@ function compare(before, after) {
       return `${f(x)} → ${f(y)}${d === null ? "" : ` (${d > 0 ? "+" : ""}${d}%)`}`;
     }).join(" | ")} |`);
   }
+  const seen = new Set(rows(after).map((r) => r.id));
+  for (const r of rows(before)) if (!seen.has(r.id)) lines.push(`| ${r.id} | only before |`);
   return lines.join("\n") + "\n";
 }
 
@@ -155,6 +160,7 @@ const out = resolve(positionals[0]);
 if (out === REPO || out.startsWith(REPO + "/")) die(`write the output outside the repo, not ${out}`);
 if (!opt.dist === !opt["base-url"]) die("give one of --dist (a built client, served here) or --base-url (a server of it)");
 if (!["summary", "full"].includes(opt.shape)) die("--shape is summary (main since #308) or full (before it)");
+if (!["worker", "workers-assets"].includes(opt.assets)) die("--assets is worker (asset-cache.ts, main since #318) or workers-assets (before it)");
 const CPU = Number(opt.cpu);
 const RATE = Number(opt.rate);
 const IDLE = Number(opt.idle);
@@ -162,10 +168,17 @@ const API_MS = Number(opt["api-ms"]);
 if (!(CPU >= 1) || !(RATE > 0) || !(IDLE >= 1) || !(API_MS >= 0)) die("--cpu, --rate, --idle and --api-ms are numbers (cpu at least 1)");
 mkdirSync(out, { recursive: true });
 
-// --- the built client, served as Cloudflare's static assets serve it -------------------------------------
-// A path that isn't a file gets index.html (single-page-application); every answer has an ETag and
-// Cloudflare's default `Cache-Control: public, max-age=0, must-revalidate` (so a warm load revalidates,
-// 304), `--asset-cache-control` for /assets/*; text is compressed (br, else gzip) as Cloudflare does.
+// --- the built client, served as the app's Worker serves it ------------------------------------------------
+// A path that isn't a file gets index.html (single-page-application); every answer has an ETag (a matching
+// If-None-Match is a 304), and text is compressed (br, else gzip) as Cloudflare does. `--assets worker`
+// (the default) caches as projects/src/asset-cache.ts does since #318: a content-hashed /assets/ file's 200
+// or 304 `private, max-age=31536000, immutable`, everything else `no-cache`. `--assets workers-assets`
+// is Workers Assets' own `public, max-age=0, must-revalidate` on everything, as before #318.
+
+/** A file `vite build` named by its content (asset-cache.ts's HASHED). */
+const HASHED = /^\/assets\/[^/]+-[A-Za-z0-9_-]{8}\.[a-z0-9]+$/;
+const cacheControl = (path, status, type) =>
+  opt.assets === "workers-assets" ? "public, max-age=0, must-revalidate" : (status === 200 || status === 304) && HASHED.test(path) && !/^text\/html\b/.test(type) ? "private, max-age=31536000, immutable" : "no-cache";
 
 const TYPES = { ".js": "text/javascript", ".css": "text/css", ".html": "text/html; charset=utf-8", ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf", ".svg": "image/svg+xml", ".json": "application/json", ".png": "image/png", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json" };
 function serveDist(dir) {
@@ -192,8 +205,9 @@ function serveDist(dir) {
     let p = join(root, path);
     if (!p.startsWith(root) || !files.has(p)) p = join(root, "index.html");
     const f = load(p);
-    const headers = { "content-type": f.type, etag: f.etag, "cache-control": path.startsWith("/assets/") ? opt["asset-cache-control"] : "public, max-age=0, must-revalidate" };
-    if (req.headers["if-none-match"] === f.etag) {
+    const status = req.headers["if-none-match"] === f.etag ? 304 : 200;
+    const headers = { "content-type": f.type, etag: f.etag, "cache-control": cacheControl(path, status, f.type) };
+    if (status === 304) {
       res.writeHead(304, headers);
       return res.end();
     }
@@ -328,9 +342,14 @@ async function run(sc) {
     async until(sel, act) {
       const page = ctx.page;
       const t0 = await page.evaluate(() => performance.now());
-      const shown = page.evaluate((s) => window.__perf.shown(s), sel).catch(() => null);
+      let failed = null;
+      const shown = page.evaluate((s) => window.__perf.shown(s), sel).catch((e) => {
+        failed = e;
+        return null;
+      });
       await act();
       const t1 = await shown;
+      if (failed) throw new Error(`waiting for ${sel}: ${failed.message.split("\n")[0]}`);
       if (t1 === null) throw new Error(`${sel} didn't show within 60 s`);
       return t1 - t0;
     },
@@ -357,6 +376,8 @@ async function run(sc) {
     await ctx.page.evaluate(() => document.body.outerHTML).then((h) => writeFileSync(join(out, `${sc.name}-error.html`), h)).catch(() => {});
   }
   await browser.close();
+  // The app throwing (a fixture whose shape drifted from the API, say) makes the numbers meaningless.
+  if (!error && errors.length) error = `the page threw: ${errors[0].slice(0, 200)}`;
   return { name: sc.name, kind: sc.kind, windows, ...(error ? { error } : {}), pageErrors: [...new Set(errors)].slice(0, 5) };
 }
 
@@ -597,14 +618,15 @@ const SCENARIOS = [
     return { steps, content: steps.toManager + steps.toReviews, selector: "Manager, then Reviews" };
   }),
   flowScenario("switch-project", `${P}/board`, "[data-ds=task-row]", async (ctx) => {
-    const t = await ctx.until("[data-ds=task-row] >> nth=0", async () => {
-      await ctx.page.evaluate(() => document.querySelectorAll("[data-ds=task-row]").forEach((r) => r.setAttribute("data-perf-old", "")));
+    // Widgets' rows (its tasks' ids start tsk_othe), from the click on the switcher.
+    const sel = "[data-task^=tsk_othe]";
+    const t = await ctx.until(sel, async () => {
       await ctx.page.locator("[data-ds=switcher]").first().click();
-      await ctx.page.getByRole("menuitem", { name: /Widgets/ }).or(ctx.page.getByRole("option", { name: /Widgets/ })).or(ctx.page.getByRole("link", { name: /Widgets/ })).first().click();
-    }).catch(async () => ctx.until("[data-ds=task-row]:not([data-perf-old])", () => {}));
+      await ctx.page.getByRole("option", { name: /Widgets/ }).or(ctx.page.getByRole("menuitem", { name: /Widgets/ })).or(ctx.page.getByRole("link", { name: /Widgets/ })).first().click({ timeout: 10_000 });
+    });
     await ctx.page.waitForURL(/prj_other/);
     await ctx.page.waitForTimeout(1000);
-    return { content: t, selector: "a Widgets board row" };
+    return { content: t, selector: `${sel} (Widgets' board rows)` };
   }),
   flowScenario("drawer", `${P}/board`, "[data-ds=task-row]", async (ctx) => {
     const { page } = ctx;
@@ -696,6 +718,7 @@ const report = {
   cpu: CPU,
   shape: opt.shape,
   apiMs: API_MS,
+  assets: opt.dist ? opt.assets : "as --base-url serves them",
   rate: RATE,
   idleSeconds: IDLE,
   seed: Number(opt.seed),

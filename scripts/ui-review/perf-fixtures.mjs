@@ -10,8 +10,8 @@
 // 500 streamed live on demand at `rate` events per second.
 //
 // `shape` is the API under test: "summary" (main since #308: the task list without bodies or specs) or
-// "full" (before it: every task whole). `etag`: whether answers carry an ETag and honour If-None-Match
-// with a 304 (since #307); a client that never sends If-None-Match gets 200s either way.
+// "full" (before it: every task whole). Every GET answer carries an ETag and is a 304 to a matching
+// If-None-Match (the API since #307); a client that never sends one (before #307) gets 200s.
 
 import { createHash } from "node:crypto";
 import { data as demoData } from "./fixtures/projects/demo.mjs";
@@ -19,7 +19,7 @@ import { data as demoData } from "./fixtures/projects/demo.mjs";
 const DAY = 86_400_000;
 
 /** A seeded PRNG (mulberry32): the same seed gives the same fixtures on every run. */
-export function rng(seed) {
+function rng(seed) {
   let a = seed >>> 0;
   const next = () => {
     a = (a + 0x6d2b79f5) >>> 0;
@@ -78,7 +78,7 @@ function reply(r, k, taskIds) {
 }
 
 /** An agent's trace: 2,000 events, as nest serves them (history pages, the ring, the live stream). */
-export function makeTrace(seed, now) {
+function makeTrace(seed, now) {
   const r = rng(seed);
   const tools = ["Bash", "Read", "Grep", "Edit", "Write", "Glob", "mcp__projects-board__list_tasks", "mcp__projects-task__report_progress"];
   const input = (name) => {
@@ -288,7 +288,7 @@ const etagOf = (text) => `W/"${createHash("sha256").update(text).digest("hex").s
  * The fixtures for one run. `answer(method, path, search, ifNoneMatch, body)` gives
  * `{ status, body (a string, or null for a 304), etag }`; `trace(agent)` an agent's trace.
  */
-export function perfData({ seed = 1, shape = "summary", etag = true, now = Date.now() } = {}) {
+export function perfData({ seed = 1, shape = "summary", now = Date.now() } = {}) {
   const demo = demoTemplates(now);
   const names = ["Gadgets", "Widgets", "Sprockets", "Cogs", "Gizmos", "Doohickeys"];
   const projectIds = ["prj_demo", "prj_other", "prj_sprk", "prj_cogs", "prj_gizm", "prj_dooh"];
@@ -358,7 +358,7 @@ export function perfData({ seed = 1, shape = "summary", etag = true, now = Date.
   const answer = (method, path, search = new URLSearchParams(), ifNoneMatch = null, sent = null) => {
     const [status, value] = generated(method, path, search, sent) ?? demo.answer(method, path, search, sent);
     const text = JSON.stringify(value);
-    if (!etag || method !== "GET" || status !== 200) return { status, body: text, etag: null };
+    if (method !== "GET" || status !== 200) return { status, body: text, etag: null };
     const tag = etagOf(text);
     const named = ifNoneMatch?.split(",").some((t) => t.trim() === "*" || t.trim().replace(/^W\//, "") === tag.replace(/^W\//, ""));
     return named ? { status: 304, body: null, etag: tag } : { status, body: text, etag: tag };
