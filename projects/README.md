@@ -961,6 +961,23 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 
 **Spawning:** a worker may run Claude Code's own subagents (the `Agent` tool, through nest's `subagents` capability). They live in its brain and reach the same sandbox through its hands, with the same grant and taint. No role gets nest-level spawning (`spawn_agent`, `fork_sandbox`): the app starts every agent itself, one worker per task (`test/catalog-roles.test.ts`).
 
+### Performance
+
+Measured with [`scripts/ui-review/perf.mjs`](../scripts/ui-review/README.md#perfmjs), the same way for every page and flow:
+- The built client, served as Cloudflare serves its assets (ETags, `max-age=0, must-revalidate`, br), in headless Chromium at 1440×900 with the CPU throttled 4×, one browser per page or flow; the API answered from generated fixtures at a realistic size (300 tasks, 60% done; 200 chat messages; 2,000-event traces; 100 reviews; 60 routine runs), each answer 40 ms late.
+- A page is loaded cold (cache empty), then warm (a new tab), then left idle 15 s; a flow is played on its loaded page. "To content" is until the page's content selector shows; long tasks are the main thread's tasks over 50 ms, summed; bytes are as sent (gzip for the API, br for assets), without headers.
+- `e655ace` is main before the perf tasks (the API's full task list, no conditional requests); main is `5ec91f2` (#307's ETag/304 polling, #308's task summaries). Both were built and measured in one 2-vCPU sandbox on 2026-11-19, main twice: its numbers are the two runs' mean, with their spread (±) where it's over 20%. Times swing between runs on a shared CPU; requests and bytes don't.
+
+PERF_TABLE
+
+To rerun (the output outside the repo; the "before" built the same way in a `git worktree` of its commit, and measured with `--shape full` if it is older than #308):
+
+```bash
+cd scripts/ui-review && npm ci && cd ../../projects && npm ci && npm run build && cd ..
+node scripts/ui-review/perf.mjs /tmp/perf-after --dist projects/dist/client --commit "$(git rev-parse --short HEAD)"
+node scripts/ui-review/perf.mjs --compare /tmp/perf-before/perf.json /tmp/perf-after/perf.json
+```
+
 ## Retention
 
 Terminal rows of history-like tables are pruned by age, at most hourly from each object's drain (`src/retention.ts`):
