@@ -316,6 +316,7 @@ async function run(sc) {
     },
     /** The time from now (in the page) until `sel` shows. */
     async until(sel, act) {
+      const page = ctx.page;
       const t0 = await page.evaluate(() => performance.now());
       const shown = page.evaluate((s) => window.__perf.shown(s), sel);
       await act();
@@ -539,18 +540,16 @@ async function loadOlder(ctx, scroller, item, pages) {
   return times;
 }
 const nav = (page, name) => page.locator("#sidebar").getByRole("link", { name, exact: true }).first().click();
-const firstTask = (state) => async (page) => {
-  // A task in the given state on the board (the fixture's first one), by its row's title.
-  return page.evaluate((s) => document.querySelector(`[data-ds=task-row][data-state=${s}] a, [data-ds=task-row][data-state=${s}]`)?.textContent ?? null, state);
-};
 
 const DRAWER = "[role=dialog] [data-ds=terminal] [data-kind=tool]";
+/** A task with a worker (its trace in the drawer): the fixture's first one in progress. */
+const WORKING = perfData({ seed: Number(opt.seed), shape: opt.shape }).project("prj_demo").tasks.find((t) => t.state === "in_progress").id;
 
 const SCENARIOS = [
   // Pages: cold, warm, idle.
   pageScenario("projects", "/projects", "a[href='/projects/prj_demo/board'], a[href='/projects/prj_demo']"),
   pageScenario("board", `${P}/board`, "[data-ds=task-row]"),
-  pageScenario("board-drawer", `${P}/board?task=tsk_demo0200`, DRAWER),
+  pageScenario("board-drawer", `${P}/board?task=${WORKING}`, DRAWER),
   pageScenario("manager-chat", `${P}/manager`, MESSAGE),
   pageScenario("manager-trace", `${P}/manager?view=trace`, TRACE_EVENT),
   pageScenario("reviews", `${P}/reviews`, "[aria-label^='Show the trace of #']"),
@@ -589,16 +588,18 @@ const SCENARIOS = [
     return { content: t, selector: "a Widgets board row" };
   }),
   flowScenario("drawer", `${P}/board`, "[data-ds=task-row]", async (ctx) => {
-    const row = ctx.page.locator("[data-ds=task-row]", { hasText: await ctx.page.evaluate(() => null) ?? "" }).filter({ has: ctx.page.locator("a") });
+    const { page } = ctx;
+    const link = page.locator(`[data-task=${WORKING}] a`).first();
+    await link.scrollIntoViewIfNeeded();
     const steps = {};
-    steps.open = await ctx.until(DRAWER, () => ctx.page.goto(base + `${P}/board?task=tsk_demo0200`, { waitUntil: "commit" }).then(() => {}) && null);
-    await ctx.page.waitForTimeout(1000);
-    const t0 = await ctx.page.evaluate(() => performance.now());
-    await ctx.page.keyboard.press("Escape");
-    await ctx.page.locator("[role=dialog]").waitFor({ state: "hidden" });
-    steps.close = (await ctx.page.evaluate(() => performance.now())) - t0;
-    void row;
-    return { steps, content: steps.open, selector: DRAWER };
+    steps.open = await ctx.until(DRAWER, () => link.click());
+    await page.waitForTimeout(1000);
+    const t0 = await page.evaluate(() => performance.now());
+    await page.keyboard.press("Escape");
+    await page.locator("[role=dialog]").first().waitFor({ state: "hidden" });
+    steps.close = (await page.evaluate(() => performance.now())) - t0;
+    await page.waitForTimeout(500);
+    return { steps, content: steps.open, selector: `${DRAWER} (open), the dialog hidden (close)` };
   }),
   flowScenario("type-composer", `${P}/manager`, MESSAGE, async (ctx) => {
     const box = ctx.page.getByLabel("Message to the manager");

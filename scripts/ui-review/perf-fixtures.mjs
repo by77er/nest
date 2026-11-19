@@ -193,7 +193,13 @@ function makeProject(id, name, seed, now, big, demo) {
     for (let k = 0; k < 12; k++) rows.push({ at_ms: t.created_ms + (k + 5) * 600_000, actor: h.pick(["agt_mgr7k2", "app:auto-assign", "owner", t.assignee ?? "app"]), action: h.pick(["assign", "progress", "state", "note"]), detail: JSON.stringify({ text: sentence(h, h.int(8, 30)) }), tainted: false });
     return rows;
   };
-  const detail = (tid) => byId[tid] && { ...byId[tid], history: history(byId[tid]) };
+  // Generated once per task, so an unchanged task answers the same (and its ETag holds).
+  const histories = new Map();
+  const detail = (tid) => {
+    if (!byId[tid]) return null;
+    if (!histories.has(tid)) histories.set(tid, history(byId[tid]));
+    return { ...byId[tid], history: histories.get(tid) };
+  };
 
   // 200 chat messages: the owner's questions, the manager's Markdown replies, a few of the app's notes.
   const chat = Array.from({ length: 200 }, (_, k) => {
