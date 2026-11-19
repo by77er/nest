@@ -177,8 +177,11 @@ mkdirSync(out, { recursive: true });
 
 /** A file `vite build` named by its content (asset-cache.ts's HASHED). */
 const HASHED = /^\/assets\/[^/]+-[A-Za-z0-9_-]{8}\.[a-z0-9]+$/;
-const cacheControl = (path, status, type) =>
-  opt.assets === "workers-assets" ? "public, max-age=0, must-revalidate" : (status === 200 || status === 304) && HASHED.test(path) && !/^text\/html\b/.test(type) ? "private, max-age=31536000, immutable" : "no-cache";
+function cacheControl(path, status, type) {
+  if (opt.assets === "workers-assets") return "public, max-age=0, must-revalidate";
+  const immutable = (status === 200 || status === 304) && HASHED.test(path) && !/^text\/html\b/.test(type);
+  return immutable ? "private, max-age=31536000, immutable" : "no-cache";
+}
 
 const TYPES = { ".js": "text/javascript", ".css": "text/css", ".html": "text/html; charset=utf-8", ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf", ".svg": "image/svg+xml", ".json": "application/json", ".png": "image/png", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json" };
 function serveDist(dir) {
@@ -286,7 +289,7 @@ async function run(sc) {
     const after = Number(new URL(ws.url()).searchParams.get("after") ?? 0);
     const send = (m) => {
       const s = JSON.stringify(m);
-      ledger.push({ at: Date.now(), type: "ws", bytes: s.length, cached: false, status: 101 });
+      ledger.push({ at: Date.now(), type: "ws", bytes: Buffer.byteLength(s), cached: false, status: 101 });
       ws.send(s);
     };
     const sock = { agent, send, t, sent: t.backlog.length };
@@ -391,13 +394,16 @@ async function setup(cdp, page, fx, ledger) {
   cdp.on("Network.responseReceived", (e) => {
     if (new URL(e.response.url).pathname.startsWith("/api/") || e.response.url.startsWith("data:")) return;
     const type = { Document: "document", Script: "script", Stylesheet: "style", Font: "font" }[e.type] ?? "other";
-    reqs.set(e.requestId, { type, cached: !!(e.response.fromDiskCache || e.response.fromMemoryCache || e.response.fromPrefetchCache), status: e.response.status });
+    const cached = !!(e.response.fromDiskCache || e.response.fromMemoryCache || e.response.fromPrefetchCache);
+    // What had arrived by the response's start is its headers: taken off, so bytes are bodies only.
+    reqs.set(e.requestId, { type, cached, status: e.response.status, headers: e.response.encodedDataLength ?? 0 });
   });
   cdp.on("Network.loadingFinished", (e) => {
     const r = reqs.get(e.requestId);
     if (!r) return;
     reqs.delete(e.requestId);
-    ledger.push({ at: Date.now(), type: r.type, bytes: r.cached ? 0 : e.encodedDataLength, cached: r.cached, status: r.status });
+    const bytes = r.cached ? 0 : Math.max(0, e.encodedDataLength - r.headers);
+    ledger.push({ at: Date.now(), type: r.type, bytes, cached: r.cached, status: r.status });
   });
   // The API: CDP's Fetch interception for /api/ only. (page.route would do it too, but Playwright turns the
   // HTTP cache off whenever it routes, and the warm loads need it.) Each answer waits --api-ms, as a Worker's

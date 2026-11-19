@@ -143,6 +143,7 @@ function makeProject(id, name, seed, now, big, demo) {
   states.length = total;
   // Templates by state: the demo fixture's task in that state (every field the API has).
   const byState = Object.fromEntries(demo.tasks.map((t) => [t.state, t]));
+  const prTpl = demo.tasks.find((t) => t.prs.length)?.prs[0] ?? { fork: false, attached_by: "app:branch", auto_merge: null };
   const ids = Array.from({ length: total }, (_, i) => `tsk_${id.slice(4, 8)}${String(i + 1).padStart(4, "0")}`);
   const live = new Set(["assigned", "in_progress", "in_review"]);
   // Done first (oldest), then the rest, as a board that has run for weeks.
@@ -165,7 +166,8 @@ function makeProject(id, name, seed, now, big, demo) {
       start_error: state === "stalled" ? "nest refused the worker: max_agents reached (403)" : null,
       tainted: r.chance(0.1),
       blocked: null,
-      prs: pr ? [{ ...(tpl.prs?.[0] ?? {}), pr, title: title(r), state: state === "done" ? "merged" : "open", repo: demo.repo }].map((p) => (tpl.prs?.[0] ? p : { pr, repo: demo.repo, title: p.title, state: p.state, attached_by: "worker", attached_ms: created, ended_ms: state === "done" ? created + DAY : null })) : [],
+      // A PR as the demo's tasks list one (its number, state, title, who attached it, auto-merge).
+      prs: pr ? [{ ...prTpl, number: pr, title: title(r), state: state === "done" ? "merged" : "open", attached_ms: created }] : [],
       blocked_by: [],
       blocks: [],
       waiting_on: [],
