@@ -7,7 +7,7 @@
 // error (2), never on slow numbers.
 //
 //   node scripts/ui-review/perf.mjs <out-dir> (--dist DIR | --base-url URL) [--shape summary|full] [--cpu 4]
-//        [--rate 20] [--idle 15] [--api-ms 40] [--only a,b] [--label NAME] [--compare other.json]
+//        [--rate 20] [--idle 15] [--api-ms 40] [--only a,b] [--label NAME] [--commit SHA] [--compare other.json]
 //   node scripts/ui-review/perf.mjs --compare before.json after.json
 
 import { createServer } from "node:http";
@@ -41,12 +41,13 @@ const { values: opt, positionals } = parseArgs({
     "asset-cache-control": { type: "string", default: "public, max-age=0, must-revalidate" },
     only: { type: "string" },
     label: { type: "string" },
+    commit: { type: "string" },
     seed: { type: "string", default: "1" },
     compare: { type: "string" },
     help: { type: "boolean", short: "h" },
   },
 });
-const USAGE = "usage: perf.mjs <out-dir> (--dist DIR | --base-url URL) [--shape summary|full] [--cpu 4] [--rate 20] [--idle 15] [--api-ms 40] [--only a,b] [--label NAME] [--compare other.json]\n       perf.mjs --compare before.json after.json";
+const USAGE = "usage: perf.mjs <out-dir> (--dist DIR | --base-url URL) [--shape summary|full] [--cpu 4] [--rate 20] [--idle 15] [--api-ms 40] [--only a,b] [--label NAME] [--commit SHA] [--compare other.json]\n       perf.mjs --compare before.json after.json";
 if (opt.help) die(USAGE);
 
 // --- results: the headline numbers, Markdown tables, and before/after ------------------------------------
@@ -61,6 +62,7 @@ const HEADLINE = [
   ["requests", "requests", num],
   ["bytes", "transferred", kb],
   ["apiBytes", "API bytes", kb],
+  ["apiRaw", "API decoded", kb],
   ["longCount", "long tasks", num],
   ["longTotal", "long total", ms],
   ["longMax", "long max", ms],
@@ -77,6 +79,7 @@ function headline(w) {
     requests: w.net.total.requests,
     bytes: w.net.total.bytes,
     apiBytes: w.net.api.bytes,
+    apiRaw: w.net.api.raw,
     longCount: w.long.count,
     longTotal: w.long.total,
     longMax: w.long.max,
@@ -675,15 +678,9 @@ const wanted = opt.only?.split(",").map((s) => s.trim());
 const chosen = SCENARIOS.filter((s) => !wanted || wanted.includes(s.name) || wanted.includes(s.kind));
 if (!chosen.length) die(`no scenario matches --only ${opt.only}; they are: ${SCENARIOS.map((s) => s.name).join(", ")}`);
 
-let commit = null;
-try {
-  const html = await (await fetch(base + "/projects")).text();
-  commit = /<meta name="commit" content="([^"]+)"/.exec(html)?.[1] ?? null;
-} catch {}
-
 const report = {
   label: opt.label ?? (opt.dist ? resolve(opt.dist) : base),
-  commit: process.env.PERF_COMMIT ?? commit,
+  commit: opt.commit ?? null,
   at: new Date().toISOString(),
   cpu: CPU,
   shape: opt.shape,
