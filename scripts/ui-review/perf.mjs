@@ -143,8 +143,9 @@ function compare(before, after) {
   return lines.join("\n") + "\n";
 }
 
-if (opt.compare && positionals.length === 2) {
-  const [x, y] = positionals.map((p) => JSON.parse(readFileSync(p, "utf8")));
+// `--compare before.json after.json`: a table only, nothing run.
+if (opt.compare && positionals.length === 1 && positionals[0].endsWith(".json") && !opt.dist && !opt["base-url"]) {
+  const [x, y] = [opt.compare, positionals[0]].map((p) => JSON.parse(readFileSync(p, "utf8")));
   process.stdout.write(compare(x, y));
   process.exit(0);
 }
@@ -262,9 +263,8 @@ async function run(sc) {
   const ledger = []; // every response: { at, type, bytes, cached, status }
   const errors = [];
   const sockets = new Set();
-  const state = { stream: null };
 
-  // The agents' traces (page.routeWebSocket, as selftest.mjs does): the history offer, the 1,000-event
+  // The agents' traces (routeWebSocket, as selftest.mjs does): the history offer, the 1,000-event
   // backlog, `live`; then the live stream when a flow starts it.
   await context.routeWebSocket(/\/api\/agents\/[^/]+\/trace/, (ws) => {
     const agent = decodeURIComponent(new URL(ws.url()).pathname.split("/")[3]);
@@ -723,7 +723,8 @@ for (const sc of chosen) {
 }
 server?.close();
 
-writeFileSync(join(out, "perf.json"), JSON.stringify(report, null, 2) + "\n");
+// Times to 0.1 ms: the clocks' noise is far above that.
+writeFileSync(join(out, "perf.json"), JSON.stringify(report, (_k, v) => (typeof v === "number" && !Number.isInteger(v) ? Math.round(v * 10) / 10 : v), 2) + "\n");
 writeFileSync(join(out, "perf.md"), markdown(report));
 console.log(`\n${join(out, "perf.json")}\n${join(out, "perf.md")}`);
 if (opt.compare) {
