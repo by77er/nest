@@ -8,6 +8,7 @@ import { resetAccessKeys } from "../src/access";
 import { handleApi } from "../src/api";
 import type { Env } from "../src/env";
 import { clientIdOf, nestFrom } from "../src/nest";
+import { DirectoryDO } from "../src/do/directory";
 import { ProjectDO } from "../src/do/project";
 import { ReviewDO } from "../src/do/review";
 import { AccessTeam, api, APP, FakeNest, holdAsk, installFetch, NEST } from "./fake-nest";
@@ -26,6 +27,7 @@ beforeAll(async () => {
 afterAll(() => restore());
 afterEach(() => {
   fake.failures.length = 0;
+  fake.github.failures.length = 0;
 });
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 10);
@@ -61,6 +63,21 @@ async function seeded() {
   });
   holdAsk(p.manager, `ask_${rand()}`, { question: "ok?", created_ms: 1000 });
   return p;
+}
+
+/** Run `body` with methods of a Durable Object class replaced (RPC sees only the prototype's), restored after. */
+async function patched<T>(cls: { prototype: object }, methods: Record<string, unknown>, body: () => Promise<T>): Promise<T> {
+  const proto = cls.prototype as Record<string, unknown>;
+  const had = Object.fromEntries(Object.keys(methods).map((k) => [k, Object.getOwnPropertyDescriptor(proto, k)]));
+  Object.assign(proto, methods);
+  try {
+    return await body();
+  } finally {
+    for (const [k, d] of Object.entries(had)) {
+      if (d) Object.defineProperty(proto, k, d);
+      else delete proto[k];
+    }
+  }
 }
 
 // --- the routes as they were composed: every read awaited in turn ----------------------------------------
@@ -143,10 +160,63 @@ describe("the polled read routes answer as they did", () => {
     expect((JSON.parse(list.body).projects as { id: string; needs_you: number | null }[]).find((x) => x.id === p.id)!.needs_you).toBeNull();
   });
 
-  it("an unknown project is 404 on every one, before anything else is read", async () => {
-    for (const path of ["/api/projects/prj_nosuch", "/api/projects/prj_nosuch/attention", "/api/projects/prj_nosuch/settings"]) {
-      expect(await raw(path)).toEqual({ status: 404, body: JSON.stringify({ error: "unknown project" }) });
+  it("an unknown project is 404 on every one, and nothing but the directory's row is read", async () => {
+    const t = traced();
+    for (const page of ["", "/attention", "/attention?local=1", "/settings", "/secrets", "/network"]) {
+      const r = await t.ask(`/api/projects/prj_nosuch${page}`, 404);
+      expect(r.body).toBe(JSON.stringify({ error: "unknown project" }));
+      expect(r.trips, page).toEqual(["directory.getProject"]);
     }
+  });
+
+  it("each page's earlier refusal is still its answer whatever fails beside it, and a later read's failure still fails it", async () => {
+    const p = await newProject();
+    const refused = async () => ({ ok: false, status: 409, error: "refused here" });
+    const down = (what: string) => async () => { throw new Error(`${what} down`); };
+    const refusal = { status: 409, body: JSON.stringify({ error: "refused here" }) };
+    // Whichever of ReviewDO's settings reads this release asks.
+    const reviewSettings = { reviewSettings: down("review"), maxConcurrent: down("review"), untrustedPolicy: down("review") };
+    const fails = (path: string, what: string) => expect(Promise.resolve().then(() => raw(path))).rejects.toThrow(`${what} down`);
+
+    // The project and its settings: ProjectDO's refusal, then the binding's failure, then ReviewDO's.
+    await patched(ProjectDO, { getSettings: refused, settingsLookedAt: refused, refreshRepoAutoMerge: async () => {} }, () =>
+      patched(DirectoryDO, { binding: down("directory") }, () => patched(ReviewDO, reviewSettings, async () => {
+        expect(await raw(`/api/projects/${p.id}`)).toEqual(refusal);
+        expect(await raw(`/api/projects/${p.id}/settings`)).toEqual(refusal);
+      })));
+    await patched(DirectoryDO, { binding: down("directory") }, () => patched(ReviewDO, reviewSettings, async () => {
+      await fails(`/api/projects/${p.id}`, "directory");
+      await fails(`/api/projects/${p.id}/settings`, "directory");
+    }));
+    await patched(ReviewDO, reviewSettings, async () => {
+      await fails(`/api/projects/${p.id}`, "review");
+      await fails(`/api/projects/${p.id}/settings`, "review");
+    });
+
+    // Secrets: ProjectDO's refusal of its secrets, though nest's secrets and the workflow facts fail beside it.
+    fake.fail(/^GET \/v1\/clients\/self\/secrets$/, 503, { times: 10 });
+    await patched(ProjectDO, { secrets: refused, workflowWorkers: down("project"), workflowsRefused: down("project") }, async () => {
+      expect(await raw(`/api/projects/${p.id}/secrets`)).toEqual(refusal);
+    });
+    await patched(ProjectDO, { workflowsRefused: down("project") }, () => fails(`/api/projects/${p.id}/secrets`, "project"));
+
+    // Network: the rules' refusal, though the grant and the manager's sandbox fail beside them.
+    fake.fail(/^GET \/v1\/clients\/self$/, 503, { times: 10 });
+    await patched(ProjectDO, { network: refused, managerSandbox: down("project") }, async () => {
+      expect(await raw(`/api/projects/${p.id}/network`)).toEqual(refusal);
+    });
+    await patched(ProjectDO, { managerSandbox: down("project") }, () => fails(`/api/projects/${p.id}/network`, "project"));
+    fake.failures.length = 0;
+
+    // The repos: GitHub's failure is the 502, though the directory fails beside it; the directory's alone is one too.
+    await patched(DirectoryDO, { projects: down("directory") }, async () => {
+      fake.github.fail(/^GET \/app\/installations$/, 502, { times: 10 });
+      const r = await raw("/api/repos");
+      expect(r.status).toBe(502);
+      expect(JSON.parse(r.body).error).toMatch(/^GitHub couldn't say which repos the app's GitHub App reaches: (?!directory down).+/);
+      fake.github.failures.length = 0;
+      expect(await raw("/api/repos")).toEqual({ status: 502, body: JSON.stringify({ error: "GitHub couldn't say which repos the app's GitHub App reaches: directory down" }) });
+    });
   });
 
   it("ProjectDO's attention refused: that refusal is the answer, though ReviewDO fails too; ReviewDO failing alone still fails the route", async () => {
@@ -208,7 +278,7 @@ function traced() {
     for (const t of trips) d.set(t, 1 + Math.max(0, ...trips.filter((x) => x.end !== null && x.end < t.start).map((x) => d.get(x)!)));
     return Math.max(0, ...d.values());
   };
-  const ask = async (path: string) => {
+  const ask = async (path: string, status = 200) => {
     trips.length = 0;
     const inner = globalThis.fetch;
     globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
@@ -219,7 +289,7 @@ function traced() {
     }) as typeof fetch;
     try {
       const res = await handleApi(new Request(`${APP}${path}`), traced, new URL(`${APP}${path}`));
-      expect(res.status, await res.clone().text()).toBe(200);
+      expect(res.status, await res.clone().text()).toBe(status);
       return { depth: depth(), trips: trips.map((t) => t.name), body: await res.text() };
     } finally {
       globalThis.fetch = inner;
@@ -235,7 +305,7 @@ describe("the polled read routes wait on fewer round trips in a row", () => {
   it("the project: 2 (its row, then its settings, binding and review settings together)", async () => {
     const p = await seeded();
     const t = traced();
-    await t.ask(`/api/projects/${p.id}`); // GitHub's owner read once (then kept a minute): what the polls after it wait on
+    // GitHub isn't traced: its owner read, kept a minute per Worker instance, adds one round trip on a miss, as before.
     const r = await t.ask(`/api/projects/${p.id}`);
     expect(r.body).toBe(await projectBefore(p.id, JSON.parse(r.body).settings.repo_owner));
     expect(r.depth, r.trips.join(", ")).toBe(2);

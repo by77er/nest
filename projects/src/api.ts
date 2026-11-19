@@ -84,7 +84,8 @@ async function answerSettings(env: Env, id: string, settings: Result<ProjectSett
   if (!r.ok) return r;
   const b = await binding;
   if (!b) return { ok: false, status: 404, error: "unknown project" };
-  const [owner, rv] = await Promise.all([shownOwner(env, b), reviews]);
+  const owner = await shownOwner(env, b);
+  const rv = await reviews;
   return {
     ok: true,
     value: { ...r.value, repo: b.repo, repo_owner: owner, max_concurrent_reviews: rv.max_concurrent_reviews, untrusted_reviews: rv.untrusted_reviews },
