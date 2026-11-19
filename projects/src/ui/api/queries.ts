@@ -39,31 +39,38 @@ export const POLL = { board: 5_000, chat: 3_000, unread: 10_000, asks: 5_000, pr
 // --- reads ------------------------------------------------------------------------------------------
 
 /**
+ * What every prefetched read adds: a hook mounting on a read whose prefetch failed takes its error (the
+ * retry rule in queryClient.ts already ran) rather than asking again, so the page shows the same error,
+ * no later. A route's loader asks again on the next visit (an error is never fresh).
+ */
+const prefetched = { retryOnMount: false } as const;
+
+/**
  * Each page read's options (its key, its fetch and its poll), shared by its hook and by the routes' loaders
  * (router.tsx), so a route's prefetch and the hook its page mounts are one cache entry and one request.
  */
 export const reads = {
-  projects: () => queryOptions({ queryKey: keys.projects, queryFn: api.projects, refetchInterval: POLL.project }),
-  project: (id: string) => queryOptions({ queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project }),
-  tasks: (id: string) => queryOptions({ queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: POLL.board }),
-  task: (id: string, task: string) => queryOptions({ queryKey: keys.task(id, task), queryFn: () => api.task(id, task), refetchInterval: POLL.task }),
-  chat: (id: string) => queryOptions({ queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: POLL.chat }),
-  attention: (id: string) => queryOptions({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks }),
-  manager: (id: string) => queryOptions({ queryKey: keys.manager(id), queryFn: () => api.manager(id), refetchInterval: POLL.manager }),
-  waits: (id: string) => queryOptions({ queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager }),
-  reviews: (id: string) => queryOptions({ queryKey: keys.reviews(id), queryFn: () => api.reviews(id), refetchInterval: POLL.reviews }),
-  reviewers: (id: string) => queryOptions({ queryKey: keys.reviewers(id), queryFn: () => api.reviewers(id), refetchInterval: POLL.reviews }),
+  projects: () => queryOptions({ ...prefetched, queryKey: keys.projects, queryFn: api.projects, refetchInterval: POLL.project }),
+  project: (id: string) => queryOptions({ ...prefetched, queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project }),
+  tasks: (id: string) => queryOptions({ ...prefetched, queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: POLL.board }),
+  task: (id: string, task: string) => queryOptions({ ...prefetched, queryKey: keys.task(id, task), queryFn: () => api.task(id, task), refetchInterval: POLL.task }),
+  chat: (id: string) => queryOptions({ ...prefetched, queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: POLL.chat }),
+  attention: (id: string) => queryOptions({ ...prefetched, queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks }),
+  manager: (id: string) => queryOptions({ ...prefetched, queryKey: keys.manager(id), queryFn: () => api.manager(id), refetchInterval: POLL.manager }),
+  waits: (id: string) => queryOptions({ ...prefetched, queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager }),
+  reviews: (id: string) => queryOptions({ ...prefetched, queryKey: keys.reviews(id), queryFn: () => api.reviews(id), refetchInterval: POLL.reviews }),
+  reviewers: (id: string) => queryOptions({ ...prefetched, queryKey: keys.reviewers(id), queryFn: () => api.reviewers(id), refetchInterval: POLL.reviews }),
   network: (id: string) =>
-    queryOptions({ queryKey: ["projects", id, "network"], queryFn: () => api.network(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.manager) }),
+    queryOptions({ ...prefetched, queryKey: ["projects", id, "network"], queryFn: () => api.network(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.manager) }),
   secrets: (id: string) =>
-    queryOptions({ queryKey: keys.secrets(id), queryFn: () => api.secrets(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.reviews) }),
-  issues: (id: string) => queryOptions({ queryKey: keys.issues(id), queryFn: () => api.issues(id), refetchInterval: POLL.asks }),
-  routines: (id: string) => queryOptions({ queryKey: keys.routines(id), queryFn: () => api.routines(id), refetchInterval: POLL.routines }),
-  runs: (id: string) => queryOptions({ queryKey: keys.runs(id), queryFn: () => api.routineRuns(id), refetchInterval: POLL.routines }),
-  proposals: (id: string) => queryOptions({ queryKey: keys.proposals(id), queryFn: () => api.proposals(id), refetchInterval: POLL.routines }),
-  memory: (id: string) => queryOptions({ queryKey: keys.memory(id), queryFn: () => api.memory(id), refetchInterval: POLL.routines }),
-  syncState: () => queryOptions({ queryKey: keys.syncState, queryFn: api.syncState }),
-  bindings: () => queryOptions({ queryKey: keys.bindings, queryFn: api.bindings }),
+    queryOptions({ ...prefetched, queryKey: keys.secrets(id), queryFn: () => api.secrets(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.reviews) }),
+  issues: (id: string) => queryOptions({ ...prefetched, queryKey: keys.issues(id), queryFn: () => api.issues(id), refetchInterval: POLL.asks }),
+  routines: (id: string) => queryOptions({ ...prefetched, queryKey: keys.routines(id), queryFn: () => api.routines(id), refetchInterval: POLL.routines }),
+  runs: (id: string) => queryOptions({ ...prefetched, queryKey: keys.runs(id), queryFn: () => api.routineRuns(id), refetchInterval: POLL.routines }),
+  proposals: (id: string) => queryOptions({ ...prefetched, queryKey: keys.proposals(id), queryFn: () => api.proposals(id), refetchInterval: POLL.routines }),
+  memory: (id: string) => queryOptions({ ...prefetched, queryKey: keys.memory(id), queryFn: () => api.memory(id), refetchInterval: POLL.routines }),
+  syncState: () => queryOptions({ ...prefetched, queryKey: keys.syncState, queryFn: api.syncState }),
+  bindings: () => queryOptions({ ...prefetched, queryKey: keys.bindings, queryFn: api.bindings }),
 };
 
 /** One page read's options, as `reads` makes them. */
