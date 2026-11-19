@@ -230,7 +230,9 @@ const startsWith = (next: readonly TraceEvent[], prev: readonly TraceEvent[]) =>
  * and every earlier turn is the same object. Anything else (history paged in, a reset, a trim) is grouped
  * afresh, keeping the earlier objects of turns and items that came out the same.
  */
-export function groupTurnsFrom(prev: Grouping | null, events: readonly TraceEvent[], older: readonly HistoryEvent[] = []): Grouping {
+const NO_HISTORY: readonly HistoryEvent[] = [];
+
+export function groupTurnsFrom(prev: Grouping | null, events: readonly TraceEvent[], older: readonly HistoryEvent[] = NO_HISTORY): Grouping {
   if (prev && prev.events === events && prev.older === older) return prev;
   if (prev && prev.older === older && startsWith(events, prev.events)) {
     const b = new Builder(prev);
