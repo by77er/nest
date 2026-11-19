@@ -1959,6 +1959,12 @@ export class ProjectDO extends DurableObject<Env> {
     await this.arm();
   }
 
+  /** The project is being looked at: `refreshRepoAutoMerge`, then `getSettings`, in one call. */
+  async settingsLookedAt(): Promise<Result<ProjectSettings>> {
+    await this.refreshRepoAutoMerge();
+    return this.getSettings();
+  }
+
   // --- telling a task's worker what changed ---------------------------------------------------------
 
   /**
