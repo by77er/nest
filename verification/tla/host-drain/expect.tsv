@@ -1,0 +1,40 @@
+# HostDrain.tla: one line per config.  <spec> <config> <holds|violates:Name> <ci|full>
+# Bounds (every config): one host, two sandboxes, Deadline 2 ticks, Window 4, the clock to 6, two writes. Each config's
+# faults are in its .cfg: MC_spot and MC_operator have the most (two wakes, one failed suspend, one failed resume, and
+# for the operator's one repeated drain); the others have only the fault they are about. ci: each under 60 s with 4 workers (TLC v1.7.4).
+# As built (2026-11-18, with that day's fixes): a spot drain and an operator's, with two wakes, a failed resume and a failed suspend
+HostDrain.tla  MC_spot.cfg                    holds                          ci
+HostDrain.tla  MC_operator.cfg                holds                          ci
+# With a stale incarnation: one whose retirement FleetDO hears of, and a destroyed sandbox's, which it never does
+HostDrain.tla  MC_spot_stale.cfg              holds                          ci
+HostDrain.tla  MC_spot_destroyed.cfg          holds                          ci
+# Before the fixes. A destroyed sandbox's incarnation waited out the salvage window, longer than the notice
+# (use1, 2026-11-18 16:03): AWS took an empty host
+HostDrain.tla  MC_old_destroyed.cfg           violates:DrainsInTime          ci
+# A wake around an eviction resumed a VM off its lease: retired with its work, or its salvage refused
+HostDrain.tla  MC_old_wake.cfg                violates:NoLossByRetire        ci
+HostDrain.tla  MC_old_wake_refused.cfg        violates:NoRefusedLoss         ci
+# The wake fix's parts: without the lease check or the unanswered-resume rule a VM is retired with its work; with
+# resumes still sent to a draining host, one after the drain's suspend runs the VM again with nothing to suspend it;
+# with that and the eviction written after SandboxDO heard `suspended`, a wake in between resumes off the lease
+HostDrain.tla  MC_wake_busy_only.cfg          violates:NoLossByRetire        ci
+HostDrain.tla  MC_wake_lease_only.cfg         violates:NoLossByRetire        ci
+HostDrain.tla  MC_wake_after_drain.cfg        violates:NoRunningLeft         ci
+HostDrain.tla  MC_wake_evict_late.cfg         violates:NoResumeOffLease      ci
+# A resume that fails leaves its VM suspended and the drain's suspend reports nothing: without the sweep the lease stays
+HostDrain.tla  MC_resume_fail_no_sweep.cfg    violates:NoStrandedLease       ci
+# A fix shape not taken: recording the evicted incarnation stale stops the retirement loss, not the refused salvage
+HostDrain.tla  MC_wake_stale.cfg              holds                          ci
+HostDrain.tla  MC_wake_stale_refused.cfg      violates:NoRefusedLoss         ci
+# Mutations: each guard removed must be caught
+HostDrain.tla  MC_mut_evict_all.cfg           violates:NoLossByRetire        ci
+HostDrain.tla  MC_mut_report_early.cfg        violates:NoLossByRetire        ci
+HostDrain.tla  MC_mut_retire_leases.cfg       violates:NoLossByRetire        ci
+HostDrain.tla  MC_mut_retire_stale.cfg        violates:NoLossByRetire        ci
+# Reachability: each state happens (so the configs above aren't vacuous)
+HostDrain.tla  MC_reach_retired.cfg           violates:NeverRetired          ci
+HostDrain.tla  MC_reach_kill_holding.cfg      violates:NeverKilledHolding    ci
+HostDrain.tla  MC_reach_kill_loss.cfg         violates:NeverKillLoss         ci
+HostDrain.tla  MC_reach_replaced.cfg          violates:NeverReplaced         ci
+HostDrain.tla  MC_reach_resumed.cfg           violates:NeverResumed          ci
+HostDrain.tla  MC_reach_resume_failed.cfg     violates:NeverResumeFailed     ci

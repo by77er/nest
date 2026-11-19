@@ -71,7 +71,7 @@ The other follow-ups of a result (`checkpoint_result`, `command_failed`, `start_
 | RetryReleased | `lease.retriedReleased` `lease.ts:189` | yes | |
 | Alarm | `placeWanted` `lease.ts:211` | yes | False for `failed`. |
 | Salvage | `decideCommit` `lease.ts:220` | yes | An orphan from an older epoch's holder; the current epoch's only from its holder. |
-| WindowPass, Reap | `reapStale` `fleet.ts:1194` | partly | The model lacks its drop of a row superseded on the same host. |
+| WindowPass, Reap | `reapStale` `fleet.ts:1194` | partly | The model lacks its drop of a row superseded on the same host, and (since 2026-11-18) its reaping of a destroyed sandbox's row without the window ([host drain](../../host-drain/)). |
 | Retire | `scaleDown`'s `salvaging` `fleet.ts:2359` | yes | A row counts until its `sandbox_destroy` is issued (`cmd`), which the model's "destroyed" is. |
 | HostLoss | `die` → `queueReassign` → `leaseLost` | partly | One step in the model. |
 
