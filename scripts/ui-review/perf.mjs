@@ -288,9 +288,9 @@ async function run(sc) {
     sockets,
     /** Measures `fn` as one window: what the network, the main thread and the renderer did during it. */
     async window(name, fn, o = {}) {
-      const before = await snapshot(page, cdp, ledger);
+      const before = await snapshot(ctx.page, ctx.cdp, ledger);
       const extra = (await fn()) ?? {};
-      const after = await snapshot(page, cdp, ledger);
+      const after = await snapshot(ctx.page, ctx.cdp, ledger);
       const w = diff(name, before, after, ledger);
       Object.assign(w, extra);
       if (o.idleSeconds) {
@@ -341,6 +341,9 @@ async function run(sc) {
     await sc.run(ctx);
   } catch (e) {
     error = e.message.split("\n")[0];
+    // What the page showed when it failed, for whoever fixes the scenario.
+    await ctx.page.screenshot({ path: join(out, `${sc.name}-error.png`) }).catch(() => {});
+    await ctx.page.evaluate(() => document.body.outerHTML).then((h) => writeFileSync(join(out, `${sc.name}-error.html`), h)).catch(() => {});
   }
   await browser.close();
   return { name: sc.name, kind: sc.kind, windows, ...(error ? { error } : {}), pageErrors: [...new Set(errors)].slice(0, 5) };
