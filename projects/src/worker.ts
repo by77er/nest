@@ -6,6 +6,7 @@
 
 import { verifyAccessJwt } from "./access";
 import { handleApi } from "./api";
+import { assetCacheControl } from "./asset-cache";
 import { conditional, timed } from "./conditional";
 import { withSecurityHeaders } from "./csp";
 import { directory, type Env, project, review } from "./env";
@@ -127,6 +128,10 @@ export default {
     }
     const asset = await env.ASSETS.fetch(request);
     // `vite build` replaces the flag with `false`: the deployed Worker always sends them.
-    return import.meta.env.DEV ? asset : withSecurityHeaders(asset);
+    if (import.meta.env.DEV) return asset;
+    const out = withSecurityHeaders(asset);
+    // Hashed build files kept for a year, the rest revalidated (src/asset-cache.ts).
+    out.headers.set("cache-control", assetCacheControl(path, out.status, out.headers.get("content-type")));
+    return out;
   },
 } satisfies ExportedHandler<Env>;

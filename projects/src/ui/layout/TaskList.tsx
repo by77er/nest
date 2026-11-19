@@ -3,13 +3,11 @@
 // A row is one line from `sm` up, in fixed columns (grip, state glyph, id, title, markers, worker, PR,
 // updated); on a phone it wraps to two lines, the title first and its metadata below. The whole row
 // opens the task (its title link's ::after covers it); its own controls sit above that link. A row drags
-// by its grip, by pointer or keyboard (dnd-kit), within its group only.
+// by its grip, by pointer or keyboard (dnd-kit), within its group only: TaskRow.tsx, its own module so that
+// dnd-kit loads with the board, not with every page.
 
-import { useSortable } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
-import { ActionIcon, UnstyledButton } from "@mantine/core";
-import { useReducedMotion } from "@mantine/hooks";
-import { IconChevronRight, IconGripVertical } from "@tabler/icons-react";
+import { UnstyledButton } from "@mantine/core";
+import { IconChevronRight } from "@tabler/icons-react";
 import { type AnchorHTMLAttributes, forwardRef, type ReactNode, useId } from "react";
 import { icon } from "../theme";
 import classes from "./TaskList.module.css";
@@ -71,58 +69,6 @@ export const TaskRowTitleAnchor = forwardRef<HTMLAnchorElement, AnchorHTMLAttrib
     </a>
   );
 });
-
-export interface TaskRowProps {
-  id: string;
-  /** The task's title, the row's accessible name. */
-  label: string;
-  /** Whether it can be dragged (more than one row in its group). */
-  sortable: boolean;
-  glyph: ReactNode;
-  /** Its short id, mono. */
-  code: ReactNode;
-  title: ReactNode;
-  /** Its markers (waiting on, blocked, needs input, tainted, a failed start). */
-  markers?: ReactNode;
-  who?: ReactNode;
-  pr?: ReactNode;
-  updated: ReactNode;
-  [k: `data-${string}`]: string | undefined;
-}
-
-/** One task: a row of fixed columns, its grip first. */
-export function TaskRow({ id, label, sortable, glyph, code, title, markers, who, pr, updated, ...data }: TaskRowProps) {
-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id, disabled: !sortable });
-  const reduced = useReducedMotion();
-  return (
-    <article
-      ref={setNodeRef}
-      className={classes.row}
-      aria-label={label}
-      data-ds="task-row"
-      data-dragging={isDragging || undefined}
-      style={{ transform: CSS.Translate.toString(transform), transition: reduced ? undefined : transition }}
-      {...data}
-    >
-      <div className={classes.gripCell}>
-        {sortable && (
-          <ActionIcon ref={setActivatorNodeRef} variant="subtle" color="gray" className={classes.grip} aria-label={`Move ${label}`} data-dragging={isDragging || undefined} {...attributes} {...listeners}>
-            <IconGripVertical size={icon.md} />
-          </ActionIcon>
-        )}
-      </div>
-      <div className={classes.glyphCell}>{glyph}</div>
-      <div className={classes.titleCell}>{title}</div>
-      <div className={classes.meta} data-slot="meta">
-        <div className={classes.code}>{code}</div>
-        <div className={classes.markers}>{markers}</div>
-        <div className={classes.who}>{who}</div>
-        <div className={classes.pr}>{pr}</div>
-        <div className={classes.updated}>{updated}</div>
-      </div>
-    </article>
-  );
-}
 
 /** A group's rows, when it has none to show (collapsed groups show nothing). */
 export function TaskRowsEmpty({ children }: { children: ReactNode }) {
