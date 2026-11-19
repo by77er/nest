@@ -14,7 +14,7 @@ export function renderApp(path: string, api = new FakeApi()) {
   vi.stubGlobal("fetch", api.fetch);
   const queryClient = createQueryClient();
   queryClient.setDefaultOptions({ queries: { ...queryClient.getDefaultOptions().queries, retry: false } });
-  const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [path] }) });
+  const router = createAppRouter({ queryClient, history: createMemoryHistory({ initialEntries: [path] }) });
   const user = userEvent.setup();
   const view = render(<App router={router} queryClient={queryClient} env="test" />);
   return { ...view, api, user, router, queryClient };
