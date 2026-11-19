@@ -20,7 +20,7 @@ def use1 : CellSpec :=
     -- A host's sandboxes are declared no more than its memory less its own reserve: no overcommit.
     -- A working guest does reach its size (its page cache fills it, and nothing takes memory back
     -- from a guest: no balloon), so anything above 100% loses VMs. At 150%, between 2026-11-18 and
-    -- -19, the kernel killed a VMM 13 times on 8 GiB hosts holding two 4 GiB sandboxes, each time
+    -- -19 (22:45 to 05:48 UTC), the kernel killed a VMM 13 times on 8 GiB hosts holding two 4 GiB sandboxes, each time
     -- with both at 3.4 to 4.0 GiB (the hosts' journals, `logs/` in the cell's bucket).
     memoryCommitPct := 100
     -- 14 × 8 GB fits the 118 GB store of every listed instance-store type
@@ -34,10 +34,9 @@ def use1 : CellSpec :=
     -- -04): FleetDO tries on demand cheapest first.
     onDemandPrices := [("c8i-flex.large", 89020), ("c8i.large", 93710), ("m8i.large", 105840), ("c8id.large", 110880),
       ("m8id.large", 130520), ("r8id.large", 166320), ("t3a.medium", 37600), ("t3.medium", 41600)]
-    -- 12 hosts take 24 default sandboxes placed at once on the 8 GiB types and 60 on r8id.large
-    -- (suspended ones move off when room is needed). 4 was sized for r8id.large alone: with none on
-    -- spot (2026-11-18) the cell filled at 8 sandboxes on four 8 GiB hosts, and the rest waited
-    -- unplaced. 24 vCPU, with the brain hosts' 6 under the account's 32 spot vCPUs; its 16 on-demand
+    -- 12 hosts take 12 default sandboxes placed at once on the 8 GiB types and 36 on r8id.large
+    -- (suspended ones move off when room is needed); r8id.large had no spot room on 2026-11-18, so
+    -- 12 is what to expect, 8 on the on-demand fallback. 12 was sized at 150%, for 24. 24 vCPU, with the brain hosts' 6 under the account's 32 spot vCPUs; its 16 on-demand
     -- vCPUs stop the fallback at 8 hosts (Service Quotas, 2026-11-18).
     -- 16 Haiku brains ran on a t3a.medium in the stress test (dev/cloud-checks/stress-2026-10-31.md;
     -- about 105 MB each, CPU peaking near 60%), so 12 leaves room for heavier sessions, and 3 hosts
