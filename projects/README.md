@@ -1005,7 +1005,7 @@ Flows (time: to the flow's content, or each step's summed, as `perf.md` states; 
 | idle-board | – | 0 ms → 260 ms (runs 200% apart) | 640 ms → 851 ms (runs 55% apart) | 1.51 MB → 0.0 KB | – |
 | idle-manager | – | 264 ms → 613 ms (runs 32% apart) | 1078 ms → 1535 ms | 1.53 MB → 3.8 KB | – |
 
-What it shows: #307 and #308 took the polls' bytes to nothing (an idle Board or Manager went from 1.5 MB a minute to `304`s) and a warm load's from 130-280 KB to 20-40 KB, but not the main thread's time: on main, typing in the composer with 200 messages still takes up to ~0.6 s from a key to its paint, a 10 s streaming turn keeps the main thread in long tasks for ~9.5 s of it, each Chat ↔ Trace switch on the Manager page reopens the trace's socket (its 1,000-event backlog again), and every page cold still loads ~520 KB of script and style.
+What it shows: #307 and #308 took the polls' bytes to nothing (an idle Board or Manager went from 1.5 MB a minute to `304`s) and a warm load's from 130-280 KB to 20-40 KB, but not the main thread's time: on main, typing in the composer with 200 messages still takes up to ~0.6 s from a key to its paint, a 10 s streaming turn keeps the main thread in long tasks for ~9.5 s of it, each Chat ↔ Trace switch on the Manager page reopens the trace's socket (its 1,000-event backlog again), and every page cold still loads ~445 KB of script and style and ~90 KB of fonts.
 
 To rerun (the output outside the repo; the "before" built the same way in a `git worktree` of its commit, and measured with `--shape full` if it is older than #308):
 

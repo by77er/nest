@@ -623,7 +623,9 @@ const SCENARIOS = [
   flowScenario("type-composer", `${P}/manager`, MESSAGE, async (ctx) => {
     const box = ctx.page.getByLabel("Message to the manager");
     await box.click();
-    await ctx.page.keyboard.type("Please split the export work into tasks", { delay: 80 });
+    await ctx.page.keyboard.type("Please split the export work into tasks.", { delay: 80 });
+    // The last key's paint lands after it.
+    await ctx.page.waitForTimeout(1000);
     return { typed: 40, messages: await count(ctx.page, MESSAGE) };
   }, { before: async (ctx) => {
     // All 200 messages shown first (three older pages).
