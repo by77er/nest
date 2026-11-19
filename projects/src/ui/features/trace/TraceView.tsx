@@ -4,14 +4,18 @@
 // `… +N lines`), and states, asks and errors as dim one-liners. Older turns come from nest's trace
 // history, loaded as the reader scrolls to the top; only what arrives live fades in. It follows the
 // newest line only while scrolled to the bottom; otherwise "Jump to live" takes it there.
+//
+// Kept cheap as it streams: the turns are grouped from the previous state's (groupTurnsFrom), so a turn
+// that didn't change is the same object, and the turn, item, tool call and event components are memoized:
+// an event appended re-renders its own turn and the log around it, not the turns before.
 
 import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
-import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { exact } from "../../common/time";
 import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn, weight } from "../../layout";
 import {
-  groupTurns, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
+  groupTurnsFrom, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
   type TurnGroup,
 } from "./model";
 import { TraceMarkdown } from "./TraceMarkdown";
@@ -71,7 +75,7 @@ function ToolResult({ r }: { r: AnyEvent }) {
   );
 }
 
-function ToolCall({ item }: { item: ToolItem }) {
+const ToolCall = memo(function ToolCall({ item }: { item: ToolItem }) {
   const [open, setOpen] = useState(false);
   const region = useId();
   const r = item.result;
@@ -105,9 +109,9 @@ function ToolCall({ item }: { item: ToolItem }) {
       {r && <ToolResult r={r} />}
     </Stack>
   );
-}
+});
 
-function EventItem({ ev }: { ev: AnyEvent }) {
+const EventItem = memo(function EventItem({ ev }: { ev: AnyEvent }) {
   switch (ev.type) {
     case "assistant_text":
       return (
@@ -161,7 +165,7 @@ function EventItem({ ev }: { ev: AnyEvent }) {
     default:
       return null; // a type this page doesn't know
   }
-}
+});
 
 const SHOWN = new Set(["assistant_text", "state", "ask", "ask_answered", "error", "rate_limited", "task_exited", "ended"]);
 /** Visible items: an unknown event type renders nothing, so it gets no slot. */
@@ -174,7 +178,12 @@ function tokens(u: unknown): string | null {
   return `${k(x.input_tokens)} in · ${k(x.output_tokens)} out`;
 }
 
-function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
+/** One line of a turn, fading in if it arrived while watching. */
+const Item = memo(function Item({ item, animate }: { item: TraceItem; animate: boolean }) {
+  return <FadeIn animate={animate}>{item.kind === "tool" ? <ToolCall item={item} /> : <EventItem ev={item.event} />}</FadeIn>;
+});
+
+const Turn = memo(function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
   const items = g.items.filter(visible);
   const head = g.items[0];
   const at = g.started?.ts_ms ?? (head ? (head.kind === "tool" ? head.call.ts_ms : head.event.ts_ms) : null);
@@ -193,18 +202,34 @@ function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
         </span>
       )}
       {items.map((i) => (
-        <FadeIn key={i.key} animate={i.seq !== null && i.seq > animateAfter}>
-          {i.kind === "tool" ? <ToolCall item={i} /> : <EventItem ev={i.event} />}
-        </FadeIn>
+        <Item key={i.key} item={i} animate={i.seq !== null && i.seq > animateAfter} />
       ))}
     </Stack>
   );
-}
+});
+
+/**
+ * What a turn's `animateAfter` is: the state's if any of its lines is newer, else one value for all, so a
+ * turn with nothing to fade in doesn't render again when the state's changes (at `live`, at a drop).
+ */
+const fadesIn = (g: TurnGroup, after: number) => {
+  const newest = g.items.at(-1)?.seq;
+  return newest !== undefined && newest !== null && newest > after ? after : Number.POSITIVE_INFINITY;
+};
 
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
 export function TraceLog({ title, state, loadOlder = () => {} }: { title: string; state: TraceState; loadOlder?: () => void }) {
   const { fill, untitled } = useFillColumn();
-  const groups = useMemo(() => groupTurns(state.events, state.older), [state.events, state.older]);
+  // Grouped from the last state's grouping (kept as state, updated while rendering: React's pattern for
+  // information from the previous render): the work is for what came since, and unchanged turns keep their
+  // objects. It needs `state.events` to grow by appending, as the reducer makes it (groupTurnsFrom).
+  const [grouping, setGrouping] = useState(() => groupTurnsFrom(null, state.events, state.older));
+  let current = grouping;
+  if (grouping.events !== state.events || grouping.older !== state.older) {
+    current = groupTurnsFrom(grouping, state.events, state.older);
+    setGrouping(current);
+  }
+  const groups = current.groups;
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
@@ -269,7 +294,9 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
 
   // New events: followed only while at the bottom; otherwise counted for "Jump to live".
   useLayoutEffect(() => {
-    const added = state.events.filter((e) => e.seq > seen.current).length;
+    // Counted from the newest back: the work is for what came, not for all that's held.
+    let added = 0;
+    for (let i = state.events.length - 1; i >= 0 && state.events[i]!.seq > seen.current; i--) added++;
     seen.current = state.last;
     if (!added) return;
     const v = viewport.current;
@@ -286,7 +313,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   };
 
   const status = STATUS[state.status];
-  const agentState = lastState(state.events);
+  const agentState = useMemo(() => lastState(state.events), [state.events]);
   const empty = state.events.length === 0 && state.older.length === 0;
   let top: ReactNode = null;
   if (state.olderState === "loading") {
@@ -363,7 +390,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
             <Stack gap="sm">
               {top}
               {groups.map((g) => (
-                <Turn key={g.key} g={g} animateAfter={state.animateAfter} />
+                <Turn key={g.key} g={g} animateAfter={fadesIn(g, state.animateAfter)} />
               ))}
             </Stack>
           )}

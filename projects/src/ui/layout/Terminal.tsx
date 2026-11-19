@@ -7,7 +7,7 @@
 // button as wide as its row.
 
 import { Box, UnstyledButton } from "@mantine/core";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import classes from "./Terminal.module.css";
 
 /**
@@ -43,6 +43,16 @@ const COLOR: Record<TermTone, string> = {
 };
 
 const WRAP = { whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "normal" } as const;
+/** One style object per tone, made once. */
+const byTone = (make: (t: TermTone) => CSSProperties) => ({ text: make("text"), muted: make("muted"), danger: make("danger"), warning: make("warning"), success: make("success") });
+
+// Style objects made once, not per line (a trace draws thousands of lines): a glyph's by tone, a line's by
+// indent and tone.
+const GLYPH_STYLE = byTone((t) => ({ color: COLOR[t], userSelect: "none", ["--glyph" as string]: COLOR[t] }));
+const lineStyle = (indent: number) =>
+  byTone((t) => ({ display: "grid", gridTemplateColumns: "2ch minmax(0, 1fr)", paddingLeft: `${indent * 2}ch`, color: COLOR[t], width: "100%", textAlign: "left", ...WRAP }));
+const LINE_STYLE = { 0: lineStyle(0), 1: lineStyle(1), 2: lineStyle(2) };
+const TEXT_STYLE: CSSProperties = { minWidth: 0 };
 
 /** The surface; it frames its log (which scrolls inside it). `fill`: the rest of a column with a height. */
 export function Terminal({ children, fill = false, ...data }: { children: ReactNode; fill?: boolean; [k: `data-${string}`]: string | undefined }) {
@@ -71,7 +81,7 @@ export function Glyph({ g, tone = "text" }: { g: string; tone?: TermTone }) {
       data-slot="glyph"
       data-glyph={g}
       className={drawn ? `${classes.glyph} ${drawn}` : undefined}
-      style={{ color: COLOR[tone], userSelect: "none", ["--glyph" as string]: COLOR[tone] }}
+      style={GLYPH_STYLE[tone]}
     >
       {g}
     </span>
@@ -88,11 +98,11 @@ export function TermLine({ glyph, glyphTone = "text", tone = "text", indent = 0,
   onClick?: () => void; expanded?: boolean; controls?: string; label?: string; title?: string;
   [k: `data-${string}`]: string | undefined;
 }) {
-  const style = { display: "grid", gridTemplateColumns: "2ch minmax(0, 1fr)", paddingLeft: `${indent * 2}ch`, color: COLOR[tone], width: "100%", textAlign: "left" as const, ...WRAP };
+  const style = LINE_STYLE[indent][tone];
   const inner = (
     <>
       {glyph ? <Glyph g={glyph} tone={glyphTone} /> : <span aria-hidden />}
-      <span data-slot="text" style={{ minWidth: 0 }}>
+      <span data-slot="text" style={TEXT_STYLE}>
         {children}
       </span>
     </>
