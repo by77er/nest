@@ -302,6 +302,24 @@
   }
 }
 
+/* Rows off screen skip their layout and paint (a long board holds hundreds), keeping their real height
+   meanwhile so the scrollbar never moves: `auto` keeps a row's last rendered size, and before its first
+   the placeholder is its one line (the grip's height, the tallest cell; on touch the touch target's). Only
+   from `sm` up, where every row is one line: on a phone a row's height follows its title's wrapping,
+   which no placeholder can match. Off-screen rows are still found by find-in-page and reached by focus. */
+@media (min-width: 48em) {
+  .row {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto var(--nest-hit);
+  }
+}
+
+@media (min-width: 48em) and (pointer: coarse) {
+  .row {
+    contain-intrinsic-block-size: auto var(--nest-hit-touch);
+  }
+}
+
 .empty {
   padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
   border-top: var(--nest-border);
