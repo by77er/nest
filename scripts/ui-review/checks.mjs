@@ -444,6 +444,16 @@ export async function restoreTouch(page) {
 }
 
 /**
+ * A screen's capture. A full-page one draws the whole page at once, but Chromium doesn't render what
+ * `content-visibility: auto` skips (far from the viewport: a long board's lower rows) for it, so those
+ * boxes would come out empty. While capturing, every element is rendered, as a reader scrolling to it
+ * sees it; the checks before it run on the page as it is.
+ */
+export async function capture(page, path, fullPage) {
+  return page.screenshot({ path, fullPage, ...(fullPage ? { style: "* { content-visibility: visible !important; }" } : {}) });
+}
+
+/**
  * hit-overlap and hit-size over everything a reader can scroll to, not the first viewport only: the
  * page in viewport steps, then each scroller in the topmost layer (the topmost modal's, else the
  * page's), sideways or down (a board's columns, a drawer's body, a table), brought into view and

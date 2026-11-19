@@ -12,7 +12,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { chromium } from "playwright";
-import { measure, restoreTouch, scanHits } from "./checks.mjs";
+import { capture, measure, restoreTouch, scanHits } from "./checks.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
@@ -143,7 +143,7 @@ for (const scheme of schemes) {
         if (state.check) appChecks.add(state.checkName ?? "app");
         for (const d of (await state.check?.(page, { width, scheme })) ?? []) fail(state.checkName ?? "app", shot, d);
         if (app.errorText && (await page.getByText(app.errorText).count())) fail("page-error", shot, `the page shows "${app.errorText}"`);
-        await page.screenshot({ path: join(out, shot.file), fullPage: state.full !== false });
+        await capture(page, join(out, shot.file), state.full !== false);
         // After the screenshot: scrolling can change what's shown (a trace loads older events at its top).
         if (width < 600) {
           // A full-page screenshot ends the touch emulation (Chromium's device metrics are reset with it):
