@@ -16,7 +16,7 @@ export { Measure, Page, PageHeader } from "./Page";
 export { Panel, type PanelTone, TableFrame, Well } from "./Panel";
 export { Section } from "./Section";
 export { Sheet, useFillColumn } from "./Sheet";
-export { StateGlyph, TaskGroup, TaskList, TaskRow, TaskRowTitleAnchor, TaskRowsEmpty } from "./TaskList";
+export { StateGlyph, TaskGroup, TaskList, TaskRowTitleAnchor, TaskRowsEmpty } from "./TaskList";
 export { Prose, Row, Stack } from "./Stack";
 export { RichImage, RichProse, RichTableFrame, SvgFigure, TaskCards, TaskCheck, TaskChipPending, TaskRefCard } from "./Rich";
 export { EmptyState, ErrorState, LoadingState } from "./States";
