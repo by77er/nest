@@ -3,7 +3,7 @@
 
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { type RefObject, useEffect, useRef, useState } from "react";
-import { useAttention, useLocalAttention, useTasks } from "../../api/queries";
+import { useAttention, useLocalAttention, useTasksSelect } from "../../api/queries";
 import { LoadingState, Stack } from "../../layout";
 import { NeedsYou } from "../attention/NeedsYou";
 import { Board } from "../board/Board";
@@ -35,6 +35,9 @@ export function BoardPage() {
   );
 }
 
+/** Whether the board's tasks are read: all this page needs of them (the Board reads the rest). */
+const isRead = () => true;
+
 /**
  * "Needs you" and the board, shown together once both are read, or the board with the asks still coming
  * after COLD_BUDGET_MS. Both are mounted from the start (hidden until then), so their reads start at once
@@ -44,9 +47,8 @@ function BoardAndAsks({ projectId, repo, tasksHeading }: { projectId: string; re
   const attention = useAttention(projectId);
   // The app's own items, read without nest (what "Needs you" lists until the asks are in).
   const local = useLocalAttention(projectId, attention.data === undefined);
-  // Only the first read is waited for here: the Board's own observer polls, and pauses while a row is
-  // dragged (an interval here would keep polling under the dragged row).
-  const tasks = useTasks(projectId, { paused: true });
+  // Only whether the tasks are read: the Board's own observer polls them.
+  const tasks = useTasksSelect(projectId, isRead, { paused: true });
   const [waited, setWaited] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => setWaited(true), COLD_BUDGET_MS);

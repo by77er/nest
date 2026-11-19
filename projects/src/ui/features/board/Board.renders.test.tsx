@@ -48,9 +48,10 @@ function report(step: string, started: number) {
 async function mount(api: FakeApi) {
   const started = performance.now();
   const view = renderApp("/projects/prj_one/board", api);
-  await screen.findByRole("article", { name: "done 214" }, { timeout: 10_000 });
+  // Budgets: 300 rows' first render in jsdom on a loaded machine, past the page's COLD_BUDGET_MS.
+  await screen.findByRole("article", { name: "done 214" }, { timeout: 30_000 });
   // The asks' first read lands too, so later counts start from a settled board.
-  await waitFor(() => expect(api.reads).toContain("/api/projects/prj_one/attention"));
+  await waitFor(() => expect(api.reads).toContain("/api/projects/prj_one/attention"), { timeout: 10_000 });
   await act(() => new Promise((r) => setTimeout(r, 0)));
   report("mount", started);
   return view;
@@ -160,17 +161,20 @@ describe("the board's renders, with 300 tasks", () => {
     expect(rendered()).toEqual({ [asked.id]: 1 });
   }, 60_000);
 
-  it("picking a row up and putting it back renders no row of another group, and the board's poll pauses meanwhile", async () => {
+  it("picking a row up and putting it back renders no row of another group, and nothing polls the tasks meanwhile", async () => {
     const api = new FakeApi();
     api.tasks = board();
+    // A manager's question in "Needs you" naming a task: its chip reads the board's tasks too.
+    api.asks = [ask({ role: "manager", agent: "agt_mgr", question: `Should ${"task:" + api.tasks[3]!.id} wait?` })];
     const view = await mount(api);
+    await waitFor(() => expect(document.querySelector(`[data-ds=task-chip][data-task-ref="${api.tasks[3]!.id}"]`)).not.toBeNull(), { timeout: 10_000 });
     const grip = screen.getByRole("button", { name: "Move ready 0" });
     reset();
     const started = performance.now();
     act(() => grip.focus());
     await view.user.keyboard("[Space]");
     await waitFor(() => expect(grip).toHaveAttribute("data-dragging"));
-    // While dragging, the board doesn't poll: no read of its tasks for longer than its 5 s interval.
+    // While dragging, nothing polls the tasks (the Board, the page, the chip): no read for longer than the 5 s board poll.
     const reads = api.reads.filter((r) => r === "/api/projects/prj_one/tasks").length;
     await act(() => new Promise((r) => setTimeout(r, 5_500)));
     expect(api.reads.filter((r) => r === "/api/projects/prj_one/tasks").length).toBe(reads);

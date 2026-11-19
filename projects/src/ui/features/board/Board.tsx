@@ -12,8 +12,8 @@ import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrate
 import { Button, Modal, Switch } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconLayoutList, IconPlus } from "@tabler/icons-react";
-import { lazy, memo, Suspense, useCallback, useMemo, useRef, useState } from "react";
-import { useAsks, useReorderTask, useTasks } from "../../api/queries";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { setBoardDragging, useAsks, useReorderTask, useTasks } from "../../api/queries";
 import type { TaskSummary } from "../../api/types";
 import { EmptyState, ErrorState, icon, LoadingState, Panel, Section, TaskGroup, TaskList, Toolbar } from "../../layout";
 import { CANCELLED_COLUMN, type Column, COLUMNS } from "../../status";
@@ -147,6 +147,12 @@ export function Board({ projectId, repo, headingRef }: { projectId: string; repo
       return next;
     }), [projectId]);
   const onMove = useCallback((task: string, ord: number) => reorder({ task, ord }), [reorder]);
+  // While a row is dragged, nothing polls the project's tasks (every observer reads this).
+  const onDragging = useCallback((on: boolean) => {
+    setDragging(on);
+    setBoardDragging(projectId, on);
+  }, [projectId]);
+  useEffect(() => () => setBoardDragging(projectId, false), [projectId]);
 
   return (
     <Section
@@ -183,7 +189,7 @@ export function Board({ projectId, repo, headingRef }: { projectId: string; repo
               repo={repo}
               pendingAsks={pendingAsks}
               onMove={onMove}
-              onDragging={setDragging}
+              onDragging={onDragging}
             />
           ))}
         </TaskList>
