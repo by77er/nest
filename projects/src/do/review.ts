@@ -318,6 +318,11 @@ export class ReviewDO extends DurableObject<Env> {
     return this.setting("untrusted_reviews") === "review" ? "review" : "hold";
   }
 
+  /** `maxConcurrent` and `untrustedPolicy` together: the project's settings show both, read in one call. */
+  async reviewSettings(): Promise<{ max_concurrent_reviews: number | null; untrusted_reviews: UntrustedPolicy }> {
+    return { max_concurrent_reviews: this.cap(), untrusted_reviews: this.policy() };
+  }
+
   async setUntrustedPolicy(p: UntrustedPolicy): Promise<UntrustedPolicy> {
     this.setSetting("untrusted_reviews", p === "review" ? "review" : null);
     return this.policy();
@@ -531,6 +536,11 @@ export class ReviewDO extends DurableObject<Env> {
   async skipped(): Promise<{ count: number; at_ms: number | null }> {
     const r = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(skipped_ms) AS at FROM prs WHERE skipped_ms IS NOT NULL AND open = 1").one();
     return { count: r.n, at_ms: r.at };
+  }
+
+  /** `held` and `skipped` together: this project's reviews in "Needs you", read in one call. */
+  async needsYou(): Promise<{ held: Job[]; skipped: { count: number; at_ms: number | null } }> {
+    return { held: await this.held(), skipped: await this.skipped() };
   }
 
   /**

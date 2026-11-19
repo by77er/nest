@@ -259,3 +259,18 @@ describe("the polled read routes wait on fewer round trips in a row", () => {
     expect(r.depth, r.trips.join(", ")).toBe(2);
   });
 });
+
+describe("the project's other pages' reads wait on fewer round trips in a row", () => {
+  // Before: settings 5 (getProject, getSettings, binding, maxConcurrent, untrustedPolicy), secrets 5 (getProject,
+  // then four together, then nest's secrets, workflowWorkers, workflowsRefused), network 3 (getProject, network,
+  // then the grant and the manager's sandbox together; its sandbox's policy after, when it has one), Needs you's
+  // local items 4 (getProject, localAttention, held, skipped).
+  it("settings, secrets, network and Needs you's local items: 2 each", async () => {
+    const p = await seeded();
+    const t = traced();
+    for (const page of ["settings", "secrets", "network", "attention?local=1"]) {
+      const r = await t.ask(`/api/projects/${p.id}/${page}`);
+      expect(r.depth, `${page}: ${r.trips.join(", ")}`).toBe(2);
+    }
+  });
+});
