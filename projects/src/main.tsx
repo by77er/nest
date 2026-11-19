@@ -13,8 +13,11 @@ import { App } from "./ui/App";
 import { createQueryClient } from "./ui/api/queryClient";
 import { createAppRouter } from "./ui/router";
 
+// One query cache for the pages and the routes' loaders (which start each page's reads).
+const queryClient = createQueryClient();
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App router={createAppRouter()} queryClient={createQueryClient()} />
+    <App router={createAppRouter({ queryClient })} queryClient={queryClient} />
   </StrictMode>,
 );
