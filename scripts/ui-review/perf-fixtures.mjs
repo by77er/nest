@@ -187,7 +187,7 @@ function makeProject(id, name, seed, now, big, demo) {
   const byId = Object.fromEntries(tasks.map((t) => [t.id, t]));
   // A task's history, as the drawer reads it: created, the spec written (its copy), assignments, PRs, notes.
   const history = (t) => {
-    const h = r;
+    const h = rng(seed * 10_000 + Number(t.id.slice(-4)));
     const rows = [{ at_ms: t.created_ms, actor: "agt_mgr7k2", action: "created", detail: JSON.stringify({ title: t.title, body: t.body }), tainted: false }];
     if (t.spec) for (let k = 0; k < 3; k++) rows.push({ at_ms: t.created_ms + (k + 1) * 60_000, actor: "agt_mgr7k2", action: k ? "body" : "spec", detail: JSON.stringify(k ? { body: t.body } : t.spec), tainted: false });
     for (let k = 0; k < 12; k++) rows.push({ at_ms: t.created_ms + (k + 5) * 600_000, actor: h.pick(["agt_mgr7k2", "app:auto-assign", "owner", t.assignee ?? "app"]), action: h.pick(["assign", "progress", "state", "note"]), detail: JSON.stringify({ text: sentence(h, h.int(8, 30)) }), tainted: false });
