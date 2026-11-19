@@ -8,7 +8,7 @@ import { Anchor, Badge, Text, Tooltip } from "@mantine/core";
 import {
   IconAlertCircle, IconAlertTriangle, IconCircle, IconCircleCheck, IconCircleDashed, IconCircleDot, IconCircleHalf, IconCircleHalf2, IconCircleX, IconHandStop, IconMessageQuestion,
 } from "@tabler/icons-react";
-import type { ComponentType } from "react";
+import { type ComponentType, memo, useSyncExternalStore } from "react";
 import type { TaskState, TaskSummary } from "../../api/types";
 import { TaskRowTitleLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
@@ -54,6 +54,44 @@ export const shortId = (id: string) => {
   return bare.length > 6 ? bare.slice(-6) : bare;
 };
 
+// One clock for every row's "updated": a row is rendered only when its task changes, so its relative
+// time ("3 minutes ago") follows this clock instead, as it followed the board's 5 s poll before. Each
+// row's time re-renders only when its own text changes; the clock stops while no row shows one, and
+// skips its tick while the tab is hidden (as the poll did).
+const TICK_MS = 5_000;
+const ticks = new Set<() => void>();
+let tickAt = 0;
+let ticker: ReturnType<typeof setInterval> | undefined;
+function onTick(listener: () => void) {
+  ticks.add(listener);
+  if (ticker === undefined) {
+    tickAt = Date.now();
+    ticker = setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      tickAt = Date.now();
+      for (const l of ticks) l();
+    }, TICK_MS);
+  }
+  return () => {
+    ticks.delete(listener);
+    if (ticks.size === 0 && ticker !== undefined) {
+      clearInterval(ticker);
+      ticker = undefined;
+    }
+  };
+}
+const clockNow = () => (ticker === undefined ? Date.now() : tickAt);
+
+/** When a task changed, kept current by the shared clock. */
+function ChangedWhen({ ms }: { ms: number }) {
+  const text = useSyncExternalStore(onTick, () => changedWhen(ms, clockNow()));
+  return (
+    <Text component="time" inherit c="dimmed" dateTime={new Date(ms).toISOString()} title={`Updated ${exact(ms)}`}>
+      {text}
+    </Text>
+  );
+}
+
 export interface TaskListRowProps {
   task: TaskSummary;
   projectId: string;
@@ -65,7 +103,11 @@ export interface TaskListRowProps {
   group?: string;
 }
 
-export function TaskListRow({ task, projectId, repo, pendingAsks, sortable, group }: TaskListRowProps) {
+/**
+ * Memoized: a row renders when its task (the same object while it's unchanged: the query's structural
+ * sharing), its asks, its group or whether it can move change; never for another task's change.
+ */
+export const TaskListRow = memo(function TaskListRow({ task, projectId, repo, pendingAsks, sortable, group }: TaskListRowProps) {
   const first = task.prs[0] ?? (task.pr !== null ? { number: task.pr, state: "open" as const } : null);
   return (
     <TaskRow
@@ -136,11 +178,7 @@ export function TaskListRow({ task, projectId, repo, pendingAsks, sortable, grou
           </Text>
         ) : undefined
       }
-      updated={
-        <Text component="time" inherit c="dimmed" dateTime={new Date(task.updated_ms).toISOString()} title={`Updated ${exact(task.updated_ms)}`}>
-          {changedWhen(task.updated_ms)}
-        </Text>
-      }
+      updated={<ChangedWhen ms={task.updated_ms} />}
     />
   );
-}
+});
