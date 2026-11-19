@@ -208,6 +208,15 @@ const Turn = memo(function Turn({ g, animateAfter }: { g: TurnGroup; animateAfte
   );
 });
 
+/**
+ * What a turn's `animateAfter` is: the state's if any of its lines is newer, else one value for all, so a
+ * turn with nothing to fade in doesn't render again when the state's changes (at `live`, at a drop).
+ */
+const fadesIn = (g: TurnGroup, after: number) => {
+  const newest = g.items.at(-1)?.seq;
+  return newest !== undefined && newest !== null && newest > after ? after : Number.POSITIVE_INFINITY;
+};
+
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
 export function TraceLog({ title, state, loadOlder = () => {} }: { title: string; state: TraceState; loadOlder?: () => void }) {
   const { fill, untitled } = useFillColumn();
@@ -374,7 +383,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
             <Stack gap="sm">
               {top}
               {groups.map((g) => (
-                <Turn key={g.key} g={g} animateAfter={state.animateAfter} />
+                <Turn key={g.key} g={g} animateAfter={fadesIn(g, state.animateAfter)} />
               ))}
             </Stack>
           )}

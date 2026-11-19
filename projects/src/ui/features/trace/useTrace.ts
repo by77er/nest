@@ -127,13 +127,15 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
           failures = 0;
           live = true;
           flush();
-        } else if (data.type === "ended") flush();
-        else if (live && queue.length === 1 && drawn.current) flush();
-        else
-          frame ??= nextFrame(() => {
+        } else if (data.type === "ended" || (live && queue.length === 1 && drawn.current)) {
+          // The end; or live, nothing else waiting, and the view drawn: at once.
+          flush();
+        } else if (!frame) {
+          frame = nextFrame(() => {
             frame = null;
             flush();
           });
+        }
       });
       sock.addEventListener("close", () => {
         clearInterval(ping);
