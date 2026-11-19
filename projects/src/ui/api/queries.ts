@@ -1,7 +1,7 @@
 // Every query and mutation the page makes, with its cache key. Live views (the board, the chat, the
 // asks) poll while the tab is visible; TanStack Query stops polling a hidden tab by default.
 
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type FetchQueryOptions, keepPreviousData, type QueryClient, type QueryKey, queryOptions, type UseQueryOptions, type UseQueryResult, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api } from "./client";
 import type { CreateReviewerBody, CreateRoutineBody, PutSecretBody, ReviewerPreset, UpdateReviewerBody, UpdateRoutineBody } from "./types";
 import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, TaskSummary, UpdateTaskBody, Waiting } from "./types";
@@ -38,21 +38,83 @@ export const POLL = { board: 5_000, chat: 3_000, unread: 10_000, asks: 5_000, pr
 
 // --- reads ------------------------------------------------------------------------------------------
 
-/** The projects, with each one's "needs you" count (the sidebar's badges): polled like a project. */
-export const useProjects = () => useQuery({ queryKey: keys.projects, queryFn: api.projects, refetchInterval: POLL.project });
+/**
+ * Each page read's options (its key, its fetch and its poll), shared by its hook and by the routes' loaders
+ * (router.tsx), so a route's prefetch and the hook its page mounts are one cache entry and one request.
+ */
+export const reads = {
+  projects: () => queryOptions({ queryKey: keys.projects, queryFn: api.projects, refetchInterval: POLL.project }),
+  project: (id: string) => queryOptions({ queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project }),
+  tasks: (id: string) => queryOptions({ queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: POLL.board }),
+  task: (id: string, task: string) => queryOptions({ queryKey: keys.task(id, task), queryFn: () => api.task(id, task), refetchInterval: POLL.task }),
+  chat: (id: string) => queryOptions({ queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: POLL.chat }),
+  attention: (id: string) => queryOptions({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks }),
+  manager: (id: string) => queryOptions({ queryKey: keys.manager(id), queryFn: () => api.manager(id), refetchInterval: POLL.manager }),
+  waits: (id: string) => queryOptions({ queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager }),
+  reviews: (id: string) => queryOptions({ queryKey: keys.reviews(id), queryFn: () => api.reviews(id), refetchInterval: POLL.reviews }),
+  reviewers: (id: string) => queryOptions({ queryKey: keys.reviewers(id), queryFn: () => api.reviewers(id), refetchInterval: POLL.reviews }),
+  network: (id: string) =>
+    queryOptions({ queryKey: ["projects", id, "network"], queryFn: () => api.network(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.manager) }),
+  secrets: (id: string) =>
+    queryOptions({ queryKey: keys.secrets(id), queryFn: () => api.secrets(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.reviews) }),
+  issues: (id: string) => queryOptions({ queryKey: keys.issues(id), queryFn: () => api.issues(id), refetchInterval: POLL.asks }),
+  routines: (id: string) => queryOptions({ queryKey: keys.routines(id), queryFn: () => api.routines(id), refetchInterval: POLL.routines }),
+  runs: (id: string) => queryOptions({ queryKey: keys.runs(id), queryFn: () => api.routineRuns(id), refetchInterval: POLL.routines }),
+  proposals: (id: string) => queryOptions({ queryKey: keys.proposals(id), queryFn: () => api.proposals(id), refetchInterval: POLL.routines }),
+  memory: (id: string) => queryOptions({ queryKey: keys.memory(id), queryFn: () => api.memory(id), refetchInterval: POLL.routines }),
+  syncState: () => queryOptions({ queryKey: keys.syncState, queryFn: api.syncState }),
+  bindings: () => queryOptions({ queryKey: keys.bindings, queryFn: api.bindings }),
+};
 
-export const useProject = (id: string) => useQuery({ queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project });
+/** One page read's options, as `reads` makes them. */
+export type Read = ReturnType<(typeof reads)[keyof typeof reads]>;
+
+/** How long a route's prefetched answer stands as its page's first read: a slow chunk, a click a moment after a hover. */
+export const PREFETCH_FIRST_READ_MS = 5_000;
+
+/** What each read's latest prefetch left (its answer's time, or its failure's), for the hook that mounts on it. */
+const warmed = new WeakMap<object, { data: number } | { error: number }>();
+
+/**
+ * Start a read a route is about to show, without waiting for it (README.md#the-ui). A prefetch makes no
+ * observer, so it never polls; it asks only when the cache has nothing fresher than the read's `staleTime`,
+ * and leaves alone a read a mounted view already polls (at that view's own pace).
+ */
+export function warm(qc: QueryClient, o: Read): void {
+  const cache = qc.getQueryCache();
+  if (cache.find({ queryKey: o.queryKey, exact: true })?.isActive()) return;
+  // Each of `reads`' options is a valid fetch's (the union only loses which data goes with which key).
+  void qc.prefetchQuery(o as FetchQueryOptions).then(() => {
+    const q = cache.find({ queryKey: o.queryKey, exact: true });
+    if (q) warmed.set(q, q.state.status === "error" ? { error: q.state.errorUpdatedAt } : { data: q.state.dataUpdatedAt });
+  });
+}
+
+/**
+ * `useQuery` for a page read. A hook mounting on its route's prefetch takes it as its own first read: an
+ * answer under PREFETCH_FIRST_READ_MS old isn't asked for again, and a failure (the retry rule already
+ * ran) is shown as if the hook had asked, with no second request. Otherwise the usual rules apply.
+ */
+function useRead<T, D, K extends QueryKey>(o: UseQueryOptions<T, Error, D, K>): UseQueryResult<D, Error> {
+  const q = useQueryClient().getQueryCache().find({ queryKey: o.queryKey, exact: true });
+  const w = q && warmed.get(q);
+  const first = !!w && ("error" in w ? q.state.status === "error" && q.state.errorUpdatedAt === w.error : q.state.dataUpdatedAt === w.data && Date.now() - w.data < PREFETCH_FIRST_READ_MS);
+  return useQuery(first ? { ...o, refetchOnMount: false, retryOnMount: false } : o);
+}
+
+/** The projects, with each one's "needs you" count (the sidebar's badges): polled like a project. */
+export const useProjects = () => useRead(reads.projects());
+
+export const useProject = (id: string) => useRead(reads.project(id));
 
 /** The board: its tasks as summaries; `paused` while a card is being dragged, so a poll can't move cards under the pointer. */
 export const useTasks = (id: string, o: { paused?: boolean } = {}) =>
-  useQuery({ queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: o.paused ? false : POLL.board });
+  useRead({ ...reads.tasks(id), refetchInterval: o.paused ? false : POLL.board });
 
 export const useTask = (id: string, task: string | undefined) =>
-  useQuery({
-    queryKey: keys.task(id, task ?? ""),
-    queryFn: () => api.task(id, task!),
+  useRead({
+    ...reads.task(id, task ?? ""),
     enabled: task !== undefined,
-    refetchInterval: POLL.task,
     placeholderData: keepPreviousData,
   });
 
@@ -61,7 +123,7 @@ export const useTask = (id: string, task: string | undefined) =>
  * this observer's own interval (each observer polls on its own, so the fastest one sets the pace).
  */
 export const useChat = (id: string, enabled = true, every: number | false = POLL.chat) =>
-  useQuery({ queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: every, enabled: enabled && id !== "" });
+  useRead({ ...reads.chat(id), refetchInterval: every, enabled: enabled && id !== "" });
 
 /** Stop the manager's current turn (Stop, while one runs). */
 export function useInterruptManager(id: string) {
@@ -70,12 +132,12 @@ export function useInterruptManager(id: string) {
 
 /** The project's open asks: "Needs you"'s, from the same read (one nest read serves both). */
 export const useAsks = (id: string) =>
-  useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks, select: (xs: Attention[]) => xs.filter((x): x is Extract<Attention, { kind: "ask" }> => x.kind === "ask") });
+  useRead({ ...reads.attention(id), select: (xs: Attention[]) => xs.filter((x): x is Extract<Attention, { kind: "ask" }> => x.kind === "ask") });
 
 /** The manager's status for its page (nest's agent record, read through the app). */
-export const useManager = (id: string) => useQuery({ queryKey: keys.manager(id), queryFn: () => api.manager(id), refetchInterval: POLL.manager });
+export const useManager = (id: string) => useRead(reads.manager(id));
 
-export const useReviews = (id: string) => useQuery({ queryKey: keys.reviews(id), queryFn: () => api.reviews(id), refetchInterval: POLL.reviews });
+export const useReviews = (id: string) => useRead(reads.reviews(id));
 
 /** Attach the repo again after a failure: the manager starts once it's attached. */
 export function useRetryAttach(id: string) {
@@ -101,7 +163,7 @@ export function useRestartManager(id: string) {
 
 /** What waits on the owner: open asks and blocked tasks, oldest first (README.md#blocked). */
 /** The manager's pending waits (and the last few that ended): polled, since their deadlines run down. */
-export const useWaits = (id: string) => useQuery({ queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager });
+export const useWaits = (id: string) => useRead(reads.waits(id));
 
 /** The Network page: polled while changes reach the live agents. */
 /** A stop nest refused, tried again or dismissed by the owner (README.md#outboxes): the Network page and the board move. */
@@ -116,8 +178,7 @@ function useStopWrite<R>(id: string, fn: (agent: string) => Promise<R>, failure:
 export const useRetryStop = (id: string) => useStopWrite(id, (agent: string) => api.retryStop(id, agent), "The stop wasn't tried again");
 export const useDismissStop = (id: string) => useStopWrite(id, (agent: string) => api.dismissStop(id, agent), "The stop wasn't dismissed");
 
-export const useNetwork = (id: string) =>
-  useQuery({ queryKey: ["projects", id, "network"], queryFn: () => api.network(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.manager) });
+export const useNetwork = (id: string) => useRead(reads.network(id));
 
 export function useSetNetwork(id: string) {
   const qc = useQueryClient();
@@ -133,7 +194,7 @@ export function useSetNetwork(id: string) {
   });
 }
 
-export const useAttention = (id: string) => useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks });
+export const useAttention = (id: string) => useRead(reads.attention(id));
 
 /**
  * What "Needs you" can say, from the full read and (until it first arrives) the app's own items:
@@ -197,8 +258,7 @@ export const useAddDependency = (id: string) => useRelationWrite(id, (v: { task:
 export const useRemoveDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocker: string }) => api.removeDependency(id, v.task, v.blocker), "The dependency wasn't removed");
 
 /** The Secrets page: polled faster while a change reaches the live agents. */
-export const useSecrets = (id: string) =>
-  useQuery({ queryKey: keys.secrets(id), queryFn: () => api.secrets(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.reviews) });
+export const useSecrets = (id: string) => useRead(reads.secrets(id));
 
 /** Save a secret's settings, and its value when one is given (straight to nest; never kept by the page). */
 export function usePutSecret(id: string) {
@@ -248,7 +308,7 @@ export const useDismissReview = (id: string) => useHeldReview(id, (pr, sha) => a
 // --- the project's reviewers (README.md#reviewers) ---------------------------------------------------------
 
 /** Polled with the reviews, so a reviewer the manager adds or changes shows without a reload. */
-export const useReviewers = (id: string) => useQuery({ queryKey: keys.reviewers(id), queryFn: () => api.reviewers(id), refetchInterval: POLL.reviews });
+export const useReviewers = (id: string) => useRead(reads.reviewers(id));
 
 /** A write to reviewers: the list read again after it. `failure` null: the form shows its error itself. */
 function useReviewerWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: string | null) {
@@ -304,7 +364,7 @@ export function useSecretRequestDone(id: string) {
 // --- triage (README.md#triage) ----------------------------------------------------------------------
 
 /** The repo's issues waiting for triage, polled as "Needs you" is. */
-export const useIssues = (id: string) => useQuery({ queryKey: keys.issues(id), queryFn: () => api.issues(id), refetchInterval: POLL.asks });
+export const useIssues = (id: string) => useRead(reads.issues(id));
 
 /** A triage write: the queue, the board and "Needs you" (its count) all move. */
 function useTriageWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: string, inline = false) {
@@ -326,7 +386,7 @@ export const useAcceptIssue = (id: string) =>
 export const useDeclineIssue = (id: string) => useTriageWrite(id, (v: { n: number; reason: string }) => api.declineIssue(id, v.n, v.reason ? { reason: v.reason } : {}), "The issue wasn't declined");
 export const useImportIssues = (id: string) => useTriageWrite(id, () => api.importIssues(id), "The open issues weren't imported");
 
-export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
+export const useSyncState = () => useRead(reads.syncState());
 
 /** The repos a new project may be attached to (the App's installations'), read when the form opens. */
 export const useAttachableRepos = () => useQuery({ queryKey: keys.attachableRepos, queryFn: api.attachableRepos });
@@ -518,7 +578,7 @@ export function useSync() {
   });
 }
 
-export const useBindings = () => useQuery({ queryKey: keys.bindings, queryFn: api.bindings });
+export const useBindings = () => useRead(reads.bindings());
 
 /** The operator's re-read of a project's repo binding: the bindings, and the projects (a rename) move. */
 export function useRereadBinding() {
@@ -533,10 +593,10 @@ export function useRereadBinding() {
 
 // --- routines and memory (README.md#routines) ------------------------------------------------------------
 
-export const useRoutines = (id: string) => useQuery({ queryKey: keys.routines(id), queryFn: () => api.routines(id), refetchInterval: POLL.routines });
-export const useRoutineRuns = (id: string) => useQuery({ queryKey: keys.runs(id), queryFn: () => api.routineRuns(id), refetchInterval: POLL.routines });
-export const useProposals = (id: string) => useQuery({ queryKey: keys.proposals(id), queryFn: () => api.proposals(id), refetchInterval: POLL.routines });
-export const useMemory = (id: string) => useQuery({ queryKey: keys.memory(id), queryFn: () => api.memory(id), refetchInterval: POLL.routines });
+export const useRoutines = (id: string) => useRead(reads.routines(id));
+export const useRoutineRuns = (id: string) => useRead(reads.runs(id));
+export const useProposals = (id: string) => useRead(reads.proposals(id));
+export const useMemory = (id: string) => useRead(reads.memory(id));
 
 /** A write to routines: the routines and their runs read again after it. */
 function useRoutineWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: string | null) {

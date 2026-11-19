@@ -4,8 +4,6 @@ import "@fontsource-variable/inter";
 import "@fontsource-variable/jetbrains-mono";
 import "@mantine/core/styles.css";
 import "@mantine/notifications/styles.css";
-// KaTeX's own CSS and fonts, from the package (no CDN): the manager's math.
-import "katex/dist/katex.min.css";
 import "./ui/layout/global.css";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -13,8 +11,11 @@ import { App } from "./ui/App";
 import { createQueryClient } from "./ui/api/queryClient";
 import { createAppRouter } from "./ui/router";
 
+// One query cache for the pages and the routes' loaders (which start each page's reads).
+const queryClient = createQueryClient();
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App router={createAppRouter()} queryClient={createQueryClient()} />
+    <App router={createAppRouter({ queryClient })} queryClient={queryClient} />
   </StrictMode>,
 );

@@ -608,3 +608,42 @@ describe("tasks and their PRs", () => {
     expect((await task(p, w.task)).state).toBe("in_progress");
   });
 });
+
+describe("the reads the project's pages ask for in one call", () => {
+  it("needsYou: the held jobs, oldest first, and the open PRs' heads that got no job (how many, since when)", async () => {
+    const p = await newProject();
+    await runInDurableObject(reviews(p), async (_o, state) => {
+      const sql = state.storage.sql;
+      const job = (pr: number, s: string, st: string, at: number) => sql.exec(
+        "INSERT INTO jobs (pr, sha, state, title, base, author, author_id, fork, needs_approval, next_ms, created_ms, updated_ms) VALUES (?, ?, ?, 't', 'main', 'a', 1, 1, 1, NULL, ?, ?)",
+        pr, s, st, at, at,
+      );
+      job(8, sha(), "held", 2000);
+      job(7, sha(), "held", 1000);
+      job(6, sha(), "queued", 500);
+      const pr = (n: number, open: number, skipped: number | null) => sql.exec(
+        "INSERT INTO prs (pr, sha, base, title, updated_at, open, author, author_id, fork, skipped_ms) VALUES (?, ?, 'main', 't', '2026-01-01T00:00:00Z', ?, 'a', 1, 1, ?)",
+        n, sha(), open, skipped,
+      );
+      pr(20, 1, 1800);
+      pr(21, 1, 1700);
+      pr(22, 0, 100); // closed: not counted
+      pr(23, 1, null);
+    });
+    const r = await reviews(p).needsYou();
+    expect(r.held.map((j) => [j.pr, j.state, j.created_ms])).toEqual([[7, "held", 1000], [8, "held", 2000]]);
+    expect(r.skipped).toEqual({ count: 2, at_ms: 1700 });
+    expect(r).toEqual({ held: await reviews(p).held(), skipped: await reviews(p).skipped() });
+    expect(await reviews(await newProject()).needsYou()).toEqual({ held: [], skipped: { count: 0, at_ms: null } });
+  });
+
+  it("reviewSettings: the cap and the untrusted policy as set, defaults none and hold", async () => {
+    const p = await newProject();
+    expect(await reviews(p).reviewSettings()).toEqual({ max_concurrent_reviews: null, untrusted_reviews: "hold" });
+    await reviews(p).setMaxConcurrent(2);
+    await reviews(p).setUntrustedPolicy("review");
+    expect(await reviews(p).reviewSettings()).toEqual({ max_concurrent_reviews: 2, untrusted_reviews: "review" });
+    const s = (await api(token, "GET", `/api/projects/${p.id}/settings`)).body;
+    expect([s.max_concurrent_reviews, s.untrusted_reviews]).toEqual([2, "review"]);
+  });
+});

@@ -12,7 +12,9 @@ import type { ComponentType } from "react";
 import type { TaskState, TaskSummary } from "../../api/types";
 import { TaskRowTitleLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
-import { icon, StateGlyph, TaskRow, TriggerBadge } from "../../layout";
+import { icon, StateGlyph, TriggerBadge } from "../../layout";
+// Not from the index: its module brings dnd-kit, which only the board loads.
+import { TaskRow } from "../../layout/TaskRow";
 import { STATE_COLOR, STATE_LABEL } from "../../status";
 import { WaitingBadge } from "./WaitingBadge";
 

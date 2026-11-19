@@ -7,21 +7,21 @@
 // when you're there, offers the way back down when you're not, and loads older messages as you scroll up
 // without losing your place.
 
-import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
-import { useMediaQuery, useReducedMotion } from "@mantine/hooks";
-import { IconAlertTriangle, IconArrowDown, IconArrowUp, IconCalendarEvent, IconCopy, IconDots, IconHourglass, IconListCheck, IconMessage, IconPlayerStop, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
-import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { human } from "../../../waits";
+import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Tooltip, VisuallyHidden } from "@mantine/core";
+import { useReducedMotion } from "@mantine/hooks";
+import { IconAlertTriangle, IconArrowDown, IconCalendarEvent, IconCopy, IconDots, IconListCheck, IconMessage, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "../../api/client";
-import { useChat, useInterruptManager, useManager, usePostChat, useRestartManager, useRetryChat, useWaits } from "../../api/queries";
+import { useChat, useManager, usePostChat, useRetryChat } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
-  ChatFrame, ChatLog, ChatWelcome, ComposerBox, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine, usePhone,
+  ChatFrame, ChatLog, ChatWelcome, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
-import { finishedTurns, liveTurn, type LogItem, loadDraft, markRead, quote, saveDraft, type Step, stepsBySeq, timeline, type ToolStep } from "./model";
+import { Composer, type ComposerHandle } from "./Composer";
+import { type LogItem, markRead, type Step, stepsBySeq, timeline, type ToolStep, TurnReader } from "./model";
 
 /** A message of the owner's the page couldn't post (its answer never came): kept with its request id, so Retry posts the same message. */
 type Unsent = ChatMessage & { request_id: string };
@@ -50,8 +50,8 @@ function useOpen(): [boolean, () => void] {
   ];
 }
 
-/** One tool call: its row, and behind it each input field and the result. */
-function ToolStepView({ s }: { s: ToolStep }) {
+/** One tool call: its row, and behind it each input field and the result (drawn again only when the call changes). */
+const ToolStepView = memo(function ToolStepView({ s }: { s: ToolStep }) {
   const [open, toggle] = useOpen();
   return (
     <StepRow name={s.name} summary={s.summary} status={s.status} open={open} onToggle={toggle}>
@@ -65,7 +65,7 @@ function ToolStepView({ s }: { s: ToolStep }) {
       </StepField>
     </StepRow>
   );
-}
+});
 
 /**
  * A turn's steps in order: what it said, and each run of tool calls as one tight list. `quiet`: the
@@ -182,6 +182,30 @@ function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (tex
   );
 }
 
+/**
+ * One clock for the log's relative times, read every `AGO_TICK_MS` while any is shown: a message is drawn
+ * again only for its own changes, so its time ("5 minutes ago") follows the clock on its own, and only
+ * when its words change.
+ */
+const AGO_TICK_MS = 15_000;
+const clock = { listeners: new Set<() => void>(), timer: undefined as ReturnType<typeof setInterval> | undefined };
+function onTick(listener: () => void) {
+  clock.listeners.add(listener);
+  clock.timer ??= setInterval(() => {
+    for (const l of clock.listeners) l();
+  }, AGO_TICK_MS);
+  return () => {
+    clock.listeners.delete(listener);
+    if (clock.listeners.size === 0) {
+      clearInterval(clock.timer);
+      clock.timer = undefined;
+    }
+  };
+}
+function Ago({ ms }: { ms: number }) {
+  return <>{useSyncExternalStore(onTick, () => ago(ms))}</>;
+}
+
 /** A message's delivery state (README.md#outboxes): an older row without one reads from `delivered` and `error`. */
 const statusOf = (m: ChatMessage) => m.status ?? (m.delivered ? "done" : m.error ? "failed" : "owed");
 
@@ -232,7 +256,25 @@ export function InFlightMark({ retrying, spin }: { retrying: boolean; spin: bool
   );
 }
 
-function Message({ m, projectId, appear, steps, spin = false, onQuote, onRetry }: { m: ChatMessage; projectId: string; appear: boolean; steps?: Step[]; spin?: boolean; onQuote: (t: string) => void; onRetry: (m: ChatMessage) => void }) {
+interface MessageProps {
+  m: ChatMessage;
+  projectId: string;
+  /** New since the log was last drawn: it fades in, as it mounts. */
+  appear: boolean;
+  steps?: Step[];
+  spin?: boolean;
+  onQuote: (t: string) => void;
+  onRetry: (m: ChatMessage) => void;
+}
+
+const sameMessage = (a: MessageProps, b: MessageProps) => a.m === b.m && a.projectId === b.projectId && a.steps === b.steps && a.spin === b.spin && a.onQuote === b.onQuote && a.onRetry === b.onRetry;
+
+/**
+ * One message, drawn again only when what it shows changes: its data (a poll keeps an unchanged message's
+ * object), its steps, its spinner. Whether it fades in is settled as it mounts (the animation runs then).
+ */
+const Message = memo(function Message({ m, projectId, appear: appearing, steps, spin = false, onQuote, onRetry }: MessageProps) {
+  const [appear] = useState(appearing);
   if (m.sender === "app") {
     return (
       <MessageRow side="note" appear={appear} data-sender="app">
@@ -265,7 +307,7 @@ function Message({ m, projectId, appear, steps, spin = false, onQuote, onRetry }
           {/* The exact time on hover; for the keyboard and touch it heads the message's actions. */}
           <Tooltip label={exact(m.at_ms)} withArrow>
             <Text component="time" dateTime={new Date(m.at_ms).toISOString()} fz="xs" c="dimmed">
-              {ago(m.at_ms)}
+              <Ago ms={m.at_ms} />
             </Text>
           </Tooltip>
           {failed && (
@@ -298,33 +340,67 @@ function Message({ m, projectId, appear, steps, spin = false, onQuote, onRetry }
       )}
     </MessageRow>
   );
+}, sameMessage);
+
+/** A group of messages by one author, drawn again only when one of its messages, or what it shows, changes. */
+interface GroupProps {
+  sender: string;
+  messages: ChatMessage[];
+  projectId: string;
+  /** The steps behind each reply, by seq. */
+  replySteps: Map<number, Step[]>;
+  spinSeq: number | undefined;
+  /** Whether a message is new since the log was last drawn. */
+  isNew: (m: ChatMessage) => boolean;
+  onQuote: (t: string) => void;
+  onRetry: (m: ChatMessage) => void;
+}
+
+const sameGroup = (a: GroupProps, b: GroupProps) =>
+  a.sender === b.sender &&
+  a.projectId === b.projectId &&
+  a.onQuote === b.onQuote &&
+  a.onRetry === b.onRetry &&
+  a.messages.length === b.messages.length &&
+  a.messages.every((m, i) => m === b.messages[i] && a.replySteps.get(m.seq) === b.replySteps.get(m.seq) && (m.seq === a.spinSeq) === (m.seq === b.spinSeq));
+
+const LogGroup = memo(function LogGroup({ sender, messages, projectId, replySteps, spinSeq, isNew, onQuote, onRetry }: GroupProps) {
+  return (
+    <MessageGroup side={sender === "owner" ? "owner" : sender === "manager" ? "manager" : "note"} name={sender === "manager" ? "Manager" : undefined} avatar={MANAGER_MARK}>
+      {messages.map((m) => (
+        <Message key={m.seq} m={m} projectId={projectId} appear={isNew(m)} steps={replySteps.get(m.seq)} spin={m.seq === spinSeq} onQuote={onQuote} onRetry={onRetry} />
+      ))}
+    </MessageGroup>
+  );
+}, sameGroup);
+
+/** A part of the turn in progress, between the messages sent during it: the last has the working line. */
+function StreamPart({ steps, working, projectId }: { steps: Step[]; working: boolean; projectId: string }) {
+  return (
+    <MessageGroup side="manager" name="Manager" avatar={MANAGER_MARK}>
+      <MessageRow side="manager" quiet data-sender="stream">
+        <Stack gap="sm">
+          {steps.length > 0 && <LiveSteps steps={steps} projectId={projectId} />}
+          {working && <WorkingLine>Working…</WorkingLine>}
+        </Stack>
+      </MessageRow>
+    </MessageGroup>
+  );
 }
 
 export function ChatView({ projectId, agent }: { projectId: string; agent: string | null }) {
   const chat = useChat(projectId);
   const post = usePostChat(projectId);
   const retryChat = useRetryChat(projectId);
-  const interrupt = useInterruptManager(projectId);
   const trace = useTrace(agent);
-  const coarse = useMediaQuery("(pointer: coarse)") ?? false;
-  const live = useMemo(() => liveTurn(trace.state.events), [trace.state.events]);
-  const finished = useMemo(() => finishedTurns(trace.state.events), [trace.state.events]);
-  const waits = useWaits(projectId);
-  const replyWait = waits.data?.pending.find((w) => w.kind === "reply");
-  // The time left on the owner's reply counts down by the minute.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!replyWait) return;
-    setNow(Date.now());
-    const t = setInterval(() => setNow(Date.now()), 60_000);
-    return () => clearInterval(t);
-  }, [replyWait?.id]);
+  // Each turn of the trace read once (README.md#the-manager-chat): only the one in progress again as it grows.
+  const reader = useMemo(() => new TurnReader(), [agent]);
+  const { live, finished } = useMemo(() => reader.read(trace.state.events), [reader, trace.state.events]);
 
   const [older, setOlder] = useState<ChatMessage[]>([]);
   const [hasOlder, setHasOlder] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [failed, setFailed] = useState<Unsent[]>([]);
-  const [text, setText] = useState(() => loadDraft(projectId));
   const [atBottom, setAtBottomState] = useState(true);
   // Read by observers between renders; the state drives the pill.
   const atBottomRef = useRef(true);
@@ -338,7 +414,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   // Each of the owner's messages' delivery state as last seen, for announcing its changes.
   const statuses = useRef(new Map<number, string>());
   const log = useRef<HTMLDivElement>(null);
-  const composer = useRef<HTMLTextAreaElement>(null);
+  const composer = useRef<ComposerHandle>(null);
   const seen = useRef<Set<number> | null>(null);
   const anchor = useRef<number | null>(null);
   // Nothing said yet and no turn running: nothing to follow (its welcome is read from the top).
@@ -354,10 +430,19 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     const all = [...bySeq.values()];
     return [...all.filter((m) => m.seq > 0).sort((a, b) => a.seq - b.seq), ...all.filter((m) => m.seq < 0).sort((a, b) => a.at_ms - b.at_ms), ...failed];
   }, [older, latest, failed]);
-  const maxSeq = messages.reduce((n, m) => Math.max(n, m.seq), 0);
-  const lastManagerSeq = messages.reduce((n, m) => (m.sender === "manager" ? Math.max(n, m.seq) : n), 0);
+  const { maxSeq, lastManagerSeq, spinSeq } = useMemo(() => {
+    let max = 0;
+    let manager = 0;
+    let spin: number | undefined;
+    for (const m of messages) {
+      max = Math.max(max, m.seq);
+      if (m.sender === "manager") manager = Math.max(manager, m.seq);
+      // One spinner in the log: the most recent of the owner's messages in flight.
+      if (m.sender === "owner" && (statusOf(m) === "owed" || statusOf(m) === "retrying")) spin = m.seq;
+    }
+    return { maxSeq: max, lastManagerSeq: manager, spinSeq: spin };
+  }, [messages]);
 
-  useEffect(() => saveDraft(projectId, text), [projectId, text]);
   // Reading the chat here reads it: the Manager row's unread dot clears.
   useEffect(() => {
     if (maxSeq > 0) markRead(projectId, maxSeq);
@@ -471,7 +556,12 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     }
   }, [messages, loadingOlder, hasOlder, projectId]);
 
-  const onScroll = () => {
+  // What the handlers below read as it is now, so they keep one identity (the log's rows and the composer
+  // aren't drawn again for a new handler).
+  const now = useRef({ loadOlder, latest, failed, post, retryChat });
+  now.current = { loadOlder, latest, failed, post, retryChat };
+
+  const onScroll = useCallback(() => {
     const el = log.current;
     if (!el) return;
     // Reaching the end rejoins it; only scrolling up leaves it (growth never moves the log).
@@ -481,100 +571,76 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
       setUnseen(0);
     } else if (el.scrollTop < lastTop.current && atBottomRef.current) setAtBottom(false);
     lastTop.current = el.scrollTop;
-    if (el.scrollTop < OLDER_AT && latest.length >= PAGE) void loadOlder();
-  };
+    if (el.scrollTop < OLDER_AT && now.current.latest.length >= PAGE) void now.current.loadOlder();
+  }, [setAtBottom]);
 
-  const send = (t = text.trim(), fromRetry?: Unsent) => {
-    if (!t || post.isPending) return;
-    if (fromRetry) setFailed((f) => f.filter((x) => x !== fromRetry));
-    // The same request id on a retry: if the first post landed and only its answer was lost, it's one message.
-    const request_id = fromRetry?.request_id ?? requestId();
-    post.mutate({ text: t, request_id }, {
-      // Not taken: kept in the log as not delivered, with Retry.
-      onError: (e) => setFailed((f) => [...f, { seq: -Date.now(), at_ms: Date.now(), sender: "owner", text: t, delivered: false, status: "failed", error: e.message, request_id }]),
-    });
-    if (!fromRetry) setText("");
-    setAtBottom(true);
-    requestAnimationFrame(() => {
-      scrollToBottom();
-      composer.current?.focus();
-    });
-  };
+  // Posts a message (the composer's, or one the page never had an answer for, again): false if not taken.
+  const send = useCallback(
+    (t: string, fromRetry?: Unsent): boolean => {
+      const post = now.current.post;
+      if (!t || post.isPending) return false;
+      if (fromRetry) setFailed((f) => f.filter((x) => x !== fromRetry));
+      // The same request id on a retry: if the first post landed and only its answer was lost, it's one message.
+      const request_id = fromRetry?.request_id ?? requestId();
+      post.mutate({ text: t, request_id }, {
+        // Not taken: kept in the log as not delivered, with Retry.
+        onError: (e) => setFailed((f) => [...f, { seq: -Date.now(), at_ms: Date.now(), sender: "owner", text: t, delivered: false, status: "failed", error: e.message, request_id }]),
+      });
+      setAtBottom(true);
+      requestAnimationFrame(() => {
+        scrollToBottom();
+        composer.current?.focus();
+      });
+      return true;
+    },
+    [setAtBottom, scrollToBottom],
+  );
+  const sendComposed = useCallback((t: string) => send(t), [send]);
   const jumpToLatest = () => {
     setAtBottom(true);
     scrollToBottom();
   };
   // One the app took and nest refused: owed again on the server (once, however often asked). One the app
   // never answered for: posted again under its request id.
-  const retry = (m: ChatMessage) => {
-    if (m.seq > 0) retryChat.mutate(m.seq);
-    else send(m.text, failed.find((x) => x === m));
-  };
-  // Quoting puts the quote at the composer's start and the caret at its end, once the menu has closed
-  // (it returns focus to its button first).
-  const quoteReply = (t: string) => {
-    const next = quote(t) + text;
-    setText(next);
-    setTimeout(() => {
-      const c = composer.current;
-      if (!c) return;
-      c.focus();
-      c.setSelectionRange(next.length, next.length);
-    }, 0);
-  };
+  const retry = useCallback(
+    (m: ChatMessage) => {
+      if (m.seq > 0) now.current.retryChat.mutate(m.seq);
+      else send(m.text, now.current.failed.find((x) => x === m));
+    },
+    [send],
+  );
+  const quoteReply = useCallback((t: string) => composer.current?.quote(t), []);
 
   // The manager ended or errored (README.md#the-manager-lifecycle): said where the composer is (a phone
   // lands here, far below the page's notice), with its Restart, and nothing to Stop.
   const manager = useManager(projectId);
-  const restart = useRestartManager(projectId);
   const down = manager.data?.phase === "ended" || manager.data?.phase === "errored";
   const running = !!live && !down;
-  // On a phone only: wider, the page's notice (with its own Restart) stays in view above the log.
-  const phone = usePhone();
   // The turn in the log where it is in time (README.md#the-manager-chat): split by the messages sent
   // during it; a held one keeps its split until its reply lands.
-  const turn = live ? { ...live, running } : held && !(landed && atBottom) ? { turn: held.turn, steps: heldEnd?.steps ?? held.steps, running: false, landed: reply?.seq } : null;
-  const items = timeline(messages, turn);
-  const replySteps = stepsBySeq(messages, finished);
-  // One spinner in the log: the most recent of the owner's messages in flight.
-  const spinSeq = messages.filter((m) => m.sender === "owner" && (statusOf(m) === "owed" || statusOf(m) === "retrying")).at(-1)?.seq;
+  const shown = held && !(landed && atBottom);
+  const heldSteps = heldEnd?.steps ?? held?.steps;
+  const turnId = live?.turn ?? held?.turn;
+  const landedSeq = reply?.seq;
+  const turn = useMemo(
+    () => (live ? { ...live, running } : shown && turnId && heldSteps ? { turn: turnId, steps: heldSteps, running: false, landed: landedSeq } : null),
+    [live, running, shown, turnId, heldSteps, landedSeq],
+  );
+  // Recomputed when the log or the turn changes (or the day, for its labels), not on every render.
+  const today = new Date().toDateString();
+  const items = useMemo(() => timeline(messages, turn), [messages, turn, today]);
+  const replySteps = useMemo(() => stepsBySeq(messages, finished), [messages, finished]);
   const stream = items.some((it) => it.kind === "stream");
   emptyRef.current = messages.length === 0 && !stream;
-  // A starter fills the composer and focuses it at once (setting the value puts the caret at its end),
-  // so typing straight after the click continues it.
-  const fillStarter = (st: string) => {
-    setText(st);
-    composer.current?.focus();
-  };
+  const isNew = useCallback((m: ChatMessage) => !!seen.current && m.seq > 0 && !seen.current.has(m.seq), []);
 
   const item = (it: LogItem) =>
     it.kind === "day" ? (
       <DaySeparator key={it.key} label={it.label} />
     ) : it.kind === "stream" ? (
-      // A part of the turn in progress, between the messages sent during it: the last has the working line.
-      <MessageGroup key={it.key} side="manager" name="Manager" avatar={MANAGER_MARK}>
-        <MessageRow side="manager" quiet data-sender="stream">
-          <Stack gap="sm">
-            {it.steps.length > 0 && <LiveSteps steps={it.steps} projectId={projectId} />}
-            {it.working && <WorkingLine>Working…</WorkingLine>}
-          </Stack>
-        </MessageRow>
-      </MessageGroup>
+      <StreamPart key={it.key} steps={it.steps} working={it.working} projectId={projectId} />
     ) : (
-      <MessageGroup key={it.key} side={it.sender === "owner" ? "owner" : it.sender === "manager" ? "manager" : "note"} name={it.sender === "manager" ? "Manager" : undefined} avatar={MANAGER_MARK}>
-        {it.messages.map((m) => (
-          <Message
-            key={m.seq}
-            m={m}
-            projectId={projectId}
-            appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)}
-            steps={replySteps.get(m.seq)}
-            spin={m.seq === spinSeq}
-            onQuote={quoteReply}
-            onRetry={retry}
-          />
-        ))}
-      </MessageGroup>
+      <LogGroup key={it.key} sender={it.sender} messages={it.messages} projectId={projectId} replySteps={replySteps} spinSeq={spinSeq} isNew={isNew} onQuote={quoteReply} onRetry={retry} />
     );
 
   return (
@@ -596,7 +662,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
                 starters={STARTERS.map((st, i) => {
                   const Icon = STARTER_ICONS[i] ?? IconMessage;
                   return (
-                    <Starter key={st} leftSection={<Icon size={icon.md} aria-hidden />} onClick={() => fillStarter(st)}>
+                    <Starter key={st} leftSection={<Icon size={icon.md} aria-hidden />} onClick={() => composer.current?.fill(st)}>
                       {st.endsWith(" ") ? `${st}…` : st}
                     </Starter>
                   );
@@ -623,76 +689,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
             )
           }
         >
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              send();
-            }}
-          >
-            <ComposerBox
-              bar={
-                <>
-                  {down && phone ? (
-                    <Row gap="xs" wrap="nowrap" data-slot="manager-down">
-                      <Text fz="xs" c="warning">
-                        The manager isn&apos;t running
-                      </Text>
-                      <Button variant="subtle" size="compact-sm" loading={restart.isPending} onClick={() => restart.mutate()}>
-                        Restart manager
-                      </Button>
-                    </Row>
-                  ) : replyWait && !down ? (
-                    <Row gap="xs" wrap="nowrap" data-slot="reply-wait">
-                      <Text component="span" c="dimmed" display="inline-flex">
-                        <IconHourglass size={icon.sm} aria-hidden />
-                      </Text>
-                      <Text fz="xs" c="dimmed" title={`Times out ${exact(replyWait.deadline_ms)}`}>
-                        Waiting for your reply · {replyWait.deadline_ms > now ? `${human(replyWait.deadline_ms - now)} left` : "timing out"}
-                      </Text>
-                    </Row>
-                  ) : (
-                    !coarse && (
-                      <Text fz="xs" c="dimmed">
-                        Enter to send · Shift+Enter for a new line
-                      </Text>
-                    )
-                  )}
-                  <Row gap="sm" wrap="nowrap">
-                    {running && (
-                      <Button variant="default" size="compact-sm" leftSection={<IconPlayerStop size={icon.sm} />} loading={interrupt.isPending} onClick={() => interrupt.mutate()}>
-                        Stop
-                      </Button>
-                    )}
-                    <Tooltip label="Send" withArrow disabled={coarse}>
-                      <ActionIcon type="submit" size="lg" aria-label="Send" disabled={!text.trim() || post.isPending}>
-                        <IconArrowUp size={icon.md} />
-                      </ActionIcon>
-                    </Tooltip>
-                  </Row>
-                </>
-              }
-            >
-              <Textarea
-                ref={composer}
-                aria-label="Message to the manager"
-                placeholder="Message the manager"
-                variant="unstyled"
-                autosize
-                minRows={1}
-                maxRows={10}
-                maxLength={20000}
-                value={text}
-                onChange={(e) => setText(e.currentTarget.value)}
-                onKeyDown={(e) => {
-                  // On touch, Enter is a new line (a phone's keyboard has no Shift+Enter); Send sends.
-                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && !coarse) {
-                    e.preventDefault();
-                    send();
-                  }
-                }}
-              />
-            </ComposerBox>
-          </form>
+          {/* Its own state: typing draws the composer alone. Each project's draft its own. */}
+          <Composer key={projectId} ref={composer} projectId={projectId} running={running} down={down} sending={post.isPending} onSend={sendComposed} />
         </ComposerDock>
       </Stack>
     </OpenedContext.Provider>
