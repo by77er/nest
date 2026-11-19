@@ -27,7 +27,7 @@ const HTML = "text/html; charset=utf-8";
 
 describe("assetCacheControl", () => {
   it("keeps a hashed build file's 200 for a year, privately", () => {
-    // Names `vite build` wrote (dist/client/assets/, listed in the PR): a hash may itself hold `-` or `_`.
+    // Names a `vite build` wrote (dist/client/assets/): a hash may itself hold `-` or `_`.
     for (const path of [
       "/assets/index-CqelrehK.js",
       "/assets/react-9-62sbiC.js",
@@ -50,9 +50,16 @@ describe("assetCacheControl", () => {
     expect(REVALIDATE).toBe("no-cache");
   });
 
-  it("never keeps a hashed path's answer that isn't a 200 with the file", () => {
+  it("keeps a hashed file's 304 too, so a copy stored before the rule becomes immutable", () => {
+    expect(assetCacheControl("/assets/index-CqelrehK.js", 304, JS)).toBe(IMMUTABLE);
+    expect(assetCacheControl("/assets/index-CqelrehK.js", 304, null)).toBe(IMMUTABLE);
+    expect(assetCacheControl("/scheme.js", 304, JS)).toBe(REVALIDATE);
+    expect(assetCacheControl("/", 304, HTML)).toBe(REVALIDATE);
+  });
+
+  it("never keeps a hashed path's other answers, nor the fallback page", () => {
     const path = "/assets/index-CqelrehK.js";
-    for (const status of [304, 404, 206, 500]) expect(assetCacheControl(path, status, JS), String(status)).toBe(REVALIDATE);
+    for (const status of [404, 206, 500]) expect(assetCacheControl(path, status, JS), String(status)).toBe(REVALIDATE);
     // The single-page fallback: a chunk a deploy removed is answered with index.html and a 200.
     expect(assetCacheControl(path, 200, HTML)).toBe(REVALIDATE);
     expect(assetCacheControl(path, 200, "TEXT/HTML")).toBe(REVALIDATE);
@@ -106,11 +113,14 @@ describe("the Worker's asset answers", () => {
     }
   });
 
-  it("doesn't keep a 304 or a removed chunk's fallback page", async () => {
+  it("keeps a hashed file's 304 (replacing the stored max-age=0), not the page's 304 or a removed chunk's fallback page", async () => {
     const notModified = await get("/assets/index-CqelrehK.js", { "cf-access-jwt-assertion": token, "if-none-match": `"/assets/index-CqelrehK.js"` });
     expect(notModified.res.status).toBe(304);
-    expect(notModified.res.headers.get("cache-control")).toBe(REVALIDATE);
+    expect(notModified.res.headers.get("cache-control")).toBe(IMMUTABLE);
     secured(notModified.res);
+    const page = await get("/", { "cf-access-jwt-assertion": token, "if-none-match": `"/"` });
+    expect(page.res.status).toBe(304);
+    expect(page.res.headers.get("cache-control")).toBe(REVALIDATE);
     const gone = await get("/assets/index-Gone1234.js");
     expect(gone.res.status).toBe(200);
     expect(gone.res.headers.get("content-type")).toBe(HTML);

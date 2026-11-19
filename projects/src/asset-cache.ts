@@ -17,11 +17,14 @@ export const IMMUTABLE = "private, max-age=31536000, immutable";
 export const REVALIDATE = "no-cache";
 
 /**
- * The `cache-control` of an asset answer: immutable only for a `200` with a hashed file's body. A `304`,
- * a `404` or any other status, and an HTML body (the single-page fallback answers a missing file with
- * index.html and a `200`, as after a deploy removed an old chunk) are revalidated.
+ * The `cache-control` of an asset answer: immutable for a hashed file's `200`, and for its `304` too. A
+ * browser stores a 304's headers in place of the ones it held (RFC 9111 §4.3.4), and one that fetched the
+ * file before this rule (with Workers Assets' `max-age=0, must-revalidate`) learns it is immutable only
+ * that way; a 304 at a content-named path confirms the copy it holds is that file. A `404` or any other
+ * status, and an HTML body (the single-page fallback answers a missing file with index.html and a `200`,
+ * as after a deploy removed an old chunk) are revalidated.
  */
 export function assetCacheControl(path: string, status: number, contentType: string | null): string {
-  if (status === 200 && HASHED.test(path) && !/^text\/html\b/i.test(contentType ?? "")) return IMMUTABLE;
+  if ((status === 200 || status === 304) && HASHED.test(path) && !/^text\/html\b/i.test(contentType ?? "")) return IMMUTABLE;
   return REVALIDATE;
 }
