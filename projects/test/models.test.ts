@@ -501,8 +501,15 @@ describe("a project's models", () => {
       m.state = "working";
       expect((await setModel(p, "claude-haiku-5-5")).body.manager_switch).toMatchObject({ after_turn: true });
       m.state = "idle";
-      await dueNow(p);
-      await giveUp(p, 1);
+      // The switch made due and nest's give-up heard in one step, with no alarm left armed: a real alarm run
+      // between the two would make the switch first, and that restart clears nest's give-up (a CI flake).
+      m.restartError = { code: "unavailable", message: "the fleet didn't answer", ms: 1 };
+      await runInDurableObject(stub(p), async (o, st) => {
+        st.storage.sql.exec("UPDATE settings SET switch_next_ms = 0 WHERE switch_next_ms IS NOT NULL");
+        await (o as unknown as { onEvent(e: unknown, r: unknown): Promise<void> }).onEvent({ id: `evt-${rand()}`, type: "agent.error", agent: p.manager, code: "restart_refused" }, { role: "manager", task: null });
+        await st.storage.deleteAlarm();
+      });
+      await alarm(p);
       expect((await refusedLines(p)).at(-1)).toBe("The switch to Haiku 5.5 didn't complete (nest couldn't restart the manager): trying again in 5 minutes.");
       expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
     });
