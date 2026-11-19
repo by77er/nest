@@ -15,7 +15,7 @@ import { memo, type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRe
 import { exact } from "../../common/time";
 import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn, weight } from "../../layout";
 import {
-  type Grouping, groupTurnsFrom, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
+  groupTurnsFrom, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
   type TurnGroup,
 } from "./model";
 import { TraceMarkdown } from "./TraceMarkdown";
@@ -220,9 +220,16 @@ const fadesIn = (g: TurnGroup, after: number) => {
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
 export function TraceLog({ title, state, loadOlder = () => {} }: { title: string; state: TraceState; loadOlder?: () => void }) {
   const { fill, untitled } = useFillColumn();
-  // Grouped from the last state's grouping: the work is for what came since, and unchanged turns keep their objects.
-  const grouping = useRef<Grouping | null>(null);
-  const groups = useMemo(() => (grouping.current = groupTurnsFrom(grouping.current, state.events, state.older)).groups, [state.events, state.older]);
+  // Grouped from the last state's grouping (kept as state, updated while rendering: React's pattern for
+  // information from the previous render): the work is for what came since, and unchanged turns keep their
+  // objects. It needs `state.events` to grow by appending, as the reducer makes it (groupTurnsFrom).
+  const [grouping, setGrouping] = useState(() => groupTurnsFrom(null, state.events, state.older));
+  let current = grouping;
+  if (grouping.events !== state.events || grouping.older !== state.older) {
+    current = groupTurnsFrom(grouping, state.events, state.older);
+    setGrouping(current);
+  }
+  const groups = current.groups;
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);

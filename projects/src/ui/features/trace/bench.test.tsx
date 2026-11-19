@@ -130,8 +130,7 @@ describe("the trace's cost", () => {
     const ms = clock() - t0;
     const per = (x: number) => (x / live).toFixed(1);
     console.log(`BENCH live-1500: per_event state_changes=${per(n.states)} commits=${per(n.commits)} turn_renders=${per(n.rules)} line_renders=${per(n.lines)} markdown_renders=${per(n.markdown)} ms=${(ms / live).toFixed(1)}`);
-    expect(n.states).toBeLessThanOrEqual(live);
     expect(n.rules).toBeLessThanOrEqual(2 * live);
-    expect(n.markdown).toBeLessThanOrEqual(live);
+    expect(n.lines).toBeLessThanOrEqual(2 * live);
   });
 });

@@ -6,9 +6,11 @@
 // Messages are applied in batches, at most one per animation frame: a backlog of a thousand events is a
 // handful of state changes, not a thousand. The batch is applied at once on `live` (the backlog is done),
 // `ended`, a close and an unmount, so nothing is lost or reordered. Once live, a message that comes while
-// nothing is waiting is applied at once if the view has drawn the last batch, or if that batch was applied
-// in this same task (React renders the two together); one that comes sooner waits for the next frame
-// (README.md#the-live-trace).
+// nothing is waiting is applied at once if React has committed the last batch: live events are applied per
+// commit, and batched per frame only when they come faster than React commits (a message from a later task
+// before that commit waits for the next frame). Messages delivered in the task that applied the last batch
+// go with it too: a browser delivers each socket message in a task of its own, so this is for a caller (a
+// test) that delivers several synchronously (README.md#the-live-trace).
 
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 import { type HistoryPage, historyUrl, initialTrace, PING_EVERY_MS, reconnectDelay, type TraceState, traceReducer, traceUrl } from "./model";
@@ -39,10 +41,11 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
   current.current = state;
   const agentRef = useRef(agent);
   agentRef.current = agent;
-  // The view has committed the last batch applied: a live message may then be applied at once.
-  const drawn = useRef(true);
+  // React has committed the last batch applied: a live message may then be applied at once. (A batch that
+  // changes nothing commits nothing: the next live message then waits one frame.)
+  const committed = useRef(true);
   useLayoutEffect(() => {
-    drawn.current = true;
+    committed.current = true;
   }, [state]);
 
   const loadOlder = useCallback(() => {
@@ -95,7 +98,7 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
       if (queue.length === 0) return;
       const batch = queue;
       queue = [];
-      drawn.current = false;
+      committed.current = false;
       if (!appliedThisTask) {
         appliedThisTask = true;
         queueMicrotask(() => {
@@ -136,8 +139,8 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
           failures = 0;
           live = true;
           flush();
-        } else if (data.type === "ended" || (live && queue.length === 1 && (drawn.current || appliedThisTask))) {
-          // The end; or live, nothing else waiting, and the view drawn (or drawing this task's batch): at once.
+        } else if (data.type === "ended" || (live && queue.length === 1 && (committed.current || appliedThisTask))) {
+          // The end; or live, nothing else waiting, and the last batch committed (or applied in this task): at once.
           flush();
         } else if (!frame) {
           frame = nextFrame(() => {

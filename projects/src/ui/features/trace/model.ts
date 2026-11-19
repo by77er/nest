@@ -219,7 +219,11 @@ class Builder {
   }
 }
 
-/** `next` starts with all of `prev` (the reducer only appends between resets and trims; events are never rebuilt). */
+/**
+ * `next` starts with all of `prev`, judged by its ends: the reducer only appends between resets and trims,
+ * reusing the event objects, so a reset or trim changes the first. (A caller building its own arrays must
+ * keep to that.)
+ */
 const startsWith = (next: readonly TraceEvent[], prev: readonly TraceEvent[]) =>
   next.length >= prev.length && (prev.length === 0 || (next[0] === prev[0] && next[prev.length - 1] === prev[prev.length - 1]));
 
