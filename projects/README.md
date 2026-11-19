@@ -965,6 +965,60 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 
 **Spawning:** a worker may run Claude Code's own subagents (the `Agent` tool, through nest's `subagents` capability). They live in its brain and reach the same sandbox through its hands, with the same grant and taint. No role gets nest-level spawning (`spawn_agent`, `fork_sandbox`): the app starts every agent itself, one worker per task (`test/catalog-roles.test.ts`).
 
+### Performance
+
+Measured with [`scripts/ui-review/perf.mjs`](../scripts/ui-review/README.md#perfmjs), the same way for every page and flow:
+- The built client, served as Cloudflare serves its assets (ETags, `max-age=0, must-revalidate`, br), in headless Chromium at 1440×900 with the CPU throttled 4×, one browser per page or flow; the API answered from generated fixtures at a realistic size (300 tasks, 60% done; 200 chat messages; 2,000-event traces; 100 reviews; 60 routine runs), each answer 40 ms late.
+- A page is loaded cold (cache empty), then warm (a new tab), then left idle 15 s; a flow is played on its loaded page. "To content" is until the page's content selector shows; long tasks are the main thread's tasks over 50 ms, summed; bytes are as sent (gzip for the API, br for assets), without headers.
+- `e655ace` is main before the perf tasks (the API's full task list, no conditional requests); main is `5ec91f2` (#307's ETag/304 polling, #308's task summaries). Both were built and measured in one 2-vCPU sandbox on 2026-11-19, main twice: its numbers are the two runs' mean, and where the runs are more than 20% apart the cell says so. Times swing between runs on a shared CPU; requests and bytes don't.
+
+Each cell is `e655ace` → main. Pages:
+
+| page | to content, cold | long tasks, cold | transferred, cold / warm | API per idle minute |
+|---|---:|---:|---:|---:|
+| projects | 1026 ms → 1463 ms (runs 87% apart) | 637 ms → 967 ms (runs 73% apart) | 485 KB / 4.1 KB → 485 KB / 4.1 KB | 4 → 4 req, 0.9 KB → 0.0 KB |
+| board | 3371 ms → 2799 ms (runs 40% apart) | 2664 ms → 2598 ms | 679 KB / 133 KB → 567 KB / 21 KB | 52 → 36 req, 1.51 MB → 0.0 KB |
+| board-drawer | 5431 ms → 8041 ms | 6184 ms → 7081 ms (runs 39% apart) | 697 KB / 276 KB → 582 KB / 36 KB | 60 → 64 req, 1.05 MB → 0.0 KB |
+| manager-chat | 2827 ms → 1902 ms (runs 21% apart) | 3002 ms → 2201 ms | 735 KB / 143 KB → 623 KB / 31 KB | 56 → 62 req, 1.50 MB → 0.0 KB |
+| manager-trace | 2006 ms → 1753 ms (runs 36% apart) | 4227 ms → 4240 ms (runs 43% apart) | 694 KB / 150 KB → 579 KB / 34 KB | 64 → 46 req, 1.53 MB → 0.0 KB |
+| reviews | 1993 ms → 2396 ms (runs 52% apart) | 1647 ms → 1818 ms (runs 33% apart) | 542 KB / 13 KB → 542 KB / 13 KB | 36 → 20 req, 83 KB → 0.0 KB |
+| reviews-trace | 1995 ms → 1989 ms (runs 56% apart) | 2949 ms → 4985 ms (runs 101% apart) | 554 KB / 22 KB → 552 KB / 22 KB | 40 → 32 req, 73 KB → 0.0 KB |
+| routines | 1159 ms → 1486 ms (runs 60% apart) | 725 ms → 749 ms (runs 68% apart) | 551 KB / 18 KB → 552 KB / 18 KB | 44 → 28 req, 103 KB → 0.0 KB |
+| routines-trace | 820 ms → 944 ms | 1022 ms → 2456 ms (runs 129% apart) | 561 KB / 28 KB → 561 KB / 28 KB | 40 → 42 (runs 67% apart) req, 91 KB → 0.0 KB |
+| triage | 1105 ms → 1218 ms (runs 38% apart) | 784 ms → 969 ms (runs 40% apart) | 532 KB / 13 KB → 532 KB / 13 KB | 44 → 28 req, 116 KB → 0.0 KB |
+| secrets | 1023 ms → 1263 ms (runs 52% apart) | 737 ms → 803 ms (runs 44% apart) | 530 KB / 9.1 KB → 531 KB / 9.1 KB | 48 → 32 req, 90 KB → 0.0 KB |
+| network | 1049 ms → 976 ms | 756 ms → 687 ms | 530 KB / 9.0 KB → 530 KB / 9.0 KB | 48 → 32 req, 88 KB → 0.0 KB |
+| settings | 1103 ms → 1060 ms | 742 ms → 762 ms | 533 KB / 9.8 KB → 534 KB / 9.8 KB | 48 → 32 req, 90 KB → 0.0 KB |
+| admin | 631 ms → 592 ms | 502 ms → 507 ms (runs 48% apart) | 523 KB / 4.4 KB → 523 KB / 4.4 KB | 4 → 4 req, 0.9 KB → 0.0 KB |
+
+Flows (time: to the flow's content, or each step's summed, as `perf.md` states; API: bytes during the flow):
+
+| flow | time | long tasks | script | API | worst key→paint |
+|---|---:|---:|---:|---:|---:|
+| switch-view | 3318 ms → 3248 ms | 3716 ms → 3673 ms | 3004 ms → 2984 ms | 141 KB → 14 KB | – |
+| switch-project | 496 ms → 488 ms | 608 ms → 641 ms | 638 ms → 591 ms | 43 KB → 8.0 KB | – |
+| drawer | 1722 ms → 1611 ms | 4216 ms → 3944 ms | 2471 ms → 2362 ms | 144 KB → 15 KB | – |
+| type-composer | – | 11.1 s → 11.3 s | 10.8 s → 10.2 s | 391 KB → 0.0 KB | 571 ms → 584 ms |
+| stream-chat | – | 9010 ms → 9296 ms | 7195 ms → 6502 ms (runs 29% apart) | 138 KB → 3.8 KB | – |
+| stream-trace | – | 9746 ms → 9538 ms | 7974 ms → 7789 ms (runs 21% apart) | 254 KB → 0.0 KB | – |
+| open-trace | 1944 ms → 1218 ms | 3785 ms → 3334 ms (runs 41% apart) | 1860 ms → 1737 ms | 20 KB → 13 KB | – |
+| older-chat | 5028 ms → 4671 ms (runs 37% apart) | 5334 ms → 5202 ms (runs 37% apart) | 3583 ms → 4037 ms | 153 KB → 23 KB | – |
+| older-trace | 4330 ms → 3666 ms (runs 31% apart) | 3982 ms → 3178 ms (runs 26% apart) | 2214 ms → 1909 ms | 158 KB → 28 KB | – |
+| drag-reorder | – | 2272 ms → 2253 ms (runs 51% apart) | 2096 ms → 2028 ms | 249 KB → 11 KB | – |
+| tab-switch | 1939 ms → 1224 ms | 16.0 s → 14.1 s (runs 23% apart) | 7798 ms → 7813 ms | 458 KB → 59 KB | – |
+| idle-board | – | 0 ms → 260 ms (runs 200% apart) | 640 ms → 851 ms (runs 55% apart) | 1.51 MB → 0.0 KB | – |
+| idle-manager | – | 264 ms → 613 ms (runs 32% apart) | 1078 ms → 1535 ms | 1.53 MB → 3.8 KB | – |
+
+What it shows: #307 and #308 took the polls' bytes to nothing (an idle Board or Manager went from 1.5 MB a minute to `304`s) and a warm load's from 130-280 KB to 20-40 KB, but not the main thread's time: on main, typing in the composer with 200 messages still takes up to ~0.6 s from a key to its paint, a 10 s streaming turn keeps the main thread in long tasks for ~9.5 s of it, each Chat ↔ Trace switch on the Manager page reopens the trace's socket (its 1,000-event backlog again), and every page cold still loads ~445 KB of script and style and ~90 KB of fonts.
+
+To rerun (the output outside the repo; the "before" built the same way in a `git worktree` of its commit, and measured with `--shape full` if it is older than #308):
+
+```bash
+cd scripts/ui-review && npm ci && cd ../../projects && npm ci && npm run build && cd ..
+node scripts/ui-review/perf.mjs /tmp/perf-after --dist projects/dist/client --commit "$(git rev-parse --short HEAD)"
+node scripts/ui-review/perf.mjs --compare /tmp/perf-before/perf.json /tmp/perf-after/perf.json
+```
+
 ## Retention
 
 Terminal rows of history-like tables are pruned by age, at most hourly from each object's drain (`src/retention.ts`):
