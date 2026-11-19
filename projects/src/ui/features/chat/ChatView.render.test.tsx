@@ -99,6 +99,9 @@ describe("what the chat re-renders", () => {
     await within(c).findByText("Message 99");
     await waitFor(() => expect(within(c).getAllByRole("button", { name: "Message actions" })).toHaveLength(100));
     const box = within(c).getByLabelText("Message to the manager");
+    // The counters count: the log's first render drew every message and parsed the manager's Markdown.
+    expect(counts.rows).toBeGreaterThanOrEqual(100);
+    expect(counts.markdown).toBeGreaterThanOrEqual(50);
     reset();
     const t = performance.now();
     await user.type(box, "abcdefghijklmnopqrst");
