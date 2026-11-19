@@ -318,7 +318,7 @@ async function run(sc) {
     async until(sel, act) {
       const page = ctx.page;
       const t0 = await page.evaluate(() => performance.now());
-      const shown = page.evaluate((s) => window.__perf.shown(s), sel);
+      const shown = page.evaluate((s) => window.__perf.shown(s), sel).catch(() => null);
       await act();
       const t1 = await shown;
       if (t1 === null) throw new Error(`${sel} didn't show within 60 s`);
@@ -397,7 +397,8 @@ async function setup(cdp, page, fx, ledger) {
       if (!gz.has(body)) gz.set(body, gzipSync(body).length);
       bytes = gz.get(body);
     }
-    ledger.push({ at: Date.now(), type: "api", bytes, raw: body?.length ?? 0, cached: false, status });
+    const path = `${e.request.method} ${url.pathname.replace(/^\/api/, "").replace(/\/(tsk|agt)_[a-z0-9]+/g, "/$1_*")}${url.searchParams.has("before") ? "?before" : url.search}`;
+    ledger.push({ at: Date.now(), type: "api", bytes, raw: body?.length ?? 0, cached: false, status, path });
     const responseHeaders = [{ name: "content-type", value: "application/json" }, { name: "cache-control", value: "no-store" }, ...(etag ? [{ name: "etag", value: etag }] : [])];
     await cdp.send("Fetch.fulfillRequest", { requestId: e.requestId, responseCode: status, responseHeaders, body: body === null ? "" : Buffer.from(body).toString("base64") }).catch(() => {});
   });
@@ -422,6 +423,7 @@ function diff(name, a, b, ledger) {
   for (const t of ["document", "script", "style", "font", "api", "ws", "other"]) net[t] = { requests: 0, bytes: 0 };
   net.api.notModified = 0;
   net.api.raw = 0;
+  net.apiPaths = {};
   for (const r of ledger.slice(a.ledger, b.ledger)) {
     if (r.cached) {
       net.cached++;
@@ -432,6 +434,11 @@ function diff(name, a, b, ledger) {
     if (r.type === "api") {
       net.api.raw += r.raw;
       if (r.status === 304) net.api.notModified++;
+      // Per endpoint: [requests, bytes (gzip), 304s].
+      const e = (net.apiPaths[r.path] ??= [0, 0, 0]);
+      e[0]++;
+      e[1] += r.bytes;
+      if (r.status === 304) e[2]++;
     }
     if (r.type !== "ws") {
       net.total.requests++;
@@ -539,7 +546,7 @@ async function loadOlder(ctx, scroller, item, pages) {
   }
   return times;
 }
-const nav = (page, name) => page.locator("#sidebar").getByRole("link", { name, exact: true }).first().click();
+const nav = (page, name) => page.locator("#sidebar").getByRole("link", { name: new RegExp(`^${name}`) }).first().click({ timeout: 10_000 });
 
 const DRAWER = "[role=dialog] [data-ds=terminal] [data-kind=tool]";
 /** A task with a worker (its trace in the drawer): the fixture's first one in progress. */
