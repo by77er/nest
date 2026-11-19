@@ -76,6 +76,8 @@ struct Gateway {
     seen: mpsc::UnboundedReceiver<Seen>,
     closes: mpsc::UnboundedReceiver<Option<u16>>,
     pongs: Arc<Mutex<usize>>,
+    /// Pings the client sent (its keepalive).
+    pings: Arc<Mutex<usize>>,
 }
 
 async fn gateway(mode: Mode) -> Gateway {
@@ -85,6 +87,8 @@ async fn gateway(mode: Mode) -> Gateway {
     let (close_tx, closes) = mpsc::unbounded_channel();
     let pongs = Arc::new(Mutex::new(0usize));
     let pongs_srv = pongs.clone();
+    let pings = Arc::new(Mutex::new(0usize));
+    let pings_srv = pings.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -94,6 +98,7 @@ async fn gateway(mode: Mode) -> Gateway {
             let seen_tx = seen_tx.clone();
             let close_tx = close_tx.clone();
             let pongs = pongs_srv.clone();
+            let pings = pings_srv.clone();
             tokio::spawn(async move {
                 let headers = Arc::new(Mutex::new(Vec::new()));
                 let h = headers.clone();
@@ -223,6 +228,7 @@ async fn gateway(mode: Mode) -> Gateway {
                             _ => unreachable!(),
                         },
                         Ok(Message::Pong(_)) => *pongs.lock().unwrap() += 1,
+                        Ok(Message::Ping(_)) => *pings.lock().unwrap() += 1,
                         Ok(Message::Close(cf)) => {
                             let _ = close_tx.send(cf.map(|c| u16::from(c.code)));
                             return;
@@ -243,6 +249,7 @@ async fn gateway(mode: Mode) -> Gateway {
         seen,
         closes,
         pongs,
+        pings,
     }
 }
 
@@ -264,6 +271,7 @@ fn opts() -> OpenOptions {
     OpenOptions {
         connect_timeout: Duration::from_secs(5),
         bind_timeout: Duration::from_millis(800),
+        keepalive: Duration::from_secs(30),
     }
 }
 
@@ -696,6 +704,32 @@ async fn wss_to_a_self_signed_server_fails_certificate_verification() {
         "{r:?}"
     );
     let _ = server.kill().await;
+}
+
+/// A call that is quiet for longer than the keepalive interval is pinged while it waits, so what
+/// carries the connection never sees it idle; the answer still arrives. Quiet calls were reset at
+/// 125 s through the tunnel.
+#[tokio::test]
+async fn a_quiet_call_is_pinged_while_it_waits_and_still_gets_its_answer() {
+    let gw = gateway(Mode::DelayedEcho(Duration::from_millis(400))).await;
+    let quick = OpenOptions { keepalive: Duration::from_millis(40), ..opts() };
+    let mut conn = open(&target(&gw.url, None), &quick).await.unwrap();
+    let req = serde_json::json!({"call_id": "hc_quiet"});
+    conn.send_json(&req).await.unwrap();
+    let got: Option<serde_json::Value> = conn.recv_json().await.unwrap();
+    assert_eq!(got, Some(req));
+    // 400 ms of quiet at 40 ms: several pings, read by the gateway once it reads again.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while *gw.pings.lock().unwrap() < 3 {
+        assert!(std::time::Instant::now() < deadline, "the gateway saw {} pings", *gw.pings.lock().unwrap());
+        let _: Result<Result<Option<serde_json::Value>, _>, _> = tokio::time::timeout(Duration::from_millis(20), conn.recv_json()).await;
+    }
+    // A call answered within the interval sends none.
+    let gw = gateway(Mode::Echo).await;
+    let mut conn = open(&target(&gw.url, None), &opts()).await.unwrap();
+    conn.send_json(&serde_json::json!({"call_id": "hc_fast"})).await.unwrap();
+    let _: Option<serde_json::Value> = conn.recv_json().await.unwrap();
+    assert_eq!(*gw.pings.lock().unwrap(), 0);
 }
 
 #[tokio::test]

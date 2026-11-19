@@ -44,13 +44,22 @@ pub struct OpenOptions {
     /// [`CLIENT_BIND_TIMEOUT_MS`], outlasts the gateway's own guest-connect timer with margin, so
     /// a slow or frozen guest comes back as the gateway's retryable `busy`.
     pub bind_timeout: Duration,
+    /// How long a bound connection may stay quiet before the client pings it ([`KEEPALIVE`]).
+    pub keepalive: Duration,
 }
+
+/// A call whose command prints nothing sends nothing either way while it runs, and what carries
+/// the connection (a tunnel, an edge) drops one that is idle: calls quiet for 125 s were reset
+/// (2026-11-18/19, through Cloudflare Tunnel; the limit itself is unverified). A WebSocket ping
+/// every 30 s, which the gateway's WebSocket layer answers, keeps both directions busy.
+pub const KEEPALIVE: Duration = Duration::from_secs(30);
 
 impl Default for OpenOptions {
     fn default() -> Self {
         OpenOptions {
             connect_timeout: Duration::from_secs(5),
             bind_timeout: Duration::from_millis(CLIENT_BIND_TIMEOUT_MS),
+            keepalive: KEEPALIVE,
         }
     }
 }
@@ -445,6 +454,8 @@ pub struct HandsConn {
     gateway_version: u32,
     /// The binding's claims (the gateway verified them before `bound`).
     claims: Option<BindingClaims>,
+    /// [`OpenOptions::keepalive`].
+    keepalive: Duration,
 }
 
 impl std::fmt::Debug for HandsConn {
@@ -561,6 +572,7 @@ pub async fn open(target: &HandsTarget, opts: &OpenOptions) -> Result<HandsConn,
                     guest,
                     gateway_version,
                     claims,
+                    keepalive: opts.keepalive,
                 })
             }
             Ok(GatewayMessage::Error {
@@ -629,12 +641,22 @@ impl HandsConn {
     /// [`RecvError::Closed`]; a reset without a close handshake is [`RecvError::Io`]
     /// (`ConnectionReset`); a text message, a `DATA` frame or a message that is not exactly one
     /// frame is [`RecvError::Protocol`]. Cancel-safe: a frame that arrives while the future is
-    /// dropped is returned by the next call.
+    /// dropped is returned by the next call. While it waits it pings the gateway every
+    /// [`OpenOptions::keepalive`], so a call that is quiet for minutes isn't dropped as idle.
     pub async fn recv_json<T: serde::de::DeserializeOwned>(
         &mut self,
     ) -> Result<Option<T>, RecvError> {
         loop {
-            match self.ws.next().await {
+            let next = match tokio::time::timeout(self.keepalive, self.ws.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    // Quiet for a whole interval: a ping. A connection that can't take one has
+                    // failed, and the read that follows says how.
+                    let _ = self.ws.send(Message::Ping(Vec::new().into())).await;
+                    continue;
+                }
+            };
+            match next {
                 None => return Ok(None),
                 Some(Ok(Message::Binary(b))) => {
                     let (kind, payload) =
