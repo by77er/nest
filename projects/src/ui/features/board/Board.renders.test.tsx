@@ -95,7 +95,7 @@ describe("the board's renders, with 300 tasks", () => {
     expect(rendered()).toEqual({ [changed.id]: 1 });
   }, 60_000);
 
-  it("a task that moves group re-renders its own row (and its new neighbours' grips only when a group's size crosses one)", async () => {
+  it("a task that moves to another group renders its own row alone, both groups' counts following", async () => {
     const api = new FakeApi();
     api.tasks = board();
     const view = await mount(api);
@@ -179,5 +179,23 @@ describe("the board's renders, with 300 tasks", () => {
     report("drag start and end", started);
     expect(others(ids(api.tasks, ["ready"]))).toBe(0);
     expect(api.writes).toEqual([]);
+  }, 60_000);
+
+  it("a row's \"updated\" stays current while the row itself isn't rendered", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      const api = new FakeApi();
+      api.tasks = [task({ title: "Quiet", state: "ready", updated_ms: Date.now() - 10_000 })];
+      renderApp("/projects/prj_one/board", api);
+      const row = await screen.findByRole("article", { name: "Quiet" });
+      expect(within(row).getByText("just now")).toBeInTheDocument();
+      reset();
+      // Three minutes on, with the board's poll bringing nothing new: the row isn't rendered, its time is.
+      await act(async () => vi.advanceTimersByTime(3 * 60_000));
+      expect(await within(row).findByText("3 minutes ago")).toBeInTheDocument();
+      expect(total()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   }, 60_000);
 });
