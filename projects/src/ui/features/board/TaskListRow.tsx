@@ -54,29 +54,32 @@ export const shortId = (id: string) => {
   return bare.length > 6 ? bare.slice(-6) : bare;
 };
 
-// One clock for every row's "updated": a row is rendered only when its task changes, so its relative
-// time ("3 minutes ago") follows this clock instead, as it followed the board's 5 s poll before. Each
-// row's time re-renders only when its own text changes; the clock stops while no row shows one, and
-// skips its tick while the tab is hidden (as the poll did).
+// One clock for every row's "updated": a row renders only when its task changes, so its relative time
+// ("3 minutes ago") follows this clock, every 5 s like the board's poll. Each row's time re-renders only
+// when its own text changes. The clock runs while a row shows one; it skips its ticks while the tab is
+// hidden and ticks at once when it's shown again.
 const TICK_MS = 5_000;
 const ticks = new Set<() => void>();
 let tickAt = 0;
 let ticker: ReturnType<typeof setInterval> | undefined;
+function tick() {
+  if (document.visibilityState === "hidden") return;
+  tickAt = Date.now();
+  for (const l of ticks) l();
+}
 function onTick(listener: () => void) {
   ticks.add(listener);
   if (ticker === undefined) {
     tickAt = Date.now();
-    ticker = setInterval(() => {
-      if (document.visibilityState === "hidden") return;
-      tickAt = Date.now();
-      for (const l of ticks) l();
-    }, TICK_MS);
+    ticker = setInterval(tick, TICK_MS);
+    document.addEventListener("visibilitychange", tick);
   }
   return () => {
     ticks.delete(listener);
     if (ticks.size === 0 && ticker !== undefined) {
       clearInterval(ticker);
       ticker = undefined;
+      document.removeEventListener("visibilitychange", tick);
     }
   };
 }

@@ -5,7 +5,6 @@
 // status is in the page's header, not here.
 
 import { Text } from "@mantine/core";
-import { useMemo } from "react";
 import { useNeedsYouList, useTasksSelect } from "../../api/queries";
 import type { TaskSummary, Waiting } from "../../api/types";
 import { AnchorLink } from "../../common/links";
@@ -76,7 +75,7 @@ const NONE = { count: 0, ids: [] as string[] };
 export function ManagerContext({ projectId }: { projectId: string }) {
   const active = useTasksSelect(projectId, underWay).data ?? NONE;
   const list = useNeedsYouList(projectId);
-  const waiting = useMemo(() => [...list.items].sort((a, b) => a.at_ms - b.at_ms), [list.items]);
+  const waiting = [...list.items].sort((a, b) => a.at_ms - b.at_ms);
   const on = active.ids;
   const asks = waiting.slice(0, ASKS_SHOWN);
   return (

@@ -15,8 +15,8 @@ import { StateBadge } from "../board/StateBadge";
 import { changesNeeded } from "../reviews/ReviewsPage";
 import { TaskCardBody } from "../board/TaskCardBody";
 
-// Each chip and card reads its own task from the board's query (`select`): another task's change
-// doesn't re-render it. The query is the board's, with the board's poll, as before.
+// Each chip and card reads its own task from the board's query (`select`, with the board's poll):
+// another task's change doesn't re-render it.
 
 export function TaskChip({ projectId, id, fallback }: { projectId: string; id: string; fallback: ReactNode }) {
   const task = useBoardTask(projectId, id);
@@ -73,7 +73,7 @@ const Card = memo(function Card({ projectId, repo, t, note, pendingAsks, job }: 
 /** A ```tasks block: one card per id the board has, the line as plain text otherwise. */
 export function TaskBlock({ projectId, lines }: { projectId: string; lines: string[] }) {
   const key = lines.join("\n");
-  const refs = useMemo(() => key.split("\n").map((line) => ({ line, ref: taskLine(line) })), [key]);
+  const refs = useMemo(() => (key === "" ? [] : key.split("\n")).map((line) => ({ line, ref: taskLine(line) })), [key]);
   // Just these tasks: the selection keeps its identity while none of them changed.
   const select = useCallback((xs: TaskSummary[]) => {
     const byId = tasksById(xs);
