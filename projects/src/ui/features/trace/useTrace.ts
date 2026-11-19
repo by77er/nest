@@ -6,8 +6,9 @@
 // Messages are applied in batches, at most one per animation frame: a backlog of a thousand events is a
 // handful of state changes, not a thousand. The batch is applied at once on `live` (the backlog is done),
 // `ended`, a close and an unmount, so nothing is lost or reordered. Once live, a message that comes while
-// nothing is waiting and the view has drawn the last batch is applied at once; one that comes sooner waits
-// for the next frame (README.md#the-live-trace).
+// nothing is waiting is applied at once if the view has drawn the last batch, or if that batch was applied
+// in this same task (React renders the two together); one that comes sooner waits for the next frame
+// (README.md#the-live-trace).
 
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 import { type HistoryPage, historyUrl, initialTrace, PING_EVERY_MS, reconnectDelay, type TraceState, traceReducer, traceUrl } from "./model";
@@ -85,6 +86,8 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
     let queue: unknown[] = [];
     let frame: (() => void) | null = null;
     let live = false;
+    // A batch was applied in this task (until its microtasks run).
+    let appliedThisTask = false;
 
     const flush = () => {
       frame?.();
@@ -93,6 +96,12 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
       const batch = queue;
       queue = [];
       drawn.current = false;
+      if (!appliedThisTask) {
+        appliedThisTask = true;
+        queueMicrotask(() => {
+          appliedThisTask = false;
+        });
+      }
       dispatch(batch.length === 1 ? { kind: "message", data: batch[0] } : { kind: "messages", data: batch });
     };
 
@@ -127,8 +136,8 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
           failures = 0;
           live = true;
           flush();
-        } else if (data.type === "ended" || (live && queue.length === 1 && drawn.current)) {
-          // The end; or live, nothing else waiting, and the view drawn: at once.
+        } else if (data.type === "ended" || (live && queue.length === 1 && (drawn.current || appliedThisTask))) {
+          // The end; or live, nothing else waiting, and the view drawn (or drawing this task's batch): at once.
           flush();
         } else if (!frame) {
           frame = nextFrame(() => {

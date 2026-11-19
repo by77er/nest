@@ -220,15 +220,18 @@ describe("the socket's batches", () => {
     expect(changes()).toBe(3);
   });
 
-  it("once live, a message shows at once when the view is drawn; ones coming before it's drawn wait for the frame, in order", () => {
+  it("once live, a message shows at once when the view is drawn; ones in later tasks before it's drawn wait for the frame, in order", async () => {
     const { sock, changes, now } = probe();
     act(() => sock.message({ type: "live" }));
     const at = changes();
     act(() => sock.message(ev(1, "assistant_text")));
     expect(changes()).toBe(at + 1);
-    act(() => {
+    // Each message its own task (as a browser delivers them), none drawn until the act ends.
+    await act(async () => {
       sock.message(ev(2, "assistant_text"));
+      await Promise.resolve();
       sock.message(ev(3, "assistant_text"));
+      await Promise.resolve();
       sock.message(ev(4, "assistant_text"));
     });
     expect(now().events.map((e) => e.seq)).toEqual([1, 2]);
@@ -236,6 +239,13 @@ describe("the socket's batches", () => {
     frame();
     expect(now().events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
     expect(changes()).toBe(at + 3);
+    // Several in one task, the first applied at once: React renders them together, so they all go with it.
+    act(() => {
+      sock.message(ev(5, "assistant_text"));
+      sock.message(ev(6, "assistant_text"));
+    });
+    expect(now().events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(changes()).toBe(at + 4);
   });
 
   it("`ended` and a close apply what's waiting first, and the next connect resumes after it", () => {
