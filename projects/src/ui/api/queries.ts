@@ -2,6 +2,7 @@
 // asks) poll while the tab is visible; TanStack Query stops polling a hidden tab by default.
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useSyncExternalStore } from "react";
 import { ApiError, api } from "./client";
 import type { CreateReviewerBody, CreateRoutineBody, PutSecretBody, ReviewerPreset, UpdateReviewerBody, UpdateRoutineBody } from "./types";
 import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, TaskSummary, UpdateTaskBody, Waiting } from "./types";
@@ -43,9 +44,60 @@ export const useProjects = () => useQuery({ queryKey: keys.projects, queryFn: ap
 
 export const useProject = (id: string) => useQuery({ queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project });
 
-/** The board: its tasks as summaries; `paused` while a card is being dragged, so a poll can't move cards under the pointer. */
-export const useTasks = (id: string, o: { paused?: boolean } = {}) =>
-  useQuery({ queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: o.paused ? false : POLL.board });
+/**
+ * Whether a row of a project's board is being dragged (README.md#the-ui: the board stops polling while
+ * a card is dragged). Every observer of the project's tasks reads it, so none polls meanwhile: not the
+ * Board's, nor a task chip's in "Needs you" beside it.
+ */
+const dragging = new Set<string>();
+const dragListeners = new Set<() => void>();
+export function setBoardDragging(id: string, on: boolean) {
+  if (dragging.has(id) === on) return;
+  if (on) dragging.add(id);
+  else dragging.delete(id);
+  for (const l of dragListeners) l();
+}
+const onDrag = (l: () => void) => {
+  dragListeners.add(l);
+  return () => void dragListeners.delete(l);
+};
+const useBoardDragging = (id: string) => useSyncExternalStore(onDrag, () => dragging.has(id));
+
+/**
+ * The board: its tasks as summaries, polled except while a row is dragged. `paused`: this observer never
+ * polls (it only waits for the first read; another observer polls).
+ */
+export function useTasks(id: string, o: { paused?: boolean } = {}) {
+  const held = useBoardDragging(id);
+  return useQuery({ queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: o.paused || held ? false : POLL.board });
+}
+
+/**
+ * A part of the board's tasks (`select`, stable for the same answer), from the board's query, polled as
+ * `useTasks` is: its reader re-renders only when that part changes. A chip, a card or the Manager's side
+ * panel reads its own task(s) this way, so one task's change doesn't re-render every reader of the list.
+ */
+export function useTasksSelect<T>(id: string, select: (tasks: TaskSummary[]) => T, o: { paused?: boolean } = {}) {
+  const held = useBoardDragging(id);
+  return useQuery({ queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: o.paused || held ? false : POLL.board, select });
+}
+
+/** The board's tasks by id, built once per answer and shared by every reader of that answer. */
+const byIdOf = new WeakMap<readonly TaskSummary[], ReadonlyMap<string, TaskSummary>>();
+export function tasksById(tasks: readonly TaskSummary[]): ReadonlyMap<string, TaskSummary> {
+  let m = byIdOf.get(tasks);
+  if (!m) {
+    m = new Map(tasks.map((t) => [t.id, t]));
+    byIdOf.set(tasks, m);
+  }
+  return m;
+}
+
+/** One task of the board (null: the board hasn't it), re-rendering its reader only when that task changes. */
+export function useBoardTask(id: string, task: string) {
+  const select = useCallback((xs: TaskSummary[]) => tasksById(xs).get(task) ?? null, [task]);
+  return useTasksSelect(id, select);
+}
 
 export const useTask = (id: string, task: string | undefined) =>
   useQuery({
