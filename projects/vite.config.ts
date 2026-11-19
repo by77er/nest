@@ -6,7 +6,8 @@ import { defineConfig } from "vite";
 // answers the JSON API, the MCP servers and the webhooks. `vite dev` runs both in workerd; `vite build`
 // writes dist/ and the Worker config that `wrangler deploy` picks up.
 // The page's libraries are chunks of their own (Mantine, React, the rest), so a release that changes only
-// the app's code leaves them cached.
+// the app's code leaves them cached; the ones only some pages use load with those pages, not with the entry
+// (README.md#the-ui).
 export default defineConfig({
   plugins: [react(), cloudflare()],
   environments: {
