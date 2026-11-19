@@ -5,8 +5,8 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory } from "@tanstack/react-router";
 import { renderHook, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { keys, POLL, useTasks } from "./api/queries";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { keys, POLL, useReviews, useTasks } from "./api/queries";
 import { createQueryClient } from "./api/queryClient";
 import { createAppRouter } from "./router";
 import { FakeApi, task } from "./test/fakeApi";
@@ -37,6 +37,16 @@ vi.mock("@tanstack/react-router", async (original) => {
   };
 });
 const loadChunks = () => ["ProjectsPage", "BoardPage", "ManagerPage", "ReviewsPage", "RoutinesPage", "SettingsPage", "NetworkPage", "TriagePage", "SecretsPage", "AdminPage"].forEach((p) => chunk(p).resolve());
+
+// The pages' modules, transformed once up front: what the gate holds is the router's load, and a cold
+// transform's seconds don't count against the reads' staleTime.
+beforeAll(async () => {
+  await Promise.all([
+    import("./features/projects/ProjectsPage"), import("./features/project/BoardPage"), import("./features/manager/ManagerPage"), import("./features/reviews/ReviewsPage"),
+    import("./features/routines/RoutinesPage"), import("./features/settings/SettingsPage"), import("./features/network/NetworkPage"), import("./features/triage/TriagePage"),
+    import("./features/secrets/SecretsPage"), import("./features/admin/AdminPage"),
+  ]);
+}, 60_000);
 
 afterEach(() => {
   vi.useRealTimers();
@@ -83,19 +93,40 @@ describe("a route's loader", () => {
     loadChunks();
     const api = new FakeApi();
     api.tasks = [task({ id: "tsk_t1", title: "Open me" })];
-    const { router } = renderApp("/projects/prj_one/board", api);
+    const { router, queryClient } = renderApp("/projects/prj_one/board", api);
     await screen.findByText("Open me");
-    // Past the default staleTime (2 s), short of the board's poll (5 s): only a route change could ask now.
-    await new Promise((ok) => setTimeout(ok, 2_200));
-    const before = api.reads.length;
+    const prefetch = vi.spyOn(queryClient, "prefetchQuery");
     await router.navigate({ to: "/projects/$projectId/board", params: { projectId: "prj_one" }, search: { task: "tsk_t1" } });
-    await waitFor(() => expect(api.reads.slice(before)).toContain(`${P}/tasks/tsk_t1`));
+    await waitFor(() => expect(api.reads).toContain(`${P}/tasks/tsk_t1`));
+    // The board's loader ran again for the drawer's task alone: its tasks and "Needs you" are polled already.
+    expect(prefetch.mock.calls.map(([o]) => o.queryKey)).toEqual([keys.task("prj_one", "tsk_t1")]);
+  });
+
+  it("a page shown a while after its reads were prefetched (a click after a hover, a slow chunk) asks for each once", async () => {
+    loadChunks();
+    const { api, user } = renderApp("/projects/prj_one/board", new FakeApi());
+    await screen.findByRole("heading", { level: 1, name: "Widgets" });
+    await user.hover(screen.getByRole("link", { name: "Reviews" }));
+    await waitFor(() => expect(api.reads).toEqual(expect.arrayContaining([`${P}/reviews`, `${P}/reviewers`])));
+    // Past the reads' staleTime (2 s), within PREFETCH_FIRST_READ_MS.
+    await new Promise((ok) => setTimeout(ok, 2_300));
+    await user.click(screen.getByRole("link", { name: "Reviews" }));
+    await screen.findByRole("heading", { name: /^Reviewers/ });
     await new Promise((ok) => setTimeout(ok, 200));
-    // The drawer's own parts read what they show as before (its PRs: the reviews; the board's list, stale,
-    // once); the loader adds nothing to that: not "Needs you"'s attention, which the board polls.
-    const after = api.reads.slice(before);
-    expect(after).not.toContain(`${P}/attention`);
-    expect(new Set(after).size).toBe(after.length);
+    for (const path of [`${P}/reviews`, `${P}/reviewers`]) expect(api.reads.filter((x) => x === path), path).toHaveLength(1);
+  });
+
+  it("a hook mounting on a failure that wasn't a prefetch's asks again, as before", async () => {
+    const api = new FakeApi();
+    vi.stubGlobal("fetch", api.fetch);
+    const queryClient = createQueryClient();
+    queryClient.setDefaultOptions({ queries: { ...queryClient.getDefaultOptions().queries, retry: false } });
+    api.fail(/^GET \/api\/projects\/prj_one\/reviews$/, 502, "the Worker is unavailable");
+    await queryClient.fetchQuery({ queryKey: keys.reviews("prj_one"), queryFn: () => Promise.reject(new Error("an earlier view's failure")) }).catch(() => {});
+    const hook = renderHook(() => useReviews("prj_one"), { wrapper: ({ children }) => <QueryClientProvider client={queryClient}>{children}</QueryClientProvider> });
+    await waitFor(() => expect(hook.result.current.isError || hook.result.current.isSuccess).toBe(true));
+    expect(api.reads.filter((x) => x === `${P}/reviews`)).toHaveLength(1);
+    hook.unmount();
   });
 
   it("an unknown project shows its error as before, and its reads fail once each, quietly", async () => {

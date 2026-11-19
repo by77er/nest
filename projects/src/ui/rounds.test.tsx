@@ -3,7 +3,7 @@
 // page has asked for once it has settled with nothing answered. Before the routes' loaders, a project
 // page took a round for the project, and only then one for its own reads.
 import { screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { type FakeApi, FakeApi as Fake, project, task } from "./test/fakeApi";
 import { renderApp } from "./test/render";
 import { RecordingSocket } from "./test/sockets";
@@ -61,7 +61,9 @@ function fake(): FakeApi {
   return api;
 }
 
+/** Each case's rounds, printed once the file has run (the PR's before/after table). */
 const report: Record<string, string[][]> = {};
+afterAll(() => console.log(JSON.stringify(report, null, 1)));
 
 describe("request rounds before a page's content shows", () => {
   it("cold load of the Board", async () => {
@@ -107,6 +109,5 @@ describe("request rounds before a page's content shows", () => {
       () => r.router.state.location.pathname.endsWith("/routines") && !!screen.queryByRole("heading", { name: /^Routines/ }) && settledView(r));
     report["view switch after hover, Board → Routines"] = got;
     expect(got).toHaveLength(0);
-    console.log(JSON.stringify(report, null, 1));
   });
 });
