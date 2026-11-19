@@ -7,7 +7,10 @@
 //
 // `private`: the app is behind Cloudflare Access, so no shared cache may keep its files; only the browser.
 
-/** A file `vite build` named by its content: under /assets/, the name's last `-` part an 8-character hash. */
+/**
+ * A file `vite build` named by its content: under /assets/, the name's last `-` part an 8-character hash.
+ * Only Vite writes there: nothing goes in public/assets/, whose files would be served unhashed at these paths.
+ */
 const HASHED = /^\/assets\/[^/]+-[A-Za-z0-9_-]{8}\.[a-z0-9]+$/;
 
 export const IMMUTABLE = "private, max-age=31536000, immutable";
