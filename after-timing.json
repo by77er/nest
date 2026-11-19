@@ -1,0 +1,72 @@
+{
+ "board": {
+  "shown_ms": 549,
+  "requests": [
+   [
+    161,
+    "/api/projects"
+   ],
+   [
+    161,
+    "project"
+   ],
+   [
+    162,
+    "/tasks"
+   ],
+   [
+    162,
+    "/attention"
+   ],
+   [
+    235,
+    "/chat"
+   ]
+  ]
+ },
+ "manager": {
+  "shown_ms": 631,
+  "requests": [
+   [
+    150,
+    "/api/projects"
+   ],
+   [
+    150,
+    "project"
+   ],
+   [
+    153,
+    "/chat"
+   ],
+   [
+    153,
+    "/manager"
+   ],
+   [
+    153,
+    "/waits"
+   ],
+   [
+    153,
+    "/tasks"
+   ],
+   [
+    153,
+    "/attention"
+   ],
+   [
+    498,
+    "/attention?local=1"
+   ],
+   [
+    548,
+    "/api/agents/agt_mgr7k2/trace/history?limit=100&before=c2"
+   ],
+   [
+    621,
+    "/reviews"
+   ]
+  ]
+ }
+}
