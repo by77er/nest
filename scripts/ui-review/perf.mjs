@@ -12,7 +12,7 @@
 
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -170,20 +170,26 @@ const TYPES = { ".js": "text/javascript", ".css": "text/css", ".html": "text/htm
 function serveDist(dir) {
   const root = resolve(dir);
   if (!existsSync(join(root, "index.html"))) die(`${root} has no index.html: build the client first (npm run build in projects/)`);
+  // Every file read and compressed before the first request (compressing on demand would bill it to the first page).
   const files = new Map();
-  const load = (p) => {
-    if (!files.has(p)) {
-      const raw = readFileSync(p);
-      const type = TYPES[extname(p)] ?? "application/octet-stream";
-      const text = /^(text|application\/(json|manifest)|image\/svg)/.test(type);
-      files.set(p, { raw, type, etag: `"${createHash("sha256").update(raw).digest("hex").slice(0, 32)}"`, br: text ? brotliCompressSync(raw) : null, gz: text ? gzipSync(raw) : null });
+  const walk = (d) => {
+    for (const name of readdirSync(d)) {
+      const p = join(d, name);
+      if (statSync(p).isDirectory()) walk(p);
+      else {
+        const raw = readFileSync(p);
+        const type = TYPES[extname(p)] ?? "application/octet-stream";
+        const text = /^(text|application\/(json|manifest)|image\/svg)/.test(type);
+        files.set(p, { raw, type, etag: `"${createHash("sha256").update(raw).digest("hex").slice(0, 32)}"`, br: text ? brotliCompressSync(raw) : null, gz: text ? gzipSync(raw) : null });
+      }
     }
-    return files.get(p);
   };
+  walk(root);
+  const load = (p) => files.get(p) ?? files.get(join(root, "index.html"));
   const server = createServer((req, res) => {
     const path = decodeURIComponent(new URL(req.url, "http://x").pathname);
     let p = join(root, path);
-    if (!p.startsWith(root) || !existsSync(p) || statSync(p).isDirectory()) p = join(root, "index.html");
+    if (!p.startsWith(root) || !files.has(p)) p = join(root, "index.html");
     const f = load(p);
     const headers = { "content-type": f.type, etag: f.etag, "cache-control": path.startsWith("/assets/") ? opt["asset-cache-control"] : "public, max-age=0, must-revalidate" };
     if (req.headers["if-none-match"] === f.etag) {
@@ -235,6 +241,7 @@ function pageProbe(content) {
       tick();
     });
   if (content) perf.first = perf.shown(content);
+  perf.h1 = perf.shown("h1");
   // Each key: from its keydown to the frame after it is painted (the next frame's rAF, then a task after it).
   addEventListener(
     "keydown",
@@ -495,7 +502,9 @@ function pageScenario(name, path, content, o = {}) {
           if (t === null) throw new Error(`${content} didn't show (${which})`);
           // Until the first polls have answered and the page is quiet.
           await page.waitForLoadState("networkidle").catch(() => {});
-          return { content: t, selector: content };
+          // The first paint with content, and the page's heading, for where the time to content went.
+          const { fcp, h1 } = await page.evaluate(async () => ({ fcp: performance.getEntriesByName("first-contentful-paint")[0]?.startTime ?? null, h1: await window.__perf.h1 }));
+          return { content: t, selector: content, fcp, h1 };
         });
         await settle(page, w);
         if (which === "cold") await page.close().catch(() => {});
