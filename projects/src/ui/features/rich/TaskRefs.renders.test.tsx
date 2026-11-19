@@ -17,6 +17,8 @@ import { RichMessage } from "./RichMessage";
 
 const chips = vi.hoisted(() => new Map<string, number>());
 const cards = vi.hoisted(() => new Map<string, number>());
+/** A tasks block's renders (its cards' frame, `TaskCards`), by the ids it shows. */
+const blocks = vi.hoisted(() => new Map<string, number>());
 const count = (m: Map<string, number>, id: string | undefined) => m.set(String(id), (m.get(String(id)) ?? 0) + 1);
 vi.mock("../../common/links", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../../common/links")>();
@@ -26,7 +28,12 @@ vi.mock("../../common/links", async (importOriginal) => {
 vi.mock("../../layout", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../../layout")>();
   const Card = mod.TaskRefCard;
-  return { ...mod, TaskRefCard: (p: Parameters<typeof Card>[0]) => (count(cards, p["data-task-ref"]), <Card {...p} />) };
+  const Cards = mod.TaskCards;
+  return {
+    ...mod,
+    TaskRefCard: (p: Parameters<typeof Card>[0]) => (count(cards, p["data-task-ref"]), <Card {...p} />),
+    TaskCards: (p: Parameters<typeof Cards>[0]) => (count(blocks, "block"), <Cards {...p} />),
+  };
 });
 
 const total = (m: Map<string, number>) => [...m.values()].reduce((a, b) => a + b, 0);
@@ -67,15 +74,20 @@ async function poll(qc: ReturnType<typeof createQueryClient>, key: readonly unkn
   await settle();
 }
 
+/** Measured numbers for the PR, printed with NEST_RENDERS_REPORT=1. */
 function report(step: string, started: number) {
-  console.info(`RENDERS ${step}: ${total(chips)} chips, ${total(cards)} cards in ${Math.round(performance.now() - started)} ms`);
+  if (process.env.NEST_RENDERS_REPORT) console.info(`RENDERS ${step}: ${total(chips)} chips, ${total(cards)} cards in ${Math.round(performance.now() - started)} ms`);
 }
 
 beforeEach(() => {
   chips.clear();
   cards.clear();
+  blocks.clear();
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("task chips and cards in a message", () => {
   it("with 30 chips of 10 tasks, a poll that changed one task re-renders that task's chips and card alone; an equal poll nothing", async () => {
@@ -125,14 +137,16 @@ describe("task chips and cards in a message", () => {
     const panel = (await within(context).findByRole("heading", { name: "Working on" })).closest("[data-ds=section]") as HTMLElement;
     await waitFor(() => expect(panel.querySelectorAll("[data-ds=task-card]")).toHaveLength(5));
     await settle();
-    // A task not under way changes: nothing in the panel renders.
+    // A task not under way changes: nothing in the panel renders, not even the cards' block.
     const done = api.tasks.find((t) => t.state === "done")!;
     api.tasks = api.tasks.map((t) => (t === done ? { ...t, title: "Done, renamed" } : t));
     cards.clear();
+    blocks.clear();
     let at = performance.now();
     await poll(view.queryClient, keys.tasks("prj_one"));
     report("manager panel, another task's poll", at);
     expect(total(cards)).toBe(0);
+    expect(total(blocks)).toBe(0);
     // A shown task's title changes (not its place): its card alone.
     const shown = api.tasks[1]!;
     api.tasks = api.tasks.map((t) => (t === shown ? { ...t, title: "Shown, renamed" } : t));

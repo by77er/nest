@@ -44,7 +44,10 @@ export const useProjects = () => useQuery({ queryKey: keys.projects, queryFn: ap
 
 export const useProject = (id: string) => useQuery({ queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project });
 
-/** The board: its tasks as summaries; `paused` while a card is being dragged, so a poll can't move cards under the pointer. */
+/**
+ * The board: its tasks as summaries. `paused`: this observer doesn't poll (the Board's while a row is
+ * dragged, so a poll can't move rows under the pointer).
+ */
 export const useTasks = (id: string, o: { paused?: boolean } = {}) =>
   useQuery({ queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: o.paused ? false : POLL.board });
 

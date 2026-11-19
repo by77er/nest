@@ -44,7 +44,9 @@ function BoardAndAsks({ projectId, repo, tasksHeading }: { projectId: string; re
   const attention = useAttention(projectId);
   // The app's own items, read without nest (what "Needs you" lists until the asks are in).
   const local = useLocalAttention(projectId, attention.data === undefined);
-  const tasks = useTasks(projectId);
+  // Only the first read is waited for here: the Board's own observer polls, and pauses while a row is
+  // dragged (an interval here would keep polling under the dragged row).
+  const tasks = useTasks(projectId, { paused: true });
   const [waited, setWaited] = useState(false);
   useEffect(() => {
     const t = setTimeout(() => setWaited(true), COLD_BUDGET_MS);

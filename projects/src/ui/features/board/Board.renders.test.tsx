@@ -40,9 +40,9 @@ function board(): Task[] {
 
 const ids = (tasks: Task[], states: TaskState[]) => new Set(tasks.filter((t) => states.includes(t.state)).map((t) => t.id));
 
-/** Measured numbers, printed for the PR (rows rendered and the step's wall time). */
+/** Measured numbers for the PR (rows rendered and the step's wall time), printed with NEST_RENDERS_REPORT=1. */
 function report(step: string, started: number) {
-  console.info(`RENDERS ${step}: ${total()} rows in ${Math.round(performance.now() - started)} ms`);
+  if (process.env.NEST_RENDERS_REPORT) console.info(`RENDERS ${step}: ${total()} rows in ${Math.round(performance.now() - started)} ms`);
 }
 
 async function mount(api: FakeApi) {
@@ -170,10 +170,10 @@ describe("the board's renders, with 300 tasks", () => {
     act(() => grip.focus());
     await view.user.keyboard("[Space]");
     await waitFor(() => expect(grip).toHaveAttribute("data-dragging"));
-    // While dragging, the board's query doesn't poll.
-    const observer = view.queryClient.getQueryCache().find({ queryKey: keys.tasks("prj_one"), exact: true })!;
-    expect(observer.observers.some((o) => o.options.refetchInterval === false)).toBe(true);
-    await act(() => new Promise((r) => setTimeout(r, 20)));
+    // While dragging, the board doesn't poll: no read of its tasks for longer than its 5 s interval.
+    const reads = api.reads.filter((r) => r === "/api/projects/prj_one/tasks").length;
+    await act(() => new Promise((r) => setTimeout(r, 5_500)));
+    expect(api.reads.filter((r) => r === "/api/projects/prj_one/tasks").length).toBe(reads);
     await view.user.keyboard("[Escape]");
     await waitFor(() => expect(grip).not.toHaveAttribute("data-dragging"));
     report("drag start and end", started);
