@@ -169,29 +169,45 @@ function inputOf(input: unknown): { fields: ToolStep["input"]; summary: string }
   return { fields: [{ key: "input (cut short)", value: field(raw) }], summary };
 }
 
-function stepsOfTurn(t: ChatTurn, running: boolean): Step[] {
+/**
+ * A turn's steps already worked out, by their event's seq (events never change once sent): a text as it
+ * was, a call's input read once (`inputOf`), and its step reused while its result and running are the same.
+ */
+type StepCache = Map<number, { kind: "text"; step: TextStep } | { kind: "tool"; resultSeq: number | null; running: boolean; step: ToolStep; input: ReturnType<typeof inputOf> }>;
+
+function stepsOfTurn(t: ChatTurn, running: boolean, cache: StepCache = new Map()): Step[] {
   return t.items.map((item): Step => {
-    if (item.kind === "text") return item;
+    if (item.kind === "text") {
+      const seq = Number(item.key.slice(1));
+      const had = cache.get(seq);
+      if (had?.kind === "text" && had.step.text === item.text) return had.step;
+      cache.set(seq, { kind: "text", step: item });
+      return item;
+    }
     const r = item.result;
-    const { fields, summary } = inputOf(item.call.input);
-    return {
+    const resultSeq = r ? r.seq : null;
+    const had = cache.get(item.call.seq);
+    const known = had?.kind === "tool" ? had : undefined;
+    if (known && known.resultSeq === resultSeq && known.running === running) return known.step;
+    const input = known?.input ?? inputOf(item.call.input);
+    const step: ToolStep = {
       kind: "tool",
       key: item.key,
       ts_ms: item.call.ts_ms,
       name: toolName(str(item.call.name)),
-      summary,
-      input: fields,
+      summary: input.summary,
+      input: input.fields,
       result: r ? str(r.summary) : null,
       status: r ? (r.is_error ? "error" : "done") : running ? "running" : "stopped",
     };
+    cache.set(item.call.seq, { kind: "tool", resultSeq, running, step, input });
+    return step;
   });
 }
 
 /** The turn running now (started, not completed), if any: the ring's last turn. */
 export function liveTurn(events: TraceEvent[]): LiveTurn | null {
-  const t = chatTurns(events).at(-1);
-  if (!t || !t.started || t.completed) return null;
-  return { turn: t.turn, steps: stepsOfTurn(t, true) };
+  return new TurnReader().read(events).live;
 }
 
 /** A finished turn, as it ended: its steps (a call it never answered stopped) and its reply (its last text), if any. */
@@ -203,13 +219,79 @@ export interface FinishedTurn {
 
 /** Every finished turn the ring holds, oldest first. */
 export function finishedTurns(events: TraceEvent[]): FinishedTurn[] {
-  return chatTurns(events)
-    .filter((t) => t.completed)
-    .map((t) => {
-      const steps = stepsOfTurn(t, false);
-      const texts = steps.filter((s): s is TextStep => s.kind === "text");
-      return { turn: t.turn, steps, reply: texts.length ? texts[texts.length - 1]!.text.trim() : null };
-    });
+  return new TurnReader().read(events).finished;
+}
+
+function finishedOf(t: ChatTurn, cache: StepCache): FinishedTurn {
+  const steps = stepsOfTurn(t, false, cache);
+  const texts = steps.filter((s): s is TextStep => s.kind === "text");
+  return { turn: t.turn, steps, reply: texts.length ? texts[texts.length - 1]!.text.trim() : null };
+}
+
+/** A turn as it was last read: its events' first and last seq and how many, and what was made of them. */
+interface Seen {
+  first: number;
+  last: number;
+  count: number;
+  /** As finished, once it is. */
+  finished: FinishedTurn | null;
+  /** As the turn in progress, while it is. */
+  live: LiveTurn | null;
+  steps: StepCache;
+}
+
+/**
+ * `liveTurn` and `finishedTurns` as the trace grows, each turn worked out once: one pass over the events
+ * per read sorts them by turn (nothing parsed), then only a turn whose events changed (the one in
+ * progress, or one the ring cut at its front) is read again, and in it only the steps that changed. A
+ * turn the same as at the last read keeps its objects, and the finished list its identity while no
+ * finished turn changed, so what's drawn from them can be skipped. Any number of new events per read
+ * (several in one state change, or one), and a trace that starts over, read the same.
+ */
+export class TurnReader {
+  private seen = new Map<string, Seen>();
+  private finished: FinishedTurn[] = [];
+  private live: LiveTurn | null = null;
+
+  read(events: TraceEvent[]): { live: LiveTurn | null; finished: FinishedTurn[] } {
+    // Each turn's events, the turns in the order they first appear (as `chatTurns` gathers them).
+    const byTurn = new Map<string, TraceEvent[]>();
+    for (const ev of events) {
+      if (!ev.turn) continue;
+      const evs = byTurn.get(ev.turn);
+      if (evs) evs.push(ev);
+      else byTurn.set(ev.turn, [ev]);
+    }
+    let lastId: string | undefined;
+    for (const id of byTurn.keys()) lastId = id;
+    const finished: FinishedTurn[] = [];
+    let live: LiveTurn | null = null;
+    for (const [id, evs] of byTurn) {
+      const first = evs[0]!.seq;
+      const last = evs[evs.length - 1]!.seq;
+      let s = this.seen.get(id);
+      if (!s || s.first !== first || s.last !== last || s.count !== evs.length) {
+        s = { first, last, count: evs.length, finished: null, live: null, steps: s?.steps ?? new Map() };
+        this.seen.set(id, s);
+      }
+      if (evs.some((e) => e.type === "turn_completed")) {
+        s.finished ??= finishedOf(chatTurns(evs)[0]!, s.steps);
+        finished.push(s.finished);
+      } else if (id === lastId && evs.some((e) => e.type === "turn_started")) {
+        if (!s.live) {
+          const steps = stepsOfTurn(chatTurns(evs)[0]!, true, s.steps);
+          const prev = this.live;
+          // An event that shows nothing new (a state): the turn as it was.
+          s.live = prev && prev.turn === id && prev.steps.length === steps.length && prev.steps.every((x, i) => x === steps[i]) ? prev : { turn: id, steps };
+        }
+        live = s.live;
+      }
+    }
+    if (this.seen.size > byTurn.size) for (const id of [...this.seen.keys()]) if (!byTurn.has(id)) this.seen.delete(id);
+    if (finished.length !== this.finished.length || finished.some((t, i) => t !== this.finished[i])) this.finished = finished;
+    this.live = live;
+    return { live, finished: this.finished };
+  }
 }
 
 /**
@@ -220,19 +302,37 @@ export function finishedTurns(events: TraceEvent[]): FinishedTurn[] {
  */
 export function stepsBySeq(messages: ChatMessage[], turns: FinishedTurn[]): Map<number, Step[]> {
   const out = new Map<number, Step[]>();
-  const manager = messages.filter((m) => m.sender === "manager").sort((a, b) => b.seq - a.seq);
-  const paired = new Set<number>();
-  for (const t of [...turns].reverse()) {
+  // The manager's messages by what they say, newest first: each turn takes the next one not paired yet.
+  const saying = new Map<string, ChatMessage[]>();
+  for (const m of messages.filter((x) => x.sender === "manager").sort((a, b) => b.seq - a.seq)) {
+    const t = m.text.trim();
+    const ms = saying.get(t);
+    if (ms) ms.push(m);
+    else saying.set(t, [m]);
+  }
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i]!;
     if (!t.reply) continue;
-    const m = manager.find((x) => !paired.has(x.seq) && x.text.trim() === t.reply);
+    const m = saying.get(t.reply)?.shift();
     if (!m) continue;
-    paired.add(m.seq);
-    let last = t.steps.length - 1;
-    while (last >= 0 && t.steps[last]!.kind !== "text") last--;
-    const steps = t.steps.filter((_, i) => i !== last);
-    if (steps.some((s) => s.kind === "tool")) out.set(m.seq, steps);
+    const steps = behindReply(t);
+    if (steps) out.set(m.seq, steps);
   }
   return out;
+}
+
+/** Each finished turn's steps behind its reply, worked out once per turn (the same array each time it's paired). */
+const behind = new WeakMap<FinishedTurn, Step[] | null>();
+function behindReply(t: FinishedTurn): Step[] | null {
+  let steps = behind.get(t);
+  if (steps === undefined) {
+    let last = t.steps.length - 1;
+    while (last >= 0 && t.steps[last]!.kind !== "text") last--;
+    const rest = t.steps.filter((_, i) => i !== last);
+    steps = rest.some((s) => s.kind === "tool") ? rest : null;
+    behind.set(t, steps);
+  }
+  return steps;
 }
 
 /**
