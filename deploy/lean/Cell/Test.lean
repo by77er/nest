@@ -146,9 +146,9 @@ it: no host is launched that placement would then refuse. The 4 GiB types (every
 `.large`) hold none, which is why they are no longer launched. -/
 theorem launch_types_hold_a_sandbox : use1.memoryCommitPct > 0 ∧ use1.launchTypesHoldASandbox = true := by decide
 
-/-- What the rule allows per host: five default sandboxes on 16 GiB, two on 8, none on 4. -/
-example : use1.defaultSandboxesOn "r8id.large" = 5 ∧ use1.defaultSandboxesOn "m8id.large" = 2
-    ∧ use1.defaultSandboxesOn "m8i.large" = 2 ∧ use1.defaultSandboxesOn "c8id.large" = 0
+/-- What the rule allows per host: three default sandboxes on 16 GiB, one on 8, none on 4. -/
+example : use1.defaultSandboxesOn "r8id.large" = 3 ∧ use1.defaultSandboxesOn "m8id.large" = 1
+    ∧ use1.defaultSandboxesOn "m8i.large" = 1 ∧ use1.defaultSandboxesOn "c8id.large" = 0
     ∧ use1.defaultSandboxesOn "c8i-flex.large" = 0 := by decide
 
 /-- `AWS_CELLS` is JSON keyed by the cell, carrying the stack's template, subnets and proxy root CA

@@ -27,6 +27,17 @@ const json = (body: unknown, status = 200) =>
 const err = (status: number, error: string) => json({ error }, status);
 const done = <T>(r: Result<T>, status = 200) => (r.ok ? json(r.value, status) : err(r.status, r.error));
 
+/**
+ * A read started before an earlier one's answer is known, so the two overlap. Awaited where it was awaited
+ * when they ran one after another, it answers or fails there as it did; one never awaited (the earlier answer
+ * ended the request) fails nothing.
+ */
+function early<T>(p: T | Promise<T>): Promise<T> {
+  const started = Promise.resolve(p);
+  started.catch(() => {});
+  return started;
+}
+
 /** How long the repo's owner as shown is kept by one Worker instance (and a failed read): a page polls the project every few seconds. */
 const OWNER_SHOWN_MS = 60_000;
 const ownersShown = new Map<string, { at_ms: number; owner: { id: number; login: string } | null }>();
@@ -62,14 +73,22 @@ async function shownOwner(env: Env, b: RepoBinding): Promise<{ id: number; login
  * as DirectoryDO has it and its owner as GitHub answers, both read through (README.md#the-repos-binding), and
  * ReviewDO's `max_concurrent_reviews` and what happens to PRs it doesn't trust (README.md#the-review-gate).
  */
-async function answerSettings(env: Env, id: string, r: Result<ProjectSettings>): Promise<Result<Settings & { max_concurrent_reviews: number | null; untrusted_reviews: UntrustedPolicy }>> {
+async function answerSettings(env: Env, id: string, settings: Result<ProjectSettings> | Promise<Result<ProjectSettings>>): Promise<Result<Settings & { max_concurrent_reviews: number | null; untrusted_reviews: UntrustedPolicy }>> {
+  // Settings a write answered: a refusal is the answer, nothing else read.
+  if (!(settings instanceof Promise) && !settings.ok) return settings;
+  // The binding and ReviewDO's settings don't need ProjectDO's: read beside them (a poll's settings still being
+  // read), and answered in the order they were: ProjectDO's refusal, then an unknown binding, then the rest.
+  const binding = early(directory(env).binding(id));
+  const reviews = early(review(env, id).reviewSettings());
+  const r = await settings;
   if (!r.ok) return r;
-  const b = await directory(env).binding(id);
+  const b = await binding;
   if (!b) return { ok: false, status: 404, error: "unknown project" };
-  const rv = review(env, id);
+  const owner = await shownOwner(env, b);
+  const rv = await reviews;
   return {
     ok: true,
-    value: { ...r.value, repo: b.repo, repo_owner: await shownOwner(env, b), max_concurrent_reviews: await rv.maxConcurrent(), untrusted_reviews: await rv.untrustedPolicy() },
+    value: { ...r.value, repo: b.repo, repo_owner: owner, max_concurrent_reviews: rv.max_concurrent_reviews, untrusted_reviews: rv.untrusted_reviews },
   };
 }
 
@@ -119,16 +138,19 @@ async function rereadBinding(env: Env, id: string, shownId?: number): Promise<Re
  * oldest first. The projects list's `needs_you` counts the same items without reading this (one nest read for every project).
  */
 async function attentionOf(env: Env, pid: string): Promise<Result<{ kind: string; at_ms: number }[]>> {
+  // ReviewDO's beside ProjectDO's (which waits on nest for the asks); ProjectDO's refusal is still the answer.
+  const reviews = early(reviewItems(env, pid));
   const a = (await project(env, pid).attention()) as Result<{ kind: string; at_ms: number }[]>;
   if (!a.ok) return a;
-  return { ok: true, value: [...a.value, ...(await reviewItems(env, pid))].sort((x, y) => x.at_ms - y.at_ms) };
+  return { ok: true, value: [...a.value, ...(await reviews)].sort((x, y) => x.at_ms - y.at_ms) };
 }
 
-/** ReviewDO's items in "Needs you": the reviews held for approval, and the review backlog as one item. */
+/** ReviewDO's items in "Needs you": the reviews held for approval, and the review backlog as one item (one call). */
 async function reviewItems(env: Env, pid: string): Promise<{ kind: string; at_ms: number }[]> {
-  const held = (await review(env, pid).held()).map((j) => ({ kind: "review" as const, pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
+  const mine = await review(env, pid).needsYou();
+  const held = mine.held.map((j) => ({ kind: "review" as const, pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
   // PRs past every cap, with no job yet: one item, their count.
-  const skipped = await review(env, pid).skipped();
+  const skipped = mine.skipped;
   const backlog = skipped.count ? [{ kind: "review_backlog" as const, count: skipped.count, at_ms: skipped.at_ms ?? Date.now() }] : [];
   return [...held, ...backlog];
 }
@@ -189,8 +211,10 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   if (parts.join("/") === "repos") {
     if (m !== "GET") return err(405, "GET only");
     try {
+      // The projects beside GitHub's answer; GitHub's failure is still the answer.
+      const projects = early(directory(env).projects());
       const r = await attachableRepos(env);
-      const byRepo = new Map((await directory(env).projects()).map((p) => [p.repo.toLowerCase(), p.id]));
+      const byRepo = new Map((await projects).map((p) => [p.repo.toLowerCase(), p.id]));
       return json({ repos: r.repos.map((repo) => ({ repo, project: byRepo.get(repo) ?? null })), unlisted: r.unlisted, complete: r.complete, app: r.app });
     } catch (e) {
       return err(502, `GitHub couldn't say which repos the app's GitHub App reaches: ${e instanceof Error ? e.message : String(e)}`);
@@ -203,14 +227,17 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     if (m === "GET") {
       const rows = await directory(env).projects();
       // The count is the length of the list "Needs you" shows: the app's own items (`localAttention`, the
-      // reviews) and the project's asks, read once for every project.
-      const asks = rows.some((r) => r.state === "ready") ? await askCounts(env) : new Map<string, number>();
-      return json({ projects: await Promise.all(rows.map(async (r) => {
-        if (r.state !== "ready") return { ...r, needs_you: 0 };
+      // reviews) and the project's asks, read once for every project. All read at once.
+      const reading = rows.some((r) => r.state === "ready") ? askCounts(env) : new Map<string, number>();
+      const owns = early(Promise.all(rows.map(async (r) => {
+        if (r.state !== "ready") return null;
+        const reviews = early(reviewItems(env, r.id));
         const local = (await project(env, r.id).localAttention()) as Result<unknown[]>;
-        const own = (local.ok ? local.value.length : 0) + (await reviewItems(env, r.id)).length;
-        return { ...r, needs_you: asks === null ? null : own + (asks.get(r.id) ?? 0) };
-      })) });
+        return (local.ok ? local.value.length : 0) + (await reviews).length;
+      })));
+      const asks = await reading;
+      const own = await owns;
+      return json({ projects: rows.map((r, i) => (r.state !== "ready" ? { ...r, needs_you: 0 } : { ...r, needs_you: asks === null ? null : own[i]! + (asks.get(r.id) ?? 0) })) });
     }
     if (m !== "POST") return err(405, "GET or POST");
     const b = await body(req, CreateProject);
@@ -261,13 +288,12 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   switch (route) {
     case "GET ": {
       // Looking at the project reads the repo's auto-merge setting again (at most once a minute).
-      await p.refreshRepoAutoMerge();
-      const s = await answerSettings(env, pid, await p.getSettings());
+      const s = await answerSettings(env, pid, Promise.resolve(p.settingsLookedAt()));
       if (!s.ok) return done(s);
       return json({ ...row, settings: s.value });
     }
     case "GET settings":
-      return done(await answerSettings(env, pid, await p.getSettings()));
+      return done(await answerSettings(env, pid, Promise.resolve(p.getSettings())));
     case "PATCH settings": {
       const b = await body(req, SettingsBody);
       if (!b.ok) return b.res;
@@ -285,16 +311,21 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "GET secrets": {
       // Metadata only: the app's, with nest's last injection and size; never a value.
+      // nest's secrets and the workflow facts too, all read at once, each awaited where it was (so a refusal
+      // of the project's secrets is still the answer).
+      const nest = nestFrom(env);
+      const listed = nest ? early(nest.listSecrets()) : null;
+      const workflowWorkers = early(p.workflowWorkers());
+      const workflowsRefused = early(p.workflowsRefused());
       const [mine, g, layers, legacy] = await Promise.all([p.secrets(), grantOf(env), p.network(), p.workersOnNestRepos()]);
       if (!mine.ok) return done(mine);
       // nest's grant bounds workflows only for a live worker on nest's repos (its push opt-in): with none, it bounds
       // nothing, whatever its `github_push` says (README.md#converging-onto-the-apps-own-access).
       if (g.ok && !legacy) g.value.workflows = true;
-      const nest = nestFrom(env);
       let theirs: Map<string, { size: number; last_injected_ms: number | null }> = new Map();
-      if (nest) {
+      if (listed) {
         try {
-          theirs = new Map((await nest.listSecrets()).map((x) => [x.name, x]));
+          theirs = new Map((await listed).map((x) => [x.name, x]));
         } catch {
           // shown without nest's facts
         }
@@ -311,9 +342,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
         // Each live agent's client layer, which carries its bindings and variables (shared with the Network page).
         agents: layers.ok ? layers.value.agents : [],
         // Live workers whose push token may change workflows (README.md#secrets): theirs until they end.
-        workflow_workers: await p.workflowWorkers(),
+        workflow_workers: await workflowWorkers,
         // Why none may though the setting says so: the App's installation doesn't grant workflows: write.
-        workflows_refused: await p.workflowsRefused(),
+        workflows_refused: await workflowsRefused,
       });
     }
     case "PUT secrets/:name": {
@@ -512,8 +543,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     case "GET attention": {
       // `?local=1`: the app's own items only, without reading nest (the page shows them while the asks load).
       if (url.searchParams.get("local") === "1") {
+        const reviews = early(reviewItems(env, pid));
         const l = (await p.localAttention()) as Result<{ kind: string; at_ms: number }[]>;
-        return l.ok ? json([...l.value, ...(await reviewItems(env, pid))].sort((x, y) => x.at_ms - y.at_ms)) : err(l.status, l.error);
+        return l.ok ? json([...l.value, ...(await reviews)].sort((x, y) => x.at_ms - y.at_ms)) : err(l.status, l.error);
       }
       const a = await attentionOf(env, pid);
       return a.ok ? json(a.value) : err(a.status, a.error);
@@ -633,9 +665,11 @@ async function egressHostsOf(env: Env): Promise<Result<string[]>> {
  * manager runs, or when nest can't be read).
  */
 async function networkView(env: Env, p: ReturnType<typeof project>, have?: Awaited<ReturnType<ReturnType<typeof project>["network"]>> extends Result<infer T> ? T : never): Promise<Response> {
+  // The grant and the manager's sandbox beside the rules (the rules' refusal is still the answer).
+  const others = early(Promise.all([egressHostsOf(env), p.managerSandbox()]));
   const mine = have ? { ok: true as const, value: have } : await p.network();
   if (!mine.ok) return err(mine.status, mine.error);
-  const [grant, sandbox] = await Promise.all([egressHostsOf(env), p.managerSandbox()]);
+  const [grant, sandbox] = await others;
   let base: OperatorRule[] | null = null;
   const nest = nestFrom(env);
   if (nest && sandbox) {
