@@ -487,7 +487,7 @@ mod tests {
             paused: Duration::from_millis(1500),
             max_sleep: Duration::from_millis(100),
             edge_pause: Duration::from_millis(50),
-            open: OpenOptions { connect_timeout: Duration::from_millis(300), bind_timeout: Duration::from_secs(5) },
+            open: OpenOptions { connect_timeout: Duration::from_millis(300), bind_timeout: Duration::from_secs(5), ..OpenOptions::default() },
         }
     }
 
@@ -840,7 +840,7 @@ mod tests {
         let (gw, guest) = gateway_with_guest().await;
         guest.freeze(true).await;
         let (agent, _) = agent_with_resolver(vec![target(gw.target(SBX, 4, AGENT))]);
-        let budgets = Budgets { open: OpenOptions { connect_timeout: Duration::from_millis(300), bind_timeout: Duration::from_millis(300) }, ..split() };
+        let budgets = Budgets { open: OpenOptions { connect_timeout: Duration::from_millis(300), bind_timeout: Duration::from_millis(300), ..OpenOptions::default() }, ..split() };
         let started = Instant::now();
         let r = call_with(&agent, "c2".into(), bash("echo hi"), &CancellationToken::new(), &budgets).await;
         assert!(text_of(&r).contains("stayed busy") && text_of(&r).contains("paused or slow"), "{r:?}");

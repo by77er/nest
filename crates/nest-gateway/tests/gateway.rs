@@ -439,6 +439,29 @@ async fn pings_before_bind_are_tolerated() {
     assert!(matches!(bind(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await, GatewayMessage::Bound { .. }));
 }
 
+/// A client's keepalive: a ping while a call is under way is answered with a pong at once (the
+/// gateway reads the client throughout), isn't passed to the guest, and leaves the call as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ping_during_a_call_is_answered_and_the_call_goes_on() {
+    let signer = Signer::generate();
+    let guest = FakeGuest::start().await;
+    let addr = start_server(ready_state(&signer, &guest)).await;
+    let mut ws = connect(&addr, "/hands").await;
+    assert!(matches!(bind(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await, GatewayMessage::Bound { .. }));
+    ws.send(Message::binary(hands_request(AGENT, 4, 1))).await.unwrap();
+    let _started = ws.next().await.unwrap().unwrap();
+    let _echo = ws.next().await.unwrap().unwrap();
+    // The call is quiet now: nothing comes from the guest. The ping's answer comes all the same.
+    ws.send(Message::Ping(b"keepalive".to_vec().into())).await.unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a pong while the call is quiet").unwrap().unwrap();
+    assert!(matches!(&pong, Message::Pong(p) if p.as_ref() == b"keepalive"), "{pong:?}");
+    assert_eq!(guest.frames().await.len(), 1, "the ping never reached the guest");
+    // And the call goes on: the next frame is piped as before.
+    ws.send(Message::binary(hands_request(AGENT, 4, 1))).await.unwrap();
+    assert!(matches!(ws.next().await.unwrap().unwrap(), Message::Binary(_)));
+    assert_eq!(guest.frames().await.len(), 2);
+}
+
 // --- framing after bound -----------------------------------------------------------------------
 
 async fn bound_ws(addr: &str, signer: &Signer) -> Ws {

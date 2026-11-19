@@ -91,6 +91,7 @@ Set together (`nest_protocol::gateway`), so a slow or frozen guest reaches the c
 | Client: bind (`CLIENT_BIND_TIMEOUT_MS`) | 10 s | sending `bind` | `Timeout(Bind)`, retried like `busy` |
 | Client: `busy` budget (the runner's `Budgets::busy`) | 30 s | the first `busy` or bind timeout of a call | the call's error, naming the last refusal's message |
 | Client: paused budget (`Budgets::paused`), instead, once a `busy` with reason `paused` came in the call | 120 s | the same | the same |
+| Client: keepalive (`nest_hands_client::KEEPALIVE`) | 30 s | each wait for a frame after `bound` | a WebSocket ping, which the gateway's WebSocket layer answers with a pong; nothing reaches the guest. Keeps a quiet call from being dropped as idle on the way ([gateway](../../sandbox/gateway/)) |
 
 The client's bind timer must exceed the gateway's guest timer by at least 5 s (`BIND_TIMEOUT_MARGIN_MS`: the edge, the tunnel and the token check), asserted at compile time: with equal timers the client's fires first, and a call meeting a paused guest fails instead of waiting.
 
