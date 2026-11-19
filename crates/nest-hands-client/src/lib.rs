@@ -52,6 +52,7 @@ pub struct OpenOptions {
 /// the connection (a tunnel, an edge) drops one that is idle: calls quiet for 125 s were reset
 /// (2026-11-18/19, through Cloudflare Tunnel; the limit itself is unverified). A WebSocket ping
 /// every 30 s, which the gateway's WebSocket layer answers, keeps both directions busy.
+/// Unverified on a host: that ping and pong frames count as activity for whatever cuts at 125 s.
 pub const KEEPALIVE: Duration = Duration::from_secs(30);
 
 impl Default for OpenOptions {
@@ -642,7 +643,8 @@ impl HandsConn {
     /// (`ConnectionReset`); a text message, a `DATA` frame or a message that is not exactly one
     /// frame is [`RecvError::Protocol`]. Cancel-safe: a frame that arrives while the future is
     /// dropped is returned by the next call. While it waits it pings the gateway every
-    /// [`OpenOptions::keepalive`], so a call that is quiet for minutes isn't dropped as idle.
+    /// [`OpenOptions::keepalive`], so a call that is quiet for minutes isn't dropped as idle. The
+    /// interval starts with each call: a caller that polls with a shorter timeout never pings.
     pub async fn recv_json<T: serde::de::DeserializeOwned>(
         &mut self,
     ) -> Result<Option<T>, RecvError> {

@@ -718,11 +718,12 @@ async fn a_quiet_call_is_pinged_while_it_waits_and_still_gets_its_answer() {
     conn.send_json(&req).await.unwrap();
     let got: Option<serde_json::Value> = conn.recv_json().await.unwrap();
     assert_eq!(got, Some(req));
-    // 400 ms of quiet at 40 ms: several pings, read by the gateway once it reads again.
+    // 400 ms of quiet at 40 ms: several pings were sent. This fake reads them only once it has
+    // answered (the real gateway's answer while a call is quiet is its own test).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while *gw.pings.lock().unwrap() < 3 {
         assert!(std::time::Instant::now() < deadline, "the gateway saw {} pings", *gw.pings.lock().unwrap());
-        let _: Result<Result<Option<serde_json::Value>, _>, _> = tokio::time::timeout(Duration::from_millis(20), conn.recv_json()).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     // A call answered within the interval sends none.
     let gw = gateway(Mode::Echo).await;
