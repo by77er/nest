@@ -10,7 +10,7 @@
 import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Tooltip, VisuallyHidden } from "@mantine/core";
 import { useReducedMotion } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowDown, IconCalendarEvent, IconCopy, IconDots, IconListCheck, IconMessage, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
-import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "../../api/client";
 import { useChat, useManager, usePostChat, useRetryChat } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
@@ -182,6 +182,30 @@ function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (tex
   );
 }
 
+/**
+ * One clock for the log's relative times, read every `AGO_TICK_MS` while any is shown: a message is drawn
+ * again only for its own changes, so its time ("5 minutes ago") follows the clock on its own, and only
+ * when its words change.
+ */
+const AGO_TICK_MS = 15_000;
+const clock = { listeners: new Set<() => void>(), timer: undefined as ReturnType<typeof setInterval> | undefined };
+function onTick(listener: () => void) {
+  clock.listeners.add(listener);
+  clock.timer ??= setInterval(() => {
+    for (const l of clock.listeners) l();
+  }, AGO_TICK_MS);
+  return () => {
+    clock.listeners.delete(listener);
+    if (clock.listeners.size === 0) {
+      clearInterval(clock.timer);
+      clock.timer = undefined;
+    }
+  };
+}
+function Ago({ ms }: { ms: number }) {
+  return <>{useSyncExternalStore(onTick, () => ago(ms))}</>;
+}
+
 /** A message's delivery state (README.md#outboxes): an older row without one reads from `delivered` and `error`. */
 const statusOf = (m: ChatMessage) => m.status ?? (m.delivered ? "done" : m.error ? "failed" : "owed");
 
@@ -283,7 +307,7 @@ const Message = memo(function Message({ m, projectId, appear: appearing, steps, 
           {/* The exact time on hover; for the keyboard and touch it heads the message's actions. */}
           <Tooltip label={exact(m.at_ms)} withArrow>
             <Text component="time" dateTime={new Date(m.at_ms).toISOString()} fz="xs" c="dimmed">
-              {ago(m.at_ms)}
+              <Ago ms={m.at_ms} />
             </Text>
           </Tooltip>
           {failed && (

@@ -177,3 +177,24 @@ describe("what the chat re-renders", () => {
     }
   });
 });
+
+describe("what the chat still draws again", () => {
+  it("a message's time follows the clock though nothing else draws it again", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = apiWith([{ seq: 1, at_ms: Date.now() - 10_000, sender: "owner", text: "Message 1", delivered: true, status: "done", error: null }]);
+      renderApp("/projects/prj_one/manager", api);
+      const c = await chat();
+      await within(c).findByText("Message 1");
+      const time = c.querySelector("time")!;
+      expect(time).toHaveTextContent("just now");
+      reset();
+      await act(() => vi.advanceTimersByTimeAsync(3 * 60_000));
+      expect(time).toHaveTextContent("3 minutes ago");
+      // Only its time: the message itself wasn't drawn again.
+      expect(counts.rows).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
