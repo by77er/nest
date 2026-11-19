@@ -99,6 +99,18 @@ describe("grouping from the last state's", () => {
     expect(a.groups.at(-1)!.completed).toBeNull();
   });
 
+  it("an appended event is the only one read: the work is for what came, not for all that's held", () => {
+    let reads = 0;
+    const counted = turns(100).map((e) => {
+      const { type, ...rest } = e;
+      return Object.defineProperty(rest, "type", { enumerable: true, get: () => (reads++, type) }) as TraceEvent;
+    });
+    const a = groupTurnsFrom(null, counted);
+    reads = 0;
+    groupTurnsFrom(a, [...counted, ev(1000, "assistant_text", { turn: counted.at(-1)!.turn })]);
+    expect(reads).toBe(0);
+  });
+
   it("a result changes only its call's item, and a new turn changes no earlier one", () => {
     const base = [...turns(3), ev(30, "turn_started", { turn: "n" }), ev(31, "tool_call", { turn: "n", call_id: "k" }), ev(32, "assistant_text", { turn: "n", text: "t" })];
     const a = groupTurnsFrom(null, base);
