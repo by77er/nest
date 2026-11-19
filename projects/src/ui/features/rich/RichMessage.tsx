@@ -12,6 +12,8 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { CodeFrame, icon, RichImage, RichProse, RichTableFrame, Stack, TaskCheck } from "../../layout";
+// KaTeX's stylesheet, with the chunk that renders the math (not from the index, which every page loads).
+import "../../layout/katex";
 import { rehypeHighlightCode } from "../../rich/highlight";
 import { INLINE_IMAGE, LINK, urlTransform } from "../../rich/links";
 import { splitSvg } from "../../rich/svg";

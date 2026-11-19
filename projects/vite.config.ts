@@ -6,7 +6,8 @@ import { defineConfig } from "vite";
 // answers the JSON API, the MCP servers and the webhooks. `vite dev` runs both in workerd; `vite build`
 // writes dist/ and the Worker config that `wrangler deploy` picks up.
 // The page's libraries are chunks of their own (Mantine, React, the rest), so a release that changes only
-// the app's code leaves them cached.
+// the app's code leaves them cached; the ones only some pages use load with those pages, not with the entry
+// (README.md#the-ui).
 export default defineConfig({
   plugins: [react(), cloudflare()],
   environments: {
@@ -22,6 +23,15 @@ export default defineConfig({
                 { name: "editor", includeDependenciesRecursively: false, test: /node_modules[\\/](@tiptap[\\/]|@mantine[\\/]tiptap[\\/]|prosemirror-|marked[\\/]|linkifyjs[\\/]|orderedmap[\\/]|rope-sequence[\\/]|w3c-keyname[\\/])/ },
                 { name: "mantine", test: /node_modules[\\/]@mantine[\\/]/ },
                 { name: "react", test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
+                // The rich-text libraries, each loaded only by the chunks that render with it (never by the
+                // entry). Earlier groups take a module first: the Markdown pipeline (with its helpers, which
+                // the groups after it share), then what only the chat's messages use.
+                { name: "markdown", test: /node_modules[\\/](react-markdown|remark-[^\\/]+|rehype-(?!katex)[^\\/]+|micromark[^\\/]*|mdast-[^\\/]+|hast-[^\\/]+|hastscript|unified|unist-[^\\/]+|vfile[^\\/]*)[\\/]/ },
+                { name: "katex", test: /node_modules[\\/](katex|rehype-katex)[\\/]/ },
+                { name: "highlight", test: /node_modules[\\/](highlight\.js|lowlight)[\\/]/ },
+                { name: "dompurify", test: /node_modules[\\/]dompurify[\\/]/ },
+                { name: "dnd", test: /node_modules[\\/]@dnd-kit[\\/]/ },
+                { name: "zod", test: /node_modules[\\/]zod[\\/]/ },
                 { name: "vendor", test: /node_modules[\\/]/ },
               ],
             },
