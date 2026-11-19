@@ -13,15 +13,16 @@ def use1 : CellSpec :=
     -- pause for whole reads). Only types with nested virtualization, on a CPU Firecracker supports
     -- (I7i is Emerald Rapids, which Firecracker doesn't list). Memory decides how many sandboxes a
     -- host holds (the commit rule below), so the most memory comes first: r8id.large (16 GiB) holds
-    -- five default sandboxes, m8id and m8i (8 GiB) two. The 4 GiB types (c8id, c8i-flex, c8i) hold
+    -- three default sandboxes, m8id and m8i (8 GiB) one. The 4 GiB types (c8id, c8i-flex, c8i) hold
     -- none and are no longer launched (`launch_types_hold_a_sandbox`); their families stay in IAM.
     instanceFamilies := ["c8id", "m8id", "r8id", "c8i-flex", "c8i", "m8i"]
     launchTypes := ["r8id.large", "m8id.large", "m8i.large"]
-    -- A host's sandboxes may be declared up to 150% of its memory less its own reserve. Their
-    -- memory is demand-paged, so they rarely all reach their size at once; at 100% a 16 GiB host
-    -- would hold three. Free memory alone admitted six 4 GiB sandboxes to a 4 GiB host, whose VMs
-    -- the kernel then killed (2026-11-18). Unmeasured: the right ratio for real workloads.
-    memoryCommitPct := 150
+    -- A host's sandboxes are declared no more than its memory less its own reserve: no overcommit.
+    -- A working guest does reach its size (its page cache fills it, and nothing takes memory back
+    -- from a guest: no balloon), so anything above 100% loses VMs. At 150%, between 2026-11-18 and
+    -- -19, the kernel killed a VMM 13 times on 8 GiB hosts holding two 4 GiB sandboxes, each time
+    -- with both at 3.4 to 4.0 GiB (the hosts' journals, `logs/` in the cell's bucket).
+    memoryCommitPct := 100
     -- 14 × 8 GB fits the 118 GB store of every listed instance-store type
     -- (`sandboxes_fit_their_disk`); a c8i-flex.large held 14 by memory in the stress test.
     maxSandboxesPerHost := 14
