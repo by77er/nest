@@ -1413,7 +1413,7 @@ export async function deliverGithub(event: string, payload: unknown, o: { secret
 
 /** A `pull_request` event's payload, in the fields GitHub sends that the app reads. */
 export function prEvent(o: {
-  repo: string; number: number; sha: string; action: string; ref?: string; base?: string; title?: string; merged?: boolean; updated_at?: string; headRepo?: string;
+  repo: string; number: number; sha: string; action: string; ref?: string; base?: string; title?: string; merged?: boolean; updated_at?: string; headRepo?: string; draft?: boolean;
   /** The PR's author: the repo's owner (a user) unless given; null for an event naming none. */
   user?: { id: number; login: string; type: string } | null;
 }) {
@@ -1422,7 +1422,7 @@ export function prEvent(o: {
   return {
     action: o.action, number: o.number,
     pull_request: {
-      number: o.number, node_id: prNode(o.repo, o.number), title: o.title ?? `PR ${o.number}`, state: o.action === "closed" ? "closed" : "open", merged: o.merged ?? false,
+      number: o.number, node_id: prNode(o.repo, o.number), title: o.title ?? `PR ${o.number}`, state: o.action === "closed" ? "closed" : "open", merged: o.merged ?? false, draft: o.draft ?? false,
       updated_at: o.updated_at ?? new Date().toISOString(),
       ...(user ? { user } : {}),
       head: { sha: o.sha, ref: o.ref ?? `feature-${o.number}`, repo: { full_name: o.headRepo ?? o.repo } },

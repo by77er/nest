@@ -210,6 +210,11 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
     "ALTER TABLE jobs ADD COLUMN reviews TEXT",
     "ALTER TABLE jobs ADD COLUMN frozen_check INTEGER",
   ],
+  [
+    // Whether the PR is a draft as last heard (`onDraft`, `onHead`): a draft's check re-run starts nothing.
+    // The release before neither writes nor reads it; a PR it hears of keeps the flag until the next event.
+    "ALTER TABLE prs ADD COLUMN draft INTEGER NOT NULL DEFAULT 0",
+  ],
 ];
 
 /** `next_ms` for a row that's kept but never due (its column can't be null): a failed stop. */
@@ -433,6 +438,14 @@ export class ReviewDO extends DurableObject<Env> {
     return out;
   }
 
+  /** Of `heads`, those whose review is in flight (its job queued or running), as `<pr>/<sha>`. */
+  async reviewingAt(heads: readonly { pr: number; sha: string }[]): Promise<string[]> {
+    return heads.filter((h) => {
+      const s = this.jobRow(h.pr, h.sha)?.state;
+      return s === "queued" || s === "running";
+    }).map((h) => `${h.pr}/${h.sha}`);
+  }
+
   /** The jobs held for the owner's approval, oldest first. */
   async held(): Promise<Job[]> {
     return this.sql.exec("SELECT * FROM jobs WHERE state = 'held' ORDER BY created_ms, pr").toArray().map((r) => this.toJob(r));
@@ -455,7 +468,7 @@ export class ReviewDO extends DurableObject<Env> {
     this.sql.exec(
       `INSERT INTO prs (pr, sha, base, title, updated_at, open, author, author_id, fork) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
         ON CONFLICT (pr) DO UPDATE SET sha = excluded.sha, base = excluded.base, title = excluded.title, updated_at = excluded.updated_at, open = 1,
-          author = excluded.author, author_id = excluded.author_id, fork = excluded.fork, skipped_ms = NULL`,
+          author = excluded.author, author_id = excluded.author_id, fork = excluded.fork, skipped_ms = NULL, draft = 0`,
       e.pr, e.sha, e.base, e.title, e.updated_at, e.author, e.author_id, e.fork ? 1 : 0,
     );
     for (const old of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND sha != ? AND state IN ('held', 'overflow', 'queued', 'running')", e.pr, e.sha).toArray()) {
@@ -594,6 +607,29 @@ export class ReviewDO extends DurableObject<Env> {
     return ok(this.toJob(this.jobRow(pr, sha)!));
   }
 
+  /**
+   * A draft PR's head, from `pull_request` `opened`, `reopened`, `synchronize` or `converted_to_draft`
+   * with `draft: true`: not reviewed. The head is recorded (so an older event delivered late is ignored,
+   * as for `onHead`), and any job of the PR still waiting or running ends (superseded): its reviewer is
+   * stopped and its check cancelled. `ready_for_review` queues the head then (`onHead`).
+   */
+  async onDraft(p: ReviewOf, e: HeadEvent): Promise<void> {
+    this.bind(p);
+    const prev = this.sql.exec("SELECT updated_at FROM prs WHERE pr = ?", e.pr).toArray()[0];
+    if (prev && e.updated_at < (prev.updated_at as string)) return;
+    this.sql.exec(
+      `INSERT INTO prs (pr, sha, base, title, updated_at, open, author, author_id, fork, draft) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, 1)
+        ON CONFLICT (pr) DO UPDATE SET sha = excluded.sha, base = excluded.base, title = excluded.title, updated_at = excluded.updated_at, open = 1,
+          author = excluded.author, author_id = excluded.author_id, fork = excluded.fork, skipped_ms = NULL, draft = 1`,
+      e.pr, e.sha, e.base, e.title, e.updated_at, e.author, e.author_id, e.fork ? 1 : 0,
+    );
+    for (const j of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND state IN ('held', 'overflow', 'queued', 'running')", e.pr).toArray()) {
+      this.end(j, "superseded", ENDED, { title: "Draft", summary: "The PR is a draft: it's reviewed once it's marked ready for review." });
+    }
+    this.fillHeld();
+    await this.arm();
+  }
+
   /** `pull_request` `closed`: the PR's running and queued jobs end. */
   async onClosed(p: ReviewOf, e: { pr: number; updated_at: string }): Promise<void> {
     this.bind(p);
@@ -618,8 +654,9 @@ export class ReviewDO extends DurableObject<Env> {
         ? this.sql.exec(`SELECT * FROM jobs WHERE sha = ? AND pr IN (${e.prs.map(() => "?").join(",")}) ORDER BY updated_ms DESC`, e.sha, ...e.prs).toArray()[0]
         : undefined);
     if (!j) return { queued: false };
-    const head = this.sql.exec("SELECT sha, open FROM prs WHERE pr = ?", j.pr).toArray()[0];
-    if (!head || head.open !== 1 || head.sha !== j.sha) return { queued: false };
+    const head = this.sql.exec("SELECT sha, open, draft FROM prs WHERE pr = ?", j.pr).toArray()[0];
+    // A draft's check (cancelled when it went back to draft) re-run: nothing until it's marked ready.
+    if (!head || head.open !== 1 || head.sha !== j.sha || head.draft === 1) return { queued: false };
     // Waiting for approval, or dismissed: only the owner's approval starts it (`requeue` isn't in their
     // rows of the table, and refuses any job whose head needs approval it never got).
     if (j.state === "queued" || j.state === "running") return { queued: false };

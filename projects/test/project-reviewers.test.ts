@@ -108,7 +108,9 @@ describe("the project's reviewers", () => {
       // Back to the previous release's shape: its schema version, no reviewers table, none of the jobs' new columns.
       sql.exec("DROP TABLE reviewers");
       for (const c of ["reviewers", "step", "reviews", "frozen_check"]) sql.exec(`ALTER TABLE jobs DROP COLUMN ${c}`);
-      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 1);
+      // And the PR's draft flag, added after.
+      sql.exec("ALTER TABLE prs DROP COLUMN draft");
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 2);
       sql.exec("INSERT INTO jobs (pr, sha, state, created_ms, updated_ms) VALUES (1, 'a', 'done', 1, 1)");
       migrate(st.storage, MIGRATIONS);
       const seeded = sql.exec("SELECT id, name, enabled, source, tainted, dimensions FROM reviewers").toArray();
@@ -120,6 +122,19 @@ describe("the project's reviewers", () => {
     expect(got.seeded).toEqual([{ id: CODE_REVIEW.id, name: CODE_REVIEW.name, enabled: 1, source: "owner", tainted: 0, dimensions: JSON.stringify(CODE_REVIEW.dimensions) }]);
     expect(got.old).toEqual([{ reviewers: null, step: 0, reviews: null, frozen_check: null }]);
     expect(got.after).toBe(0);
+  });
+
+  it("a ReviewDO from before the draft flag: its PRs read as not drafts, and a draft is recorded once migrated", async () => {
+    const stub = env.REVIEW.get(env.REVIEW.idFromName(`old-${rand()}`));
+    const got = await runInDurableObject(stub, (_o: unknown, st: DurableObjectState) => {
+      const sql = st.storage.sql;
+      sql.exec("ALTER TABLE prs DROP COLUMN draft");
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 1);
+      sql.exec("INSERT INTO prs (pr, sha, base, title, updated_at, open) VALUES (1, 'a', 'main', 't', '2026-11-18T00:00:00Z', 1)");
+      migrate(st.storage, MIGRATIONS);
+      return sql.exec("SELECT draft FROM prs WHERE pr = 1").one().draft;
+    });
+    expect(got).toBe(0);
   });
 
   it("deleted, the built-in stays gone; the preset adds it back once", async () => {
