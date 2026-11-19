@@ -6,7 +6,7 @@
 
 import { Anchor, Button, CopyButton } from "@mantine/core";
 import { IconCheck, IconChevronDown, IconChevronUp, IconCopy, IconPhoto } from "@tabler/icons-react";
-import { Children, cloneElement, isValidElement, memo, type ReactElement, type ReactNode, useState } from "react";
+import { Children, cloneElement, isValidElement, memo, type ReactElement, type ReactNode, useMemo, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -142,8 +142,9 @@ export const Markdown = memo(function Markdown({ text, projectId }: { text: stri
   );
 });
 
-export function RichMessage({ text, projectId }: { text: string; projectId: string }) {
-  const segments = splitSvg(text);
+/** A message's text in its parts (prose, figures, task blocks), split again only when the text changes. */
+export const RichMessage = memo(function RichMessage({ text, projectId }: { text: string; projectId: string }) {
+  const segments = useMemo(() => splitSvg(text), [text]);
   return (
     <RichProse>
       {segments.map((s, i) =>
@@ -159,5 +160,4 @@ export function RichMessage({ text, projectId }: { text: string; projectId: stri
       )}
     </RichProse>
   );
-}
-
+});
