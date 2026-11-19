@@ -2,9 +2,35 @@
 // it alive, and after a drop reconnect with a backoff from the last seq received, until the agent ends.
 // And the history before the ring: its first page as soon as nest offers it (a `history` or `gap` cursor),
 // each older one when the view asks (`loadOlder`, as its reader scrolls to the top).
+//
+// Messages are applied in batches, at most one per animation frame: a backlog of a thousand events is a
+// handful of state changes, not a thousand. The batch is applied at once on `live` (the backlog is done),
+// `ended`, a close and an unmount, so nothing is lost or reordered. Once live, a message that comes while
+// nothing is waiting and the view has drawn the last batch is applied at once; one that comes sooner waits
+// for the next frame (README.md#the-live-trace).
 
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 import { type HistoryPage, historyUrl, initialTrace, PING_EVERY_MS, reconnectDelay, type TraceState, traceReducer, traceUrl } from "./model";
+
+/** Where frames don't come (a hidden tab), a batch waits at most this long. */
+const FRAME_FALLBACK_MS = 100;
+
+/** Run `cb` on the next animation frame (or after FRAME_FALLBACK_MS, whichever is first); returns its cancel. */
+function nextFrame(cb: () => void): () => void {
+  let raf: number | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cancel = () => {
+    if (raf !== null) cancelAnimationFrame(raf);
+    clearTimeout(timer);
+  };
+  const run = () => {
+    cancel();
+    cb();
+  };
+  if (typeof requestAnimationFrame === "function") raf = requestAnimationFrame(run);
+  timer = setTimeout(run, FRAME_FALLBACK_MS);
+  return cancel;
+}
 
 export function useTrace(agent: string | null): { state: TraceState; loadOlder: () => void } {
   const [state, dispatch] = useReducer(traceReducer, undefined, initialTrace);
@@ -12,6 +38,11 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
   current.current = state;
   const agentRef = useRef(agent);
   agentRef.current = agent;
+  // The view has committed the last batch applied: a live message may then be applied at once.
+  const drawn = useRef(true);
+  useLayoutEffect(() => {
+    drawn.current = true;
+  }, [state]);
 
   const loadOlder = useCallback(() => {
     const s = current.current;
@@ -50,9 +81,24 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
     let ws: WebSocket | null = null;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let ping: ReturnType<typeof setInterval> | undefined;
+    // Messages not applied yet, in order; the frame that will apply them; past this connection's backlog.
+    let queue: unknown[] = [];
+    let frame: (() => void) | null = null;
+    let live = false;
+
+    const flush = () => {
+      frame?.();
+      frame = null;
+      if (queue.length === 0) return;
+      const batch = queue;
+      queue = [];
+      drawn.current = false;
+      dispatch(batch.length === 1 ? { kind: "message", data: batch[0] } : { kind: "messages", data: batch });
+    };
 
     const connect = () => {
       if (stopped) return;
+      live = false;
       const sock = new WebSocket(traceUrl(agent, last, window.location.href));
       ws = sock;
       sock.addEventListener("open", () => {
@@ -75,13 +121,24 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
         }
         if (typeof data.seq === "number" && data.seq > last) last = data.seq;
         if (data.type === "ended") ended = true;
-        // The backlog is done: a good connect, so the next drop's backoff starts over.
-        if (data.type === "live") failures = 0;
-        dispatch({ kind: "message", data });
+        queue.push(data);
+        if (data.type === "live") {
+          // The backlog is done: a good connect, so the next drop's backoff starts over.
+          failures = 0;
+          live = true;
+          flush();
+        } else if (data.type === "ended") flush();
+        else if (live && queue.length === 1 && drawn.current) flush();
+        else
+          frame ??= nextFrame(() => {
+            frame = null;
+            flush();
+          });
       });
       sock.addEventListener("close", () => {
         clearInterval(ping);
         if (ws !== sock || stopped) return;
+        flush();
         dispatch({ kind: "closed" });
         if (ended) return; // nothing more will come
         failures += 1;
@@ -91,6 +148,7 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
     connect();
     return () => {
       stopped = true;
+      flush();
       clearTimeout(retry);
       clearInterval(ping);
       ws?.close(1000, "closed by the page");

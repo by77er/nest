@@ -56,6 +56,8 @@ export const initialTrace = (): TraceState => ({
 
 export type TraceAction =
   | { kind: "message"; data: unknown }
+  /** Messages in the order they came, applied as one change (what the socket queued for a frame). */
+  | { kind: "messages"; data: readonly unknown[] }
   | { kind: "open" }
   | { kind: "closed" }
   | { kind: "reset" }
@@ -81,32 +83,64 @@ export function traceReducer(s: TraceState, a: TraceAction): TraceState {
     case "closed":
       // Not live until the next connect's backlog is done.
       return s.status === "ended" ? s : { ...s, status: "reconnecting", animateAfter: Number.POSITIVE_INFINITY };
-    case "message": {
-      const m = a.data as { type?: unknown; seq?: unknown; from?: unknown; to?: unknown; before?: unknown } | null;
-      if (!m || typeof m.type !== "string") return s;
-      // nest offers its history before the ring: taken once (a later connect's offer is the same seam).
-      if (m.type === "history" && typeof m.before === "string") return s.olderCursor === undefined ? { ...s, olderCursor: m.before } : s;
-      if (m.type === "gap" && typeof m.before === "string") {
-        // Events gone from the ring, with the history that covers them: what's held is dropped and backfilled
-        // from that cursor, so nothing is shown twice or missed (nest's rule for stitching after a gap).
-        return { ...s, events: [], older: [], olderCursor: m.before, olderState: "idle", gap: null, trimmed: false };
-      }
-      if (m.type === "gap" && typeof m.from === "number" && typeof m.to === "number") {
-        // Below what we already have: it says nothing new.
-        return m.to <= s.last ? s : { ...s, gap: s.gap ? { from: Math.min(s.gap.from, m.from), to: Math.max(s.gap.to, m.to) } : { from: m.from, to: m.to } };
-      }
-      if (m.type === "live") return { ...s, status: "live", animateAfter: s.last };
-      let next = s;
-      if (typeof m.seq === "number") {
-        // A repeat (an overlap after a reconnect) changes nothing.
-        if (m.seq <= s.last) return m.type === "ended" ? { ...s, status: "ended" } : s;
-        const events = [...s.events, m as TraceEvent];
-        const trimmed = events.length > MAX_EVENTS;
-        next = { ...s, events: trimmed ? events.slice(events.length - MAX_EVENTS) : events, last: m.seq, trimmed: s.trimmed || trimmed };
-      }
-      return m.type === "ended" ? { ...next, status: "ended" } : next;
-    }
+    case "message":
+      return applyMessages(s, [a.data]);
+    case "messages":
+      return applyMessages(s, a.data);
   }
+}
+
+/**
+ * Fold messages into the state in order, each by the same rules as if it came alone. The events they add
+ * are collected and the array is copied once at the end, not once per event; nothing changed, the state
+ * is returned as it was.
+ */
+function applyMessages(s: TraceState, msgs: readonly unknown[]): TraceState {
+  // While folding, what's held is `held` then `added` (`s.events` is stale: no rule reads it).
+  let held = s.events;
+  let added: TraceEvent[] = [];
+  for (const data of msgs) {
+    const m = data as { type?: unknown; seq?: unknown; from?: unknown; to?: unknown; before?: unknown } | null;
+    if (!m || typeof m.type !== "string") continue;
+    // nest offers its history before the ring: taken once (a later connect's offer is the same seam).
+    if (m.type === "history" && typeof m.before === "string") {
+      if (s.olderCursor === undefined) s = { ...s, olderCursor: m.before };
+      continue;
+    }
+    if (m.type === "gap" && typeof m.before === "string") {
+      // Events gone from the ring, with the history that covers them: what's held is dropped and backfilled
+      // from that cursor, so nothing is shown twice or missed (nest's rule for stitching after a gap).
+      held = [];
+      added = [];
+      s = { ...s, events: held, older: [], olderCursor: m.before, olderState: "idle", gap: null, trimmed: false };
+      continue;
+    }
+    if (m.type === "gap" && typeof m.from === "number" && typeof m.to === "number") {
+      // Below what we already have: it says nothing new.
+      if (m.to > s.last) s = { ...s, gap: s.gap ? { from: Math.min(s.gap.from, m.from), to: Math.max(s.gap.to, m.to) } : { from: m.from, to: m.to } };
+      continue;
+    }
+    if (m.type === "live") {
+      s = { ...s, status: "live", animateAfter: s.last };
+      continue;
+    }
+    if (typeof m.seq === "number") {
+      // A repeat (an overlap after a reconnect) changes nothing.
+      if (m.seq <= s.last) {
+        if (m.type === "ended") s = { ...s, status: "ended" };
+        continue;
+      }
+      added.push(m as TraceEvent);
+      // What's held only grows between resets: it went over MAX_EVENTS at some point iff it is over now.
+      s = { ...s, last: m.seq, trimmed: s.trimmed || held.length + added.length > MAX_EVENTS };
+    }
+    if (m.type === "ended") s = { ...s, status: "ended" };
+  }
+  if (added.length === 0) return held === s.events ? s : { ...s, events: held };
+  // One copy: the newest MAX_EVENTS of what was held and what came.
+  const drop = Math.max(0, held.length + added.length - MAX_EVENTS);
+  const events = drop >= held.length ? added.slice(drop - held.length) : (drop > 0 ? held.slice(drop) : held).concat(added);
+  return { ...s, events };
 }
 
 /** A tool call and its result, when it came. */
@@ -130,31 +164,80 @@ export interface TurnGroup {
 }
 
 /**
- * Group the history (oldest first; its turns are its `turn_started`s, having no ids) and then the ring's
- * events into consecutive runs by turn, pairing each tool result with its call.
+ * The turns of some events and history, kept so the next state's can be made from it: never changed once
+ * returned, so a turn (or item) that didn't change between two states is the same object in both (and its
+ * view can skip rendering it).
  */
-export function groupTurns(events: TraceEvent[], older: HistoryEvent[] = []): TurnGroup[] {
-  const groups: TurnGroup[] = [];
-  let cur: TurnGroup | null = null;
-  let calls = new Map<string, ToolItem>();
-  const add = (ev: TraceEvent | HistoryEvent, turn: string | null, key: string, seq: number | null) => {
+export interface Grouping {
+  readonly events: readonly TraceEvent[];
+  readonly older: readonly HistoryEvent[];
+  readonly groups: readonly TurnGroup[];
+  /** The last group's tool calls by call id: their place in its items. */
+  readonly calls: ReadonlyMap<string, number>;
+}
+
+/** Builds groups by appending events; the last group is copied before its first change, unless it's new. */
+class Builder {
+  groups: TurnGroup[];
+  calls: Map<string, number>;
+  /** The last group is this build's own object, so it may be changed in place. */
+  private owned = false;
+
+  constructor(from?: Grouping) {
+    this.groups = from ? from.groups.slice() : [];
+    this.calls = from ? (from.calls as Map<string, number>) : new Map();
+  }
+
+  add(ev: TraceEvent | HistoryEvent, turn: string | null, key: string, seq: number | null): void {
+    let cur = this.groups.at(-1);
     if (!cur || cur.turn !== turn) {
       cur = { key: `${turn ?? "between"}:${key}`, turn, items: [], started: null, completed: null };
-      groups.push(cur);
-      calls = new Map();
+      this.groups.push(cur);
+      this.calls = new Map();
+      this.owned = true;
+    } else if (!this.owned) {
+      cur = { ...cur, items: cur.items.slice() };
+      this.groups[this.groups.length - 1] = cur;
+      this.calls = new Map(this.calls);
+      this.owned = true;
     }
     if (ev.type === "turn_started") cur.started = ev;
     else if (ev.type === "turn_completed") cur.completed = ev;
     else if (ev.type === "tool_call") {
-      const item: ToolItem = { kind: "tool", key, seq, call: ev, result: null };
-      calls.set(String(ev.call_id), item);
-      cur.items.push(item);
-    } else if (ev.type === "tool_result" && calls.has(String(ev.call_id))) {
-      calls.get(String(ev.call_id))!.result = ev;
+      this.calls.set(String(ev.call_id), cur.items.length);
+      cur.items.push({ kind: "tool", key, seq, call: ev, result: null });
+    } else if (ev.type === "tool_result" && this.calls.has(String(ev.call_id))) {
+      const at = this.calls.get(String(ev.call_id))!;
+      cur.items[at] = { ...(cur.items[at] as ToolItem), result: ev };
     } else {
       cur.items.push({ kind: "event", key, seq, event: ev });
     }
-  };
+  }
+
+  ring(ev: TraceEvent): void {
+    this.add(ev, ev.turn ?? null, `s${ev.seq}`, ev.seq);
+  }
+}
+
+/** `next` starts with all of `prev` (the reducer only appends between resets and trims; events are never rebuilt). */
+const startsWith = (next: readonly TraceEvent[], prev: readonly TraceEvent[]) =>
+  next.length >= prev.length && (prev.length === 0 || (next[0] === prev[0] && next[prev.length - 1] === prev[prev.length - 1]));
+
+/**
+ * Group the history (oldest first; its turns are its `turn_started`s, having no ids) and then the ring's
+ * events into consecutive runs by turn, pairing each tool result with its call. From `prev` (the grouping
+ * of an earlier state), events appended since are added to it: work for what came, not for all that's held,
+ * and every earlier turn is the same object. Anything else (history paged in, a reset, a trim) is grouped
+ * afresh, keeping the earlier objects of turns and items that came out the same.
+ */
+export function groupTurnsFrom(prev: Grouping | null, events: readonly TraceEvent[], older: readonly HistoryEvent[] = []): Grouping {
+  if (prev && prev.events === events && prev.older === older) return prev;
+  if (prev && prev.older === older && startsWith(events, prev.events)) {
+    const b = new Builder(prev);
+    for (let i = prev.events.length; i < events.length; i++) b.ring(events[i]!);
+    return { events, older, groups: b.groups, calls: b.calls };
+  }
+  const b = new Builder();
   // Keys from the entry (and the event's place in it), so a page prepended later keeps every key.
   let hturn: string | null = null;
   let entry = -1;
@@ -163,10 +246,34 @@ export function groupTurns(events: TraceEvent[], older: HistoryEvent[] = []): Tu
     k = ev.entry === entry ? k + 1 : 0;
     entry = ev.entry;
     if (ev.type === "turn_started") hturn = `h${ev.entry}`;
-    add(ev, hturn, `h${ev.entry}.${k}`, null);
+    b.add(ev, hturn, `h${ev.entry}.${k}`, null);
   }
-  for (const ev of events) add(ev, ev.turn ?? null, `s${ev.seq}`, ev.seq);
-  return groups;
+  for (const ev of events) b.ring(ev);
+  return { events, older, groups: prev ? keepSame(prev.groups, b.groups) : b.groups, calls: b.calls };
+}
+
+/** The groups of `prev`, and their items, wherever `next` has an equal one (by key and the events in it). */
+function keepSame(prev: readonly TurnGroup[], next: TurnGroup[]): TurnGroup[] {
+  const groups = new Map(prev.map((g) => [g.key, g]));
+  const items = new Map<string, TraceItem>();
+  for (const g of prev) for (const i of g.items) items.set(i.key, i);
+  const sameItem = (a: TraceItem, b: TraceItem) =>
+    a.kind === "tool" ? b.kind === "tool" && a.seq === b.seq && a.call === b.call && a.result === b.result : b.kind === "event" && a.seq === b.seq && a.event === b.event;
+  return next.map((g) => {
+    g.items = g.items.map((i) => {
+      const was = items.get(i.key);
+      return was && sameItem(was, i) ? was : i;
+    });
+    const was = groups.get(g.key);
+    return was && was.turn === g.turn && was.started === g.started && was.completed === g.completed && was.items.length === g.items.length && was.items.every((x, n) => x === g.items[n])
+      ? was
+      : g;
+  });
+}
+
+/** The turns of these events (and history), grouped afresh. */
+export function groupTurns(events: TraceEvent[], older: HistoryEvent[] = []): TurnGroup[] {
+  return groupTurnsFrom(null, events, older).groups as TurnGroup[];
 }
 
 /** The agent's state as the trace last said it, if it did. */
