@@ -112,13 +112,14 @@ describe("what the chat re-renders", () => {
     expect(counts.markdown).toBe(0);
   });
 
-  it("one new message appended to 100 renders that message only", async () => {
+  it("one new message appended to 100, into the last group, renders that message only", async () => {
     const api = apiWith(msgs(100));
     const { queryClient } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
     await within(c).findByText("Message 99");
     reset();
-    api.chat = [...api.chat, { seq: 101, at_ms: T0 + 101 * 30_000, sender: "owner", text: "Message 101", delivered: true, status: "done", error: null }];
+    // The manager's, 30 s after its last: it joins that message's group, which is drawn again around it.
+    api.chat = [...api.chat, { seq: 101, at_ms: T0 + 100 * 30_000, sender: "manager", text: "Message 101", delivered: true, status: "done", error: null }];
     const t = performance.now();
     await act(() => queryClient.refetchQueries());
     await within(c).findByText("Message 101");
@@ -127,7 +128,8 @@ describe("what the chat re-renders", () => {
     const ms = performance.now() - t;
     console.info(`[render] 1 new message after 100: Message ${counts.rows}, Markdown ${counts.markdown}, ${ms.toFixed(0)} ms`);
     expect(counts.rows).toBe(1);
-    expect(counts.markdown).toBe(0);
+    // Its own Markdown only.
+    expect(counts.markdown).toBe(1);
   });
 
   it("50 trace events of a turn, with 100 messages and 30 finished turns held, render no message, no Markdown of the log, and parse no finished turn's input", async () => {
