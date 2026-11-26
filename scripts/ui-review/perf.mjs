@@ -132,7 +132,7 @@ function compare(before, after) {
   for (const r of rows(after)) {
     const b = a.get(r.id);
     if (r.error || !b || b.error) {
-      lines.push(`| ${r.id} | ${r.error ? `error: ${r.error}` : b?.error ? `before: error` : "new"} |`);
+      lines.push(`| ${r.id} | ${r.error ? `error: ${r.error.replace(/\|/g, "/")}` : b?.error ? `before: error` : "new"} |`);
       continue;
     }
     lines.push(`| ${r.id} | ${keys.map(([k, f]) => {
@@ -521,9 +521,9 @@ function pageScenario(name, path, content, o = {}) {
         const w = await ctx.window(which, async () => {
           await page.goto(base + path, { waitUntil: "commit" });
           if (o.after) {
-            await page.evaluate(() => window.__perf.first);
+            if ((await page.evaluate(() => window.__perf.first)) === null) throw new Error(`${content} didn't show (${which})`);
             const t = await o.after(ctx, page);
-            return { content: t, selector: o.afterContent };
+            return { content: t, selector: `the click, then ${o.afterContent}` };
           }
           const t = await page.evaluate(() => window.__perf.first);
           if (t === null) throw new Error(`${content} didn't show (${which})`);

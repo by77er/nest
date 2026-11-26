@@ -18,7 +18,7 @@ import { data as demoData } from "./fixtures/projects/demo.mjs";
 
 const DAY = 86_400_000;
 
-/** A seeded PRNG (mulberry32): the same seed gives the same fixtures on every run. */
+/** A seeded PRNG (mulberry32): the same seed gives the same content and sizes on every run (timestamps, and so ETags, follow the clock). */
 function rng(seed) {
   let a = seed >>> 0;
   const next = () => {
