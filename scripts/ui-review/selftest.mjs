@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { inkChatFit, inkHeaderGap, inkPrs, inkTrace, removeFocusCheck, waitsCheck, workflowsAgree } from "./apps/projects.mjs";
-import { measure, restoreTouch, scanHits } from "./checks.mjs";
+import { capture, measure, restoreTouch, scanHits } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 import { proseProblems } from "./trace-prose.mjs";
 
@@ -421,6 +421,27 @@ for (const remount of [false, true]) {
   await restoreTouch(p3);
   assert.ok(await p3.evaluate(() => matchMedia("(pointer: coarse)").matches), `restoreTouch makes it coarse again (the screenshot ${lost ? "had ended it" : "kept it"})`);
   await ctx.close();
+}
+
+// A full-page capture shows what `content-visibility: auto` skips far below the viewport (a long
+// board's lower rows), as a reader scrolling there sees it, not an empty box.
+{
+  const p4 = await browser.newPage({ viewport: { width: 400, height: 600 } });
+  await p4.setContent(`<!doctype html><html><body style="margin:0;background:#fff"><div style="height:3000px"></div>
+    <div style="content-visibility:auto;contain-intrinsic-block-size:auto 40px"><div style="height:40px;background:#000"></div></div></body></html>`);
+  const ink = (png) => p4.evaluate(async (src) => {
+    const i = new Image();
+    i.src = src;
+    await i.decode();
+    const c = new OffscreenCanvas(i.width, i.height);
+    const g = c.getContext("2d");
+    g.drawImage(i, 0, 0);
+    return [...g.getImageData(200, 3020, 1, 1).data.slice(0, 3)];
+  }, `data:image/png;base64,${png.toString("base64")}`);
+  const plain = await ink(await p4.screenshot({ fullPage: true }));
+  const shot = await ink(await capture(p4, undefined, true));
+  assert.deepEqual(shot, [0, 0, 0], `a full-page capture paints content-visibility's skipped content (a plain screenshot gave ${JSON.stringify(plain)})`);
+  await p4.close();
 }
 
 await browser.close();

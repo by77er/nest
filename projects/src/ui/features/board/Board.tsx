@@ -12,8 +12,8 @@ import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrate
 import { Button, Modal, Switch } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconLayoutList, IconPlus } from "@tabler/icons-react";
-import { lazy, Suspense, useMemo, useState } from "react";
-import { useAsks, useReorderTask, useTasks } from "../../api/queries";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { setBoardDragging, useAsks, useReorderTask, useTasks } from "../../api/queries";
 import type { TaskSummary } from "../../api/types";
 import { EmptyState, ErrorState, icon, LoadingState, Panel, Section, TaskGroup, TaskList, Toolbar } from "../../layout";
 import { CANCELLED_COLUMN, type Column, COLUMNS } from "../../status";
@@ -47,12 +47,36 @@ export function groupTasks(tasks: readonly TaskSummary[], columns: readonly Colu
   return columns.map((column) => ({ column, tasks: tasks.filter((t) => column.states.includes(t.state)) })).filter((g) => g.tasks.length > 0);
 }
 
+const sameItems = <T,>(a: readonly T[], b: readonly T[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/**
+ * `groupTasks`, memoized on the tasks' answer: a group whose tasks are the same ones in the same order
+ * keeps its array from the last answer, so its rows (and its sortable list) aren't touched by a poll
+ * that changed another group's task. The query's structural sharing keeps an unchanged task's object.
+ */
+function useGroups(tasks: readonly TaskSummary[] | undefined, columns: readonly Column[]) {
+  const last = useRef(new Map<string, TaskSummary[]>());
+  return useMemo(() => {
+    if (!tasks) return [];
+    const groups = groupTasks(tasks, columns).map((g) => {
+      const before = last.current.get(g.column.id);
+      return before && sameItems(before, g.tasks) ? { column: g.column, tasks: before } : g;
+    });
+    for (const g of groups) last.current.set(g.column.id, g.tasks);
+    return groups;
+  }, [tasks, columns]);
+}
+
+const MODIFIERS = [restrictToVerticalAxis, restrictToParentElement];
+const ACCESSIBILITY = { screenReaderInstructions: { draggable: "To move a task within its group, press space, then the arrow keys, then space again to drop it, or escape to cancel." } };
+const NO_ASKS = 0;
+
 /** One stage's rows: they reorder within it (dnd-kit), the moved row's new `ord` written at once. */
-function BoardGroup({ column, tasks, open, onToggle, projectId, repo, pendingAsks, onMove, onDragging }: {
+const BoardGroup = memo(function BoardGroup({ column, tasks, open, onToggle, projectId, repo, pendingAsks, onMove, onDragging }: {
   column: Column;
   tasks: TaskSummary[];
   open: boolean;
-  onToggle: () => void;
+  onToggle: (column: string) => void;
   projectId: string;
   repo: string;
   pendingAsks: ReadonlyMap<string, number>;
@@ -63,36 +87,40 @@ function BoardGroup({ column, tasks, open, onToggle, projectId, repo, pendingAsk
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
-  const onDragEnd = (e: DragEndEvent) => {
+  const onDragEnd = useCallback((e: DragEndEvent) => {
     onDragging(false);
     if (!e.over) return;
     const from = tasks.findIndex((t) => t.id === e.active.id);
     const to = tasks.findIndex((t) => t.id === e.over!.id);
     const ord = ordForMove(tasks, from, to);
     if (ord !== null) onMove(String(e.active.id), ord);
-  };
+  }, [tasks, onMove, onDragging]);
+  const onDragStart = useCallback(() => onDragging(true), [onDragging]);
+  const onDragCancel = useCallback(() => onDragging(false), [onDragging]);
+  const toggle = useCallback(() => onToggle(column.id), [onToggle, column.id]);
+  const ids = useMemo(() => tasks.map((t) => t.id), [tasks]);
   return (
-    <TaskGroup title={column.title} count={tasks.length} open={open} onToggle={onToggle} glyph={<TaskStateGlyph state={column.states[column.states.length - 1]!} />}>
+    <TaskGroup title={column.title} count={tasks.length} open={open} onToggle={toggle} glyph={<TaskStateGlyph state={column.states[column.states.length - 1]!} />}>
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
-        modifiers={[restrictToVerticalAxis, restrictToParentElement]}
-        onDragStart={() => onDragging(true)}
-        onDragCancel={() => onDragging(false)}
+        modifiers={MODIFIERS}
+        onDragStart={onDragStart}
+        onDragCancel={onDragCancel}
         onDragEnd={onDragEnd}
-        accessibility={{ screenReaderInstructions: { draggable: "To move a task within its group, press space, then the arrow keys, then space again to drop it, or escape to cancel." } }}
+        accessibility={ACCESSIBILITY}
       >
-        <SortableContext items={tasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+        <SortableContext items={ids} strategy={verticalListSortingStrategy}>
           <div>
             {tasks.map((t) => (
-              <TaskListRow key={t.id} task={t} projectId={projectId} repo={repo} pendingAsks={pendingAsks.get(t.id) ?? 0} sortable={tasks.length > 1} group={column.title} />
+              <TaskListRow key={t.id} task={t} projectId={projectId} repo={repo} pendingAsks={pendingAsks.get(t.id) ?? NO_ASKS} sortable={tasks.length > 1} group={column.title} />
             ))}
           </div>
         </SortableContext>
       </DndContext>
     </TaskGroup>
   );
-}
+});
 
 export function Board({ projectId, repo, headingRef }: { projectId: string; repo: string; headingRef?: React.Ref<HTMLHeadingElement> }) {
   const [dragging, setDragging] = useState(false);
@@ -101,7 +129,7 @@ export function Board({ projectId, repo, headingRef }: { projectId: string; repo
   const [creating, { open, close }] = useDisclosure(false);
   const tasks = useTasks(projectId, { paused: dragging });
   const asks = useAsks(projectId);
-  const reorder = useReorderTask(projectId);
+  const { mutate: reorder } = useReorderTask(projectId);
 
   const pendingAsks = useMemo(() => {
     const m = new Map<string, number>();
@@ -109,14 +137,22 @@ export function Board({ projectId, repo, headingRef }: { projectId: string; repo
     return m;
   }, [asks.data]);
 
-  const columns = showCancelled ? [...COLUMNS, CANCELLED_COLUMN] : COLUMNS;
-  const toggle = (id: string) =>
+  const columns = useMemo(() => (showCancelled ? [...COLUMNS, CANCELLED_COLUMN] : COLUMNS), [showCancelled]);
+  const groups = useGroups(tasks.data, columns);
+  const toggle = useCallback((id: string) =>
     setCollapsed((c) => {
       const next = new Set(c);
       if (!next.delete(id)) next.add(id);
       saveCollapsed(projectId, next);
       return next;
-    });
+    }), [projectId]);
+  const onMove = useCallback((task: string, ord: number) => reorder({ task, ord }), [reorder]);
+  // While a row is dragged, nothing polls the project's tasks (every observer reads this).
+  const onDragging = useCallback((on: boolean) => {
+    setDragging(on);
+    setBoardDragging(projectId, on);
+  }, [projectId]);
+  useEffect(() => () => setBoardDragging(projectId, false), [projectId]);
 
   return (
     <Section
@@ -142,18 +178,18 @@ export function Board({ projectId, repo, headingRef }: { projectId: string; repo
         </Panel>
       ) : (
         <TaskList label="Tasks by stage">
-          {groupTasks(tasks.data, columns).map(({ column, tasks: rows }) => (
+          {groups.map(({ column, tasks: rows }) => (
             <BoardGroup
               key={column.id}
               column={column}
               tasks={rows}
               open={!collapsed.has(column.id)}
-              onToggle={() => toggle(column.id)}
+              onToggle={toggle}
               projectId={projectId}
               repo={repo}
               pendingAsks={pendingAsks}
-              onMove={(task, ord) => reorder.mutate({ task, ord })}
-              onDragging={setDragging}
+              onMove={onMove}
+              onDragging={onDragging}
             />
           ))}
         </TaskList>

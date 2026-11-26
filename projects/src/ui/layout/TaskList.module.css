@@ -302,6 +302,26 @@
   }
 }
 
+/* Rows off screen skip their layout and paint (a long board holds hundreds). Their height stays the
+   real one, so the scrollbar doesn't move as they come into view: `auto` keeps a row's last rendered
+   size, and before its first render the placeholder is its tallest cell, the grip (Mantine's `lg`
+   action icon, 2.125rem, at least a hit target); a lone row has no grip, and its `min-height` alone
+   gives its height. Only from `sm` up with a mouse, where a row is always one line of that height:
+   on a phone it wraps with its title, and on touch its metadata's taller lines can wrap too, which no
+   placeholder can match. The clip margin keeps the grip's focus ring whole under the row's paint
+   containment. Off-screen rows stay in the accessibility tree, find-in-page and the focus order. */
+@media (min-width: 48em) and (pointer: fine) {
+  .row {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto max(var(--nest-hit), calc(2.125rem * var(--mantine-scale)));
+    overflow-clip-margin: var(--mantine-spacing-xs);
+  }
+
+  .row:has(> .gripCell:empty) {
+    contain-intrinsic-block-size: auto 0;
+  }
+}
+
 .empty {
   padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
   border-top: var(--nest-border);
