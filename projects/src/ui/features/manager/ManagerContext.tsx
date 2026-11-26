@@ -5,8 +5,8 @@
 // status is in the page's header, not here.
 
 import { Text } from "@mantine/core";
-import { useNeedsYouList, useTasks } from "../../api/queries";
-import type { Waiting } from "../../api/types";
+import { useNeedsYouList, useTasksSelect } from "../../api/queries";
+import type { TaskSummary, Waiting } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Section, Stack } from "../../layout";
@@ -62,20 +62,29 @@ function More({ projectId, n }: { projectId: string; n: number }) {
   );
 }
 
+/**
+ * The tasks under way, newest change first: how many, and the ids of the first few. A selection of the
+ * board's query, so this column re-renders only when those change (the cards follow their own tasks).
+ */
+function underWay(tasks: TaskSummary[]): { count: number; ids: string[] } {
+  const active = tasks.filter((t) => ACTIVE.has(t.state)).sort((a, b) => b.updated_ms - a.updated_ms);
+  return { count: active.length, ids: active.slice(0, SHOWN).map((t) => t.id) };
+}
+const NONE = { count: 0, ids: [] as string[] };
+
 export function ManagerContext({ projectId }: { projectId: string }) {
-  const tasks = useTasks(projectId).data ?? [];
+  const active = useTasksSelect(projectId, underWay).data ?? NONE;
   const list = useNeedsYouList(projectId);
   const waiting = [...list.items].sort((a, b) => a.at_ms - b.at_ms);
-  const active = tasks.filter((t) => ACTIVE.has(t.state)).sort((a, b) => b.updated_ms - a.updated_ms);
-  const on = active.slice(0, SHOWN);
+  const on = active.ids;
   const asks = waiting.slice(0, ASKS_SHOWN);
   return (
     <Stack gap="xl" data-slot="manager-context">
-      <Section title="Working on" count={active.length} dense region={false}>
+      <Section title="Working on" count={active.count} dense region={false}>
         {on.length ? (
           <Stack gap="sm">
-            <TaskCardList projectId={projectId} ids={on.map((t) => t.id)} />
-            {active.length > on.length && <More projectId={projectId} n={active.length - on.length} />}
+            <TaskCardList projectId={projectId} ids={on} />
+            {active.count > on.length && <More projectId={projectId} n={active.count - on.length} />}
           </Stack>
         ) : (
           <Text fz="sm" c="dimmed">

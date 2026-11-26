@@ -23,6 +23,7 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 - It starts the app's `vite dev` on a free port (log in `<out-dir>/vite.log`) and stops it at exit, or uses `--base-url`.
 - The API is served from `fixtures/<app>/` (`page.route`), so states only live events produce (stalled tasks, asks, reviews, live traces, a busy fleet) are reproducible. Fixtures hold made-up ids only, never a credential.
 - `--pages` takes state names or section names.
+- A full-page screenshot renders what `content-visibility: auto` skips far below the viewport (a long board's lower rows), as a reader scrolling there sees it; the checks run on the page as it is.
 - Output: `<state>-<width>-<scheme>.png` for every screen, and `report.json` (`passed`, failures per check, each screen's frame geometry, and every failure with its screen). Exit 0 if every check passed, 1 if any failed, 2 on a usage or setup error.
 
 ## Checks
