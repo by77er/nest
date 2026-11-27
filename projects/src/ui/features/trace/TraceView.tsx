@@ -280,15 +280,16 @@ function readerLine(v: HTMLElement): Held | null {
   return null;
 }
 
-/** Scrolls `v` so `h`'s line is back where it was; false if it's gone. */
-function restore(v: HTMLElement, h: Held): boolean {
+/** Scrolls `v` so `h`'s line is back where it was: whether that moved it, or null if the line is gone. */
+function restore(v: HTMLElement, h: Held): boolean | null {
   if (!h.line.isConnected) {
     const again = [...v.querySelectorAll("[data-item]")].find((l) => l.getAttribute("data-item") === h.item);
-    if (!again) return false;
+    if (!again) return null;
     h.line = again;
   }
   const d = h.line.getBoundingClientRect().top - v.getBoundingClientRect().top - h.y;
-  if (Math.abs(d) >= 0.5) v.scrollTop += d;
+  if (Math.abs(d) < 0.5) return false;
+  v.scrollTop += d;
   return true;
 }
 
@@ -310,12 +311,17 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const atBottomRef = useRef(true);
   // Following: new lines arrived and are still being drawn (SETTLE_FRAMES). Jumping: "Jump to live" is on its
   // way down. Held: the line being read while a page above is on its way (holding -1) and, once it's in,
-  // while the turns around it are drawn (holding 1, or 2 counting quiet frames).
+  // while the turns around it are drawn (holding 1, or 2 counting quiet frames). Each settle and jump has its
+  // own number (its run's), so a frame loop left from an earlier one stops.
   const settling = useRef(0);
-  const jumping = useRef(0); // the jump on its way (each its own number), or 0
+  const settleRun = useRef(0);
+  const jumping = useRef(0);
   const jumpRun = useRef(0);
   const held = useRef<Held | null>(null);
   const holding = useRef(0);
+  const heldTop = useRef(0); // where the hold last put the log
+  const loadingRef = useRef(false);
+  loadingRef.current = state.olderState === "loading";
   const [unseen, setUnseen] = useState(0);
   const seen = useRef(state.last);
   const heightBefore = useRef<number | null>(null);
@@ -355,10 +361,17 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     const grown = new ResizeObserver(() => {
       if (v.clientHeight === 0 || hidden) return;
       // Turns drawn while the page is on its way: the line is where the reader now sees it.
-      if (held.current && holding.current === -1) held.current = readerLine(v) ?? held.current;
-      else if (held.current && holding.current > 0) {
-        if (!restore(v, held.current)) held.current = null;
-        holding.current = 1; // drawn again: SETTLE_FRAMES more from here
+      if (held.current && holding.current === -1) {
+        if (loadingRef.current) held.current = readerLine(v) ?? held.current;
+      } else if (held.current && holding.current > 0) {
+        const moved = restore(v, held.current);
+        if (moved === null) {
+          holding.current = 0;
+          held.current = null;
+        } else if (moved) {
+          holding.current = 1; // what's above it drawn again: SETTLE_FRAMES more from here
+          heldTop.current = v.scrollTop;
+        }
       } else if (settling.current > 0 && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
     });
     if (v.firstElementChild) grown.observe(v.firstElementChild);
@@ -377,9 +390,15 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     const onScroll = () => {
       if (v.clientHeight === 0 || hidden) return;
       lastTop = v.scrollTop;
-      if (held.current && holding.current === -1) held.current = readerLine(v) ?? held.current;
+      if (held.current && holding.current === -1 && loadingRef.current) held.current = readerLine(v) ?? held.current;
+      // Scrolled by something else than the hold (find-in-page, a screen reader, focus): that's the reader's.
+      if (holding.current > 0 && Math.abs(v.scrollTop - heldTop.current) > 1) {
+        holding.current = 0;
+        held.current = null;
+      }
       const near = v.scrollHeight - v.scrollTop - v.clientHeight <= NEAR_BOTTOM;
-      if (near) jumping.current = 0;
+      // A jump ends at the true bottom (its own loop's), not near it: the bottom may have moved on.
+      if (v.scrollHeight - v.scrollTop - v.clientHeight <= 1) jumping.current = 0;
       atBottomRef.current = near;
       setAtBottom(near);
       if (near) setUnseen(0);
@@ -405,10 +424,11 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     const h = holding.current === -1 ? held.current : null;
     holding.current = 0;
     if (atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
-    else if (h && restore(v, h)) {
+    else if (h && restore(v, h) !== null) {
       // Held while the turns around it are drawn (the ResizeObserver above): the new ones are at their
       // estimated heights until then, which the browser's own anchoring doesn't hold the reader across.
       holding.current = 1;
+      heldTop.current = v.scrollTop;
       let quiet = 0;
       const tick = () => {
         if (holding.current === 0 || held.current !== h) return; // taken back, or another page asked for
@@ -430,6 +450,14 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     if (canLoadRef.current && v.clientHeight > 0 && v.scrollHeight <= v.clientHeight) older();
   }, [state.older]);
 
+  // A page asked for that didn't come (it failed): nothing is on its way, so nothing is held for it.
+  useLayoutEffect(() => {
+    if (state.olderState !== "loading" && holding.current === -1) {
+      holding.current = 0;
+      held.current = null;
+    }
+  }, [state.olderState]);
+
   // New events: followed only while at the bottom; otherwise counted for "Jump to live".
   useLayoutEffect(() => {
     // Counted from the newest back: the work is for what came, not for all that's held.
@@ -441,7 +469,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     if (atBottomRef.current) {
       v?.scrollTo({ top: v.scrollHeight });
       // Held at the bottom while it's drawn (the ResizeObserver above), for SETTLE_FRAMES frames from the last arrival.
-      const mine = ++settling.current;
+      const mine = ++settleRun.current;
+      settling.current = mine;
       let frames = 0;
       const tick = () => {
         if (settling.current !== mine) return; // newer lines took over, or unmounted
@@ -454,6 +483,9 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
 
   const jump = () => {
     const v = viewport.current;
+    // Going to the bottom: no line above is held any more.
+    holding.current = 0;
+    held.current = null;
     v?.scrollTo({ top: v.scrollHeight, behavior: "smooth" });
     const mine = ++jumpRun.current;
     jumping.current = mine;
@@ -465,7 +497,11 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     let last = -1;
     let still = 0;
     const tick = () => {
-      if (!v || jumping.current !== mine || v.clientHeight === 0) return; // taken back, arrived, or another jump
+      if (!v || jumping.current !== mine) return; // taken back, arrived, or another jump
+      if (v.clientHeight === 0) {
+        jumping.current = 0; // hidden: it's shown again where it was
+        return;
+      }
       if (v.scrollHeight - v.scrollTop - v.clientHeight <= 1) {
         jumping.current = 0;
         return;

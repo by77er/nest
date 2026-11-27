@@ -127,44 +127,95 @@ function show(s: TraceState, loadOlder = () => {}) {
 }
 
 const ring = Array.from({ length: 40 }, (_, i) => ev(i + 1, "assistant_text", { text: `live ${i + 1}` }));
+// The page held starts inside a turn (its start is on the page before), so loading that page makes the first
+// turn anew: its lines are new elements.
+const page2 = [text(20), text(21), text(22), hist(23, "turn_started", { input_kind: "user" }), text(24), text(25)];
+const page1 = [hist(10, "turn_started", { input_kind: "user" }), text(11), text(12), text(13)];
+const READ = "h21.0";
+
+/** Read from near the top, the page before asked for (and on its way); then `arrive` brings it. */
+function readingAtTop() {
+  const loadOlder = vi.fn();
+  const rerender = show(state(ring, { older: page2, olderCursor: "c1" }), loadOlder);
+  const calls = layOut();
+  scrolled(30);
+  expect(loadOlder).toHaveBeenCalledTimes(1);
+  rerender(state(ring, { older: page2, olderCursor: "c1", olderState: "loading" }));
+  return { rerender, calls, arrive: () => rerender(state(ring, { older: [...page1, ...page2], olderCursor: null })) };
+}
 
 describe("the trace's scroll, as its turns are drawn", () => {
   it("keeps the line being read in place across Load older, while the turns around it are drawn, its own made anew", () => {
-    // The page held starts inside a turn (its start is on the page before), so loading that page makes the
-    // first turn anew: its lines are new elements.
-    const page2 = [text(20), text(21), text(22), hist(23, "turn_started", { input_kind: "user" }), text(24), text(25)];
-    const page1 = [hist(10, "turn_started", { input_kind: "user" }), text(11), text(12), text(13)];
-    const loadOlder = vi.fn();
-    const rerender = show(state(ring, { older: page2, olderCursor: "c1" }), loadOlder);
-    layOut();
-    // Read from near the top: the page before is asked for; the line being read is "older 21"'s.
-    scrolled(30);
-    expect(loadOlder).toHaveBeenCalledTimes(1);
-    const read = "h21.0";
-    expect(at(read)).toBe(LINE - 30);
+    const { arrive } = readingAtTop();
+    expect(at(READ)).toBe(LINE - 30);
     // While the page is on its way, a line above is drawn taller than its estimate: the line being read is
     // where the reader now sees it (the browser anchors nothing at the top).
     heights.set("h20.0", 35);
     drawn();
-    const y = at(read);
+    const y = at(READ);
     expect(y).toBe(35 - 30);
-    const before = viewport().querySelector(`[data-item="${read}"]`);
-    rerender(state(ring, { older: [...page1, ...page2], olderCursor: null }));
-    expect(viewport().querySelector(`[data-item="${read}"]`)).not.toBe(before);
-    expect(at(read)).toBe(y);
+    const before = viewport().querySelector(`[data-item="${READ}"]`);
+    arrive();
+    expect(viewport().querySelector(`[data-item="${READ}"]`)).not.toBe(before);
+    expect(at(READ)).toBe(y);
     // The new page's lines drawn at heights other than their estimates, a frame on: still in place.
     heights.set("h11.0", 63).set("h12.0", 41);
     drawn();
-    expect(at(read)).toBe(y);
+    expect(at(READ)).toBe(y);
     frame();
     heights.set("h13.0", 7);
     drawn();
-    expect(at(read)).toBe(y);
+    expect(at(READ)).toBe(y);
     // Once it's settled, a turn drawn as the reader scrolls is the browser's to anchor, as before.
     frame(5);
     heights.set("h11.0", 90);
     drawn();
-    expect(at(read)).toBe(y + 27);
+    expect(at(READ)).toBe(y + 27);
+  });
+
+  it("holds the line the reader scrolled to while the page was on its way", () => {
+    const { arrive } = readingAtTop();
+    scrolled(45);
+    const y = at(READ);
+    expect(y).toBe(LINE - 45);
+    arrive();
+    expect(at(READ)).toBe(y);
+  });
+
+  it("lets the hold go once nothing above moves, and to the reader's own scroll or a jump", () => {
+    // Lines arriving below, drawn frame after frame, keep nothing held: a turn drawn above later moves it.
+    const { arrive } = readingAtTop();
+    arrive();
+    for (let i = 0; i < 8; i++) {
+      heights.set("s40", 30 + i);
+      drawn();
+      frame();
+    }
+    const y = at(READ);
+    heights.set("h11.0", 50);
+    drawn();
+    expect(at(READ)).toBe(y + 30);
+  });
+
+  it("lets the hold go to a scroll that isn't its own (find-in-page, a screen reader)", () => {
+    const { arrive } = readingAtTop();
+    arrive();
+    scrolled(300);
+    heights.set("h11.0", 50);
+    drawn();
+    expect(scroll.top).toBe(300);
+  });
+
+  it("lets the hold go when Jump to live is pressed", () => {
+    const { arrive, calls } = readingAtTop();
+    arrive();
+    act(() => screen.getByRole("button", { name: "Jump to live" }).click());
+    expect(calls.at(-1)).toEqual({ top: total(), behavior: "smooth" });
+    // On its way down, a turn above is drawn: the jump isn't pulled back to the line.
+    scroll.top = 500;
+    heights.set("h11.0", 50);
+    drawn();
+    expect(scroll.top).toBe(500);
   });
 
   it("holds the bottom while the lines it follows are drawn, and only then", () => {
@@ -195,6 +246,13 @@ describe("the trace's scroll, as its turns are drawn", () => {
     // On its way, the turns it passed were drawn taller than their estimates; it stopped where it aimed.
     scroll.top = total() - VIEW;
     heights.set("s3", 300);
+    frame(6);
+    expect(calls.at(-1)).toEqual({ top: total(), behavior: "smooth" });
+    // It ends where it aimed, the bottom having moved on a little (within what counts as at the bottom):
+    // it goes on still.
+    const aimed = total() - VIEW;
+    heights.set("s4", 30);
+    scrolled(aimed);
     frame(6);
     expect(calls.at(-1)).toEqual({ top: total(), behavior: "smooth" });
     // At the bottom, it's done: no more scrolling.

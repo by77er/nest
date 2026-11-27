@@ -2,7 +2,7 @@
 
 import { ScrollArea } from "@mantine/core";
 import { useMergedRef } from "@mantine/hooks";
-import { type ReactNode, type RefObject, useEffect, useRef } from "react";
+import { type ReactNode, type RefObject, useLayoutEffect, useRef } from "react";
 
 /** A log's lines wrap to its width: never Mantine's `min-width: min-content`, which lets a long line scroll it sideways. */
 const WRAPPED = { content: { minWidth: 0 } };
@@ -15,7 +15,8 @@ const MONO_ADVANCE = 0.6;
  * height of what isn't drawn yet (TermTurn). Set on the element, so a resize restyles nothing else.
  */
 function useColumns(ref: RefObject<HTMLDivElement | null>) {
-  useEffect(() => {
+  // Before the first paint: the turns' first estimates are at the log's own width.
+  useLayoutEffect(() => {
     const v = ref.current;
     if (!v) return;
     const measure = () => {

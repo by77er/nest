@@ -66,9 +66,16 @@
 /* A turn (TermTurn): off screen, the browser skips its style, layout and paint; it stays in find-in-page,
    focus order, selection and the accessibility tree. Skipped, it keeps its last drawn height (`auto`); one
    never drawn is held at its estimate: its rows, its wrapping characters over the log's columns less what
-   the glyph column and word wrapping take (`--nest-log-cols`, ScrollLog's), and its gaps. The last turn
-   (the one growing, which the log follows) is always drawn. Its paint may reach a little past its box, as
-   a focus ring at its edge does. */
+   the glyph column and word wrapping take (`--nest-log-cols`, ScrollLog's), and its gaps, in whole pixels
+   (a fraction would put everything below it, the bottom the log follows, between pixels, where a drawn
+   glyph's edges blur differently). The last turn (the one growing, which the log follows) is always
+   drawn. Its paint may reach a little past its box, as a focus ring at its edge does.
+   Only with a mouse, and where the browser anchors scrolling (`overflow-anchor`: not Safari): a turn
+   taking its own height as it's drawn above the reader would move them otherwise; and on touch a tap
+   checked right after a scroll, before the frame that draws what came into view, finds the turn's box
+   (the design review's `hit-size` scan), as the board's rows (TaskList.module.css) are kept off touch.
+   The `lh` and `round()` form only where both are understood: a `var()` in it makes an unsupported one
+   invalid only once computed, which would leave no estimate at all. */
 /* The estimate's inputs are the turn's own (not inherited): a turn growing restyles none of its lines. */
 @property --nest-turn-rows {
   syntax: "<number>";
@@ -88,18 +95,24 @@
   initial-value: 0;
 }
 
-.turn {
-  content-visibility: auto;
-  contain-intrinsic-block-size: auto calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 20px + var(--nest-turn-gaps) * var(--mantine-spacing-md));
-  contain-intrinsic-block-size: auto calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 1lh + var(--nest-turn-gaps) * var(--mantine-spacing-md));
-  /* Whole pixels: a fraction would put everything below it (the bottom the log follows) between pixels,
-     where a drawn glyph's edges blur differently. */
-  contain-intrinsic-block-size: auto round(calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 1lh + var(--nest-turn-gaps) * var(--mantine-spacing-md)), 1px);
-  overflow-clip-margin: var(--mantine-spacing-xs);
-}
+@media (pointer: fine) {
+  @supports (overflow-anchor: auto) {
+    .turn {
+      content-visibility: auto;
+      contain-intrinsic-block-size: auto calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 20px + var(--nest-turn-gaps) * var(--mantine-spacing-md));
+      overflow-clip-margin: var(--mantine-spacing-xs);
+    }
 
-.turn:last-child {
-  content-visibility: visible;
+    .turn:last-child {
+      content-visibility: visible;
+    }
+  }
+
+  @supports (overflow-anchor: auto) and (width: round(1lh, 1px)) {
+    .turn {
+      contain-intrinsic-block-size: auto round(calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 1lh + var(--nest-turn-gaps) * var(--mantine-spacing-md)), 1px);
+    }
+  }
 }
 
 /* A rule between turns: its label (wrapping when narrow), then a hairline to the end. */
