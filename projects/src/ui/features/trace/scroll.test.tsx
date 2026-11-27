@@ -141,8 +141,13 @@ describe("the trace's scroll, as its turns are drawn", () => {
     scrolled(30);
     expect(loadOlder).toHaveBeenCalledTimes(1);
     const read = "h21.0";
+    expect(at(read)).toBe(LINE - 30);
+    // While the page is on its way, a line above is drawn taller than its estimate: the line being read is
+    // where the reader now sees it (the browser anchors nothing at the top).
+    heights.set("h20.0", 35);
+    drawn();
     const y = at(read);
-    expect(y).toBe(LINE - 30);
+    expect(y).toBe(35 - 30);
     const before = viewport().querySelector(`[data-item="${read}"]`);
     rerender(state(ring, { older: [...page1, ...page2], olderCursor: null }));
     expect(viewport().querySelector(`[data-item="${read}"]`)).not.toBe(before);

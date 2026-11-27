@@ -8,6 +8,9 @@
 // Kept cheap as it streams: the turns are grouped from the previous state's (groupTurnsFrom), so a turn
 // that didn't change is the same object, and the turn, item, tool call and event components are memoized:
 // an event appended re-renders its own turn and the log around it, not the turns before.
+// And drawn only where it's seen: each turn is a TermTurn (`content-visibility: auto`), skipped off screen
+// at its last drawn height or an estimate (turnSize), so the scroll holds below (Load older, following,
+// Jump to live) are kept while turns take their own heights as they're drawn.
 
 import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
