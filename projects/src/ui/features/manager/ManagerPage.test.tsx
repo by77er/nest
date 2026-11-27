@@ -149,9 +149,13 @@ describe("the Manager page", () => {
     const panel = await screen.findByRole("tabpanel", { name: "Trace" });
     expect(within(panel).getByRole("heading", { name: "Manager's trace" })).toBeInTheDocument();
     expect(screen.queryByLabelText("Message to the manager")).toBeNull();
-    // The trace viewer connects for the manager the project names (fakeApi: agt_manager), once shown; the
-    // chat before it followed the same manager's trace for its live turn. Never another agent's.
-    await waitFor(() => expect(RecordingSocket.opened.length).toBeGreaterThanOrEqual(2));
-    expect(new Set(RecordingSocket.opened.map((u) => new URL(u).pathname))).toEqual(new Set(["/api/agents/agt_manager/trace"]));
+    // The chat and the trace viewer read one connection to the manager the project names (fakeApi:
+    // agt_manager), never another agent's; switching tabs back and forth keeps it (no second socket, which
+    // would replay the whole backlog).
+    await user.click(screen.getByRole("tab", { name: "Chat" }));
+    await screen.findByLabelText("Message to the manager");
+    await user.click(screen.getByRole("tab", { name: "Trace" }));
+    await screen.findByRole("heading", { name: "Manager's trace" });
+    expect(RecordingSocket.opened.map((u) => new URL(u).pathname)).toEqual(["/api/agents/agt_manager/trace"]);
   });
 });

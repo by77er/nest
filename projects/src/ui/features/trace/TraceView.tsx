@@ -11,10 +11,13 @@
 // And drawn only where it's seen: each turn is a TermTurn (`content-visibility: auto`), skipped off screen
 // at its last drawn height or an estimate (turnSize), so the scroll holds below (Load older, following,
 // Jump to live) are kept while turns take their own heights as they're drawn.
+// And drawn newest first when it mounts on many turns (a tab opened on a long trace already held): the
+// newest turns, a screen's worth (DRAWN_FIRST items), at once, the ones above them in a transition, which
+// React renders in slices that yield to the page, rather than one long task.
 
 import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
-import { memo, type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, type ReactNode, startTransition, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { exact } from "../../common/time";
 import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, TermTurn, useFillColumn, weight } from "../../layout";
 import {
@@ -22,7 +25,7 @@ import {
   type TurnGroup,
 } from "./model";
 import { TraceMarkdown } from "./TraceMarkdown";
-import { useTrace } from "./useTrace";
+import { useAgentTrace } from "./SharedTrace";
 
 /** Within this many px of the bottom counts as at the bottom (a fraction of a line); of the top, as asking for more. */
 const NEAR_BOTTOM = 24;
@@ -312,6 +315,22 @@ function restore(v: HTMLElement, h: Held): boolean | null {
   return true;
 }
 
+/**
+ * When many turns come together, the newest are drawn at once until they hold this many items (each at least
+ * a line: more than a screen of the log), and the rest follow in a transition.
+ */
+export const DRAWN_FIRST = 30;
+
+/** The key of the oldest turn drawn at once, if the newest DRAWN_FIRST items don't reach back to the first turn. */
+function cutFor(groups: readonly TurnGroup[]): string | null {
+  let items = 0;
+  for (let i = groups.length - 1; i > 0; i--) {
+    items += groups[i]!.items.length + 1;
+    if (items >= DRAWN_FIRST) return groups[i]!.key;
+  }
+  return null;
+}
+
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
 export function TraceLog({ title, state, loadOlder = () => {} }: { title: string; state: TraceState; loadOlder?: () => void }) {
   const { fill, untitled } = useFillColumn();
@@ -324,7 +343,18 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     current = groupTurnsFrom(grouping, state.events, state.older);
     setGrouping(current);
   }
-  const groups = current.groups;
+  // Mounting on many turns already held (the Manager's Trace tab opened on the chat's connection): only the
+  // newest (DRAWN_FIRST items, from the turn `cut` names) at once, then the rest above them in one
+  // transition. Anything that comes after mounting (a connection's backlog, however many frames it takes; a
+  // history page; live events) is drawn as it comes, as before.
+  const all = current.groups;
+  const [cut, setCut] = useState<string | null>(() => cutFor(all));
+  useEffect(() => {
+    if (cut !== null) startTransition(() => setCut(null));
+  }, [cut]);
+  const from = cut === null ? 0 : Math.max(0, all.findIndex((g) => g.key === cut));
+  const groups = from > 0 ? all.slice(from) : all;
+  const partial = from > 0;
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
@@ -344,11 +374,16 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const heightBefore = useRef<number | null>(null);
   const load = useRef(loadOlder);
   load.current = loadOlder;
+  // Not while the turns above are still being drawn: the top isn't the top yet.
   const canLoad = typeof state.olderCursor === "string" && state.olderState === "idle";
   const canLoadRef = useRef(canLoad);
   canLoadRef.current = canLoad;
+  // Whether the turns above the newest are still to be drawn, as committed (a render in progress, a
+  // transition's yielding to a scroll, doesn't count): the top isn't the top yet, so nothing older is asked.
+  const partialRef = useRef(partial);
 
   const older = () => {
+    if (partialRef.current) return;
     const v = viewport.current;
     heightBefore.current = v ? v.scrollHeight : null;
     held.current = v ? readerLine(v) : null;
@@ -430,7 +465,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       setAtBottom(near);
       if (near) setUnseen(0);
       // Near the top: the page before, if there is one.
-      if (v.scrollTop <= NEAR_TOP && !near && canLoadRef.current) older();
+      if (v.scrollTop <= NEAR_TOP && !near && canLoadRef.current && !partialRef.current) older();
     };
     v.addEventListener("scroll", onScroll, { passive: true });
     return () => {
@@ -474,8 +509,15 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     heightBefore.current = null;
     if (holding.current === 0) held.current = null;
     // Not enough yet to scroll (so no way to reach the top): the page before, too.
-    if (canLoadRef.current && v.clientHeight > 0 && v.scrollHeight <= v.clientHeight) older();
+    if (canLoadRef.current && !partialRef.current && v.clientHeight > 0 && v.scrollHeight <= v.clientHeight) older();
   }, [state.older]);
+
+  // The turns above drawn (the transition): a reader following stays at the bottom.
+  useLayoutEffect(() => {
+    partialRef.current = partial;
+    const v = viewport.current;
+    if (v && !partial && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
+  }, [partial]);
 
   // A page asked for that didn't come (it failed): nothing is on its way, so nothing is held for it, and a
   // page that comes later (a retry asks again) isn't measured from then.
@@ -553,7 +595,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const agentState = useMemo(() => lastState(state.events), [state.events]);
   const empty = state.events.length === 0 && state.older.length === 0;
   let top: ReactNode = null;
-  if (state.olderState === "loading") {
+  if (partial) top = null;
+  else if (state.olderState === "loading") {
     top = (
       <TermLine glyph={GLYPH.pending} glyphTone="muted" tone="muted" data-slot="older">
         loading earlier…
@@ -660,9 +703,9 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   );
 }
 
-/** An agent's live trace, connected while shown; `empty` says why there's no agent yet. */
+/** An agent's live trace, connected while shown (or by a SharedTrace above it); `empty` says why there's no agent yet. */
 export function TraceView({ title, agent, empty = "No agent yet." }: { title: string; agent: string | null; empty?: string }) {
-  const { state, loadOlder } = useTrace(agent);
+  const { state, loadOlder } = useAgentTrace(agent);
   if (!agent) {
     return (
       <Section title={title} region={false}>

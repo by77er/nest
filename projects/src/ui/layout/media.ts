@@ -7,3 +7,6 @@ export const PHONE_QUERY = "(max-width: 48em)";
 
 /** Whether the viewport is phone-width (below `sm`). */
 export const usePhone = (): boolean => useMediaQuery(PHONE_QUERY) ?? false;
+
+/** Whether the viewport is phone-width now: for a decision taken once, in a render, where `usePhone` may still be its initial `false`. */
+export const isPhoneNow = (): boolean => typeof window !== "undefined" && !!window.matchMedia?.(PHONE_QUERY).matches;

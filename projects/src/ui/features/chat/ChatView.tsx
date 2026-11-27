@@ -10,16 +10,16 @@
 import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Tooltip, VisuallyHidden } from "@mantine/core";
 import { useReducedMotion } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowDown, IconCalendarEvent, IconCopy, IconDots, IconListCheck, IconMessage, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
-import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createContext, memo, startTransition, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "../../api/client";
 import { useChat, useManager, usePostChat, useRetryChat } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
-  ChatFrame, ChatLog, ChatWelcome, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine,
+  ChatFrame, ChatLog, ChatWelcome, ComposerDock, DaySeparator, ErrorState, icon, isPhoneNow, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
-import { useTrace } from "../trace/useTrace";
+import { useAgentTrace } from "../trace/SharedTrace";
 import { Composer, type ComposerHandle } from "./Composer";
 import { type LogItem, markRead, type Step, stepsBySeq, timeline, type ToolStep, TurnReader } from "./model";
 
@@ -144,6 +144,21 @@ function ReplySteps({ steps, projectId, label }: { steps: Step[]; projectId: str
 
 /** The manager's mark beside its name. */
 const MANAGER_MARK = <IconMessage size={icon.sm} />;
+
+/** How many of the newest messages the log's first fill draws at once: more than a screen of them. */
+export const DRAWN_FIRST = 8;
+
+/** The key of the oldest item drawn at once, if the newest DRAWN_FIRST messages don't reach back to the first. */
+function cutFor(items: readonly LogItem[]): string | null {
+  let n = 0;
+  for (let i = items.length - 1; i > 0; i--) {
+    const it = items[i]!;
+    n += it.kind === "group" ? it.messages.length : 0;
+    // From its day's separator, if it's the day's first group.
+    if (n >= DRAWN_FIRST) return items[i - 1]!.kind === "day" ? (i - 1 > 0 ? items[i - 1]!.key : null) : it.key;
+  }
+  return null;
+}
 
 /** How close to the bottom counts as at the bottom (px), and to the top starts loading older ones. */
 const NEAR = 24;
@@ -392,7 +407,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const chat = useChat(projectId);
   const post = usePostChat(projectId);
   const retryChat = useRetryChat(projectId);
-  const trace = useTrace(agent);
+  const trace = useAgentTrace(agent);
   // Each turn of the trace read once (README.md#the-manager-chat): only the one in progress again as it grows.
   const reader = useMemo(() => new TurnReader(), [agent]);
   const { live, finished } = useMemo(() => reader.read(trace.state.events), [reader, trace.state.events]);
@@ -417,6 +432,11 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const composer = useRef<ComposerHandle>(null);
   const seen = useRef<Set<number> | null>(null);
   const anchor = useRef<number | null>(null);
+  // One page at a time: scroll events that come before the render showing "loading" read the handler as it
+  // was, so the flag the guard reads is a ref, set before the request and cleared once its page is drawn.
+  const loadingOlderRef = useRef(false);
+  // The log's first fill still being drawn above the newest messages (below): the top isn't the top yet.
+  const partialRef = useRef(false);
   // Nothing said yet and no turn running: nothing to follow (its welcome is read from the top).
   const emptyRef = useRef(true);
   // The last stream, kept until the turn's message lands, so the swap doesn't jump.
@@ -451,11 +471,17 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   // Hold the stream until its message lands (a manager message newer than when it began; any, for a turn
   // first seen in the backlog replayed on opening, whose message may be in the log already); another turn
   // starting lets the last one go.
+  // A turn this view first sees in its first render was read from the backlog, as a fresh connection replays
+  // it, even when the trace (shared with the Trace tab) was live before the view mounted.
+  const firstRender = useRef(true);
   useEffect(() => {
     if (!live) return;
-    const since = trace.state.status === "live" ? lastManagerSeq : 0;
+    const since = trace.state.status === "live" && !firstRender.current ? lastManagerSeq : 0;
     setHeld((h) => (live.steps.length ? { turn: live.turn, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : since } : h?.turn === live.turn ? h : null));
   }, [live]); // `lastManagerSeq` and the trace's status are read at each turn's start only
+  useEffect(() => {
+    firstRender.current = false;
+  }, []);
   // The held turn as it ended (a call it never answered reads stopped), while the ring has it.
   const heldEnd = !live && held ? (finished.find((t) => t.turn === held.turn) ?? null) : null;
   // Its message, once in the log: one of the manager's since it began, by what it says (an older one
@@ -530,8 +556,10 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     return () => ro.disconnect();
   }, [chat.isPending, chat.isError]); // the log mounts once the chat has loaded
 
-  // Older messages keep the place you were reading: the distance from the bottom is restored.
+  // Older messages keep the place you were reading: the distance from the bottom is restored. And the
+  // next page may be asked for only now that this one is drawn (a scroll before would ask for it again).
   useLayoutEffect(() => {
+    loadingOlderRef.current = false;
     const el = log.current;
     if (el && anchor.current !== null) {
       el.scrollTop = el.scrollHeight - anchor.current;
@@ -541,20 +569,23 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
 
   const loadOlder = useCallback(async () => {
     const first = messages.find((m) => m.seq > 0);
-    if (!first || loadingOlder || !hasOlder) return;
+    if (!first || loadingOlderRef.current || !hasOlder) return;
+    loadingOlderRef.current = true;
     setLoadingOlder(true);
     try {
       const page = await api.chat(projectId, first.seq);
       const el = log.current;
-      if (el) anchor.current = el.scrollHeight - el.scrollTop;
-      setOlder((o) => [...page, ...o]);
+      if (page.length === 0) loadingOlderRef.current = false; // nothing to draw: the [older] effect won't run
+      else if (el) anchor.current = el.scrollHeight - el.scrollTop;
+      setOlder((o) => (page.length ? [...page, ...o] : o));
       if (page.length < PAGE) setHasOlder(false);
     } catch {
       // Tried again on the next scroll.
+      loadingOlderRef.current = false;
     } finally {
       setLoadingOlder(false);
     }
-  }, [messages, loadingOlder, hasOlder, projectId]);
+  }, [messages, hasOlder, projectId]);
 
   // What the handlers below read as it is now, so they keep one identity (the log's rows and the composer
   // aren't drawn again for a new handler).
@@ -571,7 +602,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
       setUnseen(0);
     } else if (el.scrollTop < lastTop.current && atBottomRef.current) setAtBottom(false);
     lastTop.current = el.scrollTop;
-    if (el.scrollTop < OLDER_AT && now.current.latest.length >= PAGE) void now.current.loadOlder();
+    if (el.scrollTop < OLDER_AT && now.current.latest.length >= PAGE && !partialRef.current) void now.current.loadOlder();
   }, [setAtBottom]);
 
   // Posts a message (the composer's, or one the page never had an answer for, again): false if not taken.
@@ -633,6 +664,28 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const stream = items.some((it) => it.kind === "stream");
   emptyRef.current = messages.length === 0 && !stream;
   const isNew = useCallback((m: ChatMessage) => !!seen.current && m.seq > 0 && !seen.current.has(m.seq), []);
+  // The log's first fill (opening the chat on its latest page) drawn newest first: the newest messages, a
+  // screen's worth (DRAWN_FIRST), at once, the ones above them in a transition, which React renders in
+  // slices that yield to the page, so opening the chat is no single long task. The reader is at the end
+  // meanwhile (the log keeps it there as it grows above), and nothing older is asked for until it's drawn.
+  const [filled, setFilled] = useState(false);
+  const [cut, setCut] = useState<string | null>(null);
+  if (!filled && messages.length > 0) {
+    setFilled(true);
+    // Only where the log scrolls in itself (from `sm` up): on a phone the page is the scroller, and drawing
+    // above the reader there made following the end less steady (the design review's chat-follow-growth).
+    setCut(isPhoneNow() ? null : cutFor(items));
+  }
+  useEffect(() => {
+    if (cut !== null) startTransition(() => setCut(null));
+  }, [cut]);
+  const from = cut === null ? -1 : items.findIndex((it) => it.key === cut);
+  const drawn = from > 0 ? items.slice(from) : items;
+  // As committed: a transition's render in progress (yielding to a scroll) doesn't count.
+  const partial = from > 0;
+  useLayoutEffect(() => {
+    partialRef.current = partial;
+  }, [partial]);
 
   const item = (it: LogItem) =>
     it.kind === "day" ? (
@@ -652,7 +705,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
             {chat.isPending ? (
               <>
                 <LoadingState label="Loading the chat" />
-                {items.map(item)}
+                {drawn.map(item)}
               </>
             ) : chat.isError ? (
               <ErrorState title="The chat couldn't be loaded" error={chat.error} onRetry={() => void chat.refetch()} />
@@ -671,7 +724,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
                 The manager keeps this project's board: it specs tasks, assigns them, and tells you what's blocked.
               </ChatWelcome>
             ) : (
-              items.map(item)
+              drawn.map(item)
             )}
           </ChatLog>
         </ChatFrame>

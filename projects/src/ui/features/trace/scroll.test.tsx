@@ -7,6 +7,7 @@
 // browser's own numbers: the PR's measurements in Chromium.)
 import { MantineProvider } from "@mantine/core";
 import { act, render, screen } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cssVariablesResolver, theme } from "../../theme";
 import { initialTrace, type TraceEvent, type TraceState } from "./model";
@@ -366,5 +367,46 @@ describe("the trace's scroll, as its turns are drawn", () => {
     const n = calls.length;
     frame(10);
     expect(calls).toHaveLength(n);
+  });
+});
+
+describe("a long trace drawn newest first", () => {
+  /** `n` turns of a rule and two lines each. */
+  const turnsOf = (n: number) =>
+    Array.from({ length: n }, (_, t) => [
+      ev(3 * t + 1, "turn_started", { turn: `t${t}`, input_kind: "user" }),
+      ev(3 * t + 2, "assistant_text", { turn: `t${t}`, text: `turn ${t} a` }),
+      ev(3 * t + 3, "assistant_text", { turn: `t${t}`, text: `turn ${t} b` }),
+    ]).flat();
+
+  it("mounting on many turns: before the rest is drawn, only the newest show and the top asks for nothing older; after, all, and it asks", () => {
+    const events = turnsOf(30);
+    const loadOlder = vi.fn();
+    const seen: { lines: number; asked: number }[] = [];
+    // Runs in the first commit's passive effects, after the log's (its scroll listener is on), before the
+    // transition that draws the rest: what a reader scrolling at that moment meets.
+    function Probe() {
+      useEffect(() => {
+        layOut();
+        // (Inside the render's own act: the event dispatched as is.)
+        viewport().scrollTop = 0;
+        viewport().dispatchEvent(new Event("scroll"));
+        seen.push({ lines: lines().length, asked: loadOlder.mock.calls.length });
+      }, []);
+      return null;
+    }
+    render(
+      <MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">
+        <TraceLog title="T" state={state(events, { olderCursor: "c1" })} loadOlder={loadOlder} />
+        <Probe />
+      </MantineProvider>,
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.lines).toBeLessThan(40);
+    expect(seen[0]!.asked).toBe(0);
+    // Drawn: all 60 lines; at the top, the page before is asked for.
+    expect(lines()).toHaveLength(60);
+    scrolled(0);
+    expect(loadOlder).toHaveBeenCalledTimes(1);
   });
 });

@@ -54,17 +54,17 @@ afterEach(() => {
 
 const P = "/api/projects/prj_one";
 
-/** Each route, and the reads its page shows first (beside the shell's projects list and the project). */
+/** Each route, and the reads its page shows first (beside the shell's projects list, the project, and the chat its sidebar's unread dot reads). */
 const ROUTES: [string, string, string[]][] = [
-  ["board?task=tsk_t1", "BoardPage", [`${P}/tasks`, `${P}/attention`, `${P}/tasks/tsk_t1`]],
-  ["board", "BoardPage", [`${P}/tasks`, `${P}/attention`]],
-  ["manager", "ManagerPage", [`${P}/chat`, `${P}/manager`, `${P}/waits`, `${P}/tasks`, `${P}/attention`]],
-  ["reviews", "ReviewsPage", [`${P}/reviews`, `${P}/reviewers`]],
-  ["routines", "RoutinesPage", [`${P}/routines`, `${P}/routine-runs`, `${P}/proposals`, `${P}/memory`]],
-  ["triage", "TriagePage", [`${P}/issues`, `${P}/proposals`]],
-  ["secrets", "SecretsPage", [`${P}/secrets`]],
-  ["network", "NetworkPage", [`${P}/network`]],
-  ["settings", "SettingsPage", [`${P}/secrets`]],
+  ["board?task=tsk_t1", "BoardPage", [`${P}/chat`, `${P}/tasks`, `${P}/attention`, `${P}/tasks/tsk_t1`, `${P}/reviews`]],
+  ["board", "BoardPage", [`${P}/chat`, `${P}/tasks`, `${P}/attention`]],
+  ["manager", "ManagerPage", [`${P}/chat`, `${P}/manager`, `${P}/waits`, `${P}/tasks`, `${P}/attention`, `${P}/reviews`]],
+  ["reviews", "ReviewsPage", [`${P}/chat`, `${P}/reviews`, `${P}/reviewers`]],
+  ["routines", "RoutinesPage", [`${P}/chat`, `${P}/routines`, `${P}/routine-runs`, `${P}/proposals`, `${P}/memory`]],
+  ["triage", "TriagePage", [`${P}/chat`, `${P}/issues`, `${P}/proposals`]],
+  ["secrets", "SecretsPage", [`${P}/chat`, `${P}/secrets`]],
+  ["network", "NetworkPage", [`${P}/chat`, `${P}/network`]],
+  ["settings", "SettingsPage", [`${P}/chat`, `${P}/secrets`]],
 ];
 
 describe("a route's loader", () => {
@@ -89,7 +89,7 @@ describe("a route's loader", () => {
     }
   });
 
-  it("opening a task's drawer warms the task, and nothing the board already polls", async () => {
+  it("opening a task's drawer warms the task and the reviews (its PRs' verdicts), and nothing the board already polls", async () => {
     loadChunks();
     const api = new FakeApi();
     api.tasks = [task({ id: "tsk_t1", title: "Open me" })];
@@ -98,8 +98,8 @@ describe("a route's loader", () => {
     const prefetch = vi.spyOn(queryClient, "prefetchQuery");
     await router.navigate({ to: "/projects/$projectId/board", params: { projectId: "prj_one" }, search: { task: "tsk_t1" } });
     await waitFor(() => expect(api.reads).toContain(`${P}/tasks/tsk_t1`));
-    // The board's loader ran again for the drawer's task alone: its tasks and "Needs you" are polled already.
-    expect(prefetch.mock.calls.map(([o]) => o.queryKey)).toEqual([keys.task("prj_one", "tsk_t1")]);
+    // The board's loader ran again for the drawer alone: its tasks and "Needs you" are polled already.
+    expect(prefetch.mock.calls.map(([o]) => o.queryKey)).toEqual([keys.task("prj_one", "tsk_t1"), keys.reviews("prj_one")]);
   });
 
   it("a page shown a while after its reads were prefetched (a click after a hover, a slow chunk) asks for each once", async () => {
@@ -173,7 +173,7 @@ describe("a preload (a link hovered or focused)", () => {
     await router.preloadRoute({ to: "/projects/$projectId/reviews", params: { projectId: "prj_one" } });
     // Well past every interval the page's hooks would poll at.
     await vi.advanceTimersByTimeAsync(4 * POLL.reviews);
-    expect(api.reads.filter((x) => x.startsWith(P))).toEqual([P, `${P}/reviews`]);
+    expect(api.reads.filter((x) => x.startsWith(P))).toEqual([P, `${P}/chat`, `${P}/reviews`]);
     expect(queryClient.getQueryCache().find({ queryKey: keys.reviews("prj_one"), exact: true })!.getObserversCount()).toBe(0);
   });
 });

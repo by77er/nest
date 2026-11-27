@@ -11,9 +11,10 @@ import * as layout from "../../layout";
 import { FakeSocket } from "../../test/fakeSocket";
 import { cssVariablesResolver, theme } from "../../theme";
 import { ManagerTrace } from "./AgentTraces";
-import type { TraceEvent } from "./model";
+import { initialTrace, type TraceEvent, traceReducer } from "./model";
+import { TraceLog } from "./TraceView";
 
-const n = vi.hoisted(() => ({ states: 0, commits: 0, rules: 0, lines: 0, markdown: 0 }));
+const n = vi.hoisted(() => ({ states: 0, commits: 0, rules: 0, lines: 0, markdown: 0, perCommit: [] as number[] }));
 // State changes: each new state the hook hands the view.
 vi.mock("./useTrace", async (importOriginal) => {
   const real = await importOriginal<typeof import("./useTrace")>();
@@ -83,7 +84,14 @@ function open() {
   vi.useFakeTimers();
   render(
     <MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">
-      <Profiler id="trace" onRender={() => void n.commits++}>
+      <Profiler
+        id="trace"
+        onRender={() => {
+          n.commits++;
+          // The turns each commit drew (their rules rendered since the last).
+          n.perCommit.push(n.rules - n.perCommit.reduce((a, b) => a + b, 0));
+        }}
+      >
         <ManagerTrace settings={{ manager: "agt_bench" }} />
       </Profiler>
     </MantineProvider>,
@@ -92,7 +100,7 @@ function open() {
   act(() => sock.open());
   return sock;
 }
-const zero = () => Object.assign(n, { states: 0, commits: 0, rules: 0, lines: 0, markdown: 0 });
+const zero = () => Object.assign(n, { states: 0, commits: 0, rules: 0, lines: 0, markdown: 0, perCommit: [] });
 /** Each waiting frame run (the trace applies its batch on one). */
 const frames = () => act(() => void vi.advanceTimersToNextFrame());
 
@@ -109,7 +117,38 @@ describe("the trace's cost", () => {
     const r = { ...n };
     console.log(`BENCH backlog-1000: state_changes=${r.states} commits=${r.commits} turn_renders=${r.rules} line_renders=${r.lines} markdown_renders=${r.markdown} ms=${ms.toFixed(0)}`);
     expect(r.states).toBeLessThanOrEqual(5);
+    // The budget (README.md#performance): at most five commits for the backlog, its transition's included.
+    expect(r.commits).toBeLessThanOrEqual(5);
     expect(r.rules).toBeLessThanOrEqual(2 * 100);
+  });
+
+  it("a connection's backlog arriving in one frame, with its `live`, is drawn as it comes: all in its first commit", () => {
+    const sock = open();
+    zero();
+    act(() => {
+      for (const m of turns(100)) sock.message(m);
+      sock.message({ type: "live" });
+    });
+    frames();
+    const drawn = n.perCommit.filter((x) => x > 0);
+    expect(drawn[0]).toBe(100);
+  });
+
+  it("mounting on a trace already held (the Manager's Trace tab, on the chat's connection): the newest turns first, the rest after", () => {
+    const held = traceReducer(initialTrace(), { kind: "messages", data: [...turns(100), { type: "live" }] });
+    zero();
+    render(
+      <MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">
+        <Profiler id="again" onRender={() => void n.perCommit.push(n.rules - n.perCommit.reduce((a, b) => a + b, 0))}>
+          <TraceLog title="T" state={held} />
+        </Profiler>
+      </MantineProvider>,
+    );
+    // The first commit draws a screen's worth (DRAWN_FIRST items: here 5 turns), a later one the rest above
+    // them (in a transition, which a browser renders in slices), each turn once.
+    const drawn = n.perCommit.filter((x) => x > 0);
+    expect(drawn[0]).toBeLessThan(10);
+    expect(drawn.reduce((a, b) => a + b, 0)).toBe(100);
   });
 
   it("live events with 1,500 held: each re-renders its own turn only", () => {

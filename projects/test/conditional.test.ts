@@ -73,6 +73,19 @@ describe("conditional GETs", () => {
     expect(await other.json()).toEqual(tasks);
   });
 
+  it("carries the tag in X-ETag too, and answers 304 to it in X-If-None-Match (for an edge that drops ETag)", async () => {
+    const p = await seeded(1, 1);
+    const first = await get(`/api/projects/${p.id}/tasks`);
+    const etag = first.headers.get("etag")!;
+    expect(first.headers.get("x-etag")).toBe(etag);
+    const again = await get(`/api/projects/${p.id}/tasks`, { "x-if-none-match": etag });
+    expect(again.status).toBe(304);
+    expect(await again.text()).toBe("");
+    expect(again.headers.get("x-etag")).toBe(etag);
+    const other = await get(`/api/projects/${p.id}/tasks`, { "x-if-none-match": '"0123"' });
+    expect(other.status).toBe(200);
+  });
+
   it("after a write the ETag differs and the body is the new state: create then list, post then chat", async () => {
     const p = await seeded(1, 1);
     const list = await get(`/api/projects/${p.id}/tasks`);

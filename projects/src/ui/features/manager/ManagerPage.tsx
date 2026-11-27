@@ -1,6 +1,7 @@
 // A project's manager, in the same frame as every view: the conversation at a reading measure on the
 // frame's left edge, the context column beside it (its tasks, what needs you); the composer pinned to
-// the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`).
+// the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`). Both tabs read
+// one connection to the manager's trace, which a switch keeps (each tab is drawn anew, as before).
 
 import { Tabs } from "@mantine/core";
 import { IconMessage, IconTimeline } from "@tabler/icons-react";
@@ -11,6 +12,7 @@ import { ChatView } from "../chat/ChatView";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ManagerProblem, ManagerStatusLine } from "./ManagerStatus";
 import { ManagerTrace } from "../trace/AgentTraces";
+import { SharedTrace } from "../trace/SharedTrace";
 
 export function ManagerPage() {
   const { projectId } = useParams({ from: "/projects/$projectId/manager" });
@@ -20,6 +22,8 @@ export function ManagerPage() {
   return (
     <ProjectFrame projectId={projectId}>
       {(p) => (
+        // One trace connection for both tabs: a switch doesn't reconnect or fetch its history again.
+        <SharedTrace agent={p.settings.manager}>
         <WithContext measure="reading" contextLabel="About the manager" context={<ManagerContext projectId={projectId} />}>
         <Section title="Manager" actions={<ManagerStatusLine projectId={projectId} />}>
         <Stack gap="xl">
@@ -43,6 +47,7 @@ export function ManagerPage() {
         </Stack>
         </Section>
         </WithContext>
+        </SharedTrace>
       )}
     </ProjectFrame>
   );

@@ -453,6 +453,8 @@ describe("the chat", () => {
     renderApp("/projects/prj_one/manager", api);
     const c = await chat();
     await within(c).findByText("Message 80");
+    // The latest page all drawn (its newest first, then the rest above them): the top is the top.
+    await within(c).findByText("Message 31");
     expect(within(c).queryByText("Message 30")).toBeNull();
     const log = within(c).getByRole("log", { name: "Conversation with the manager" });
     log.scrollTop = 0;

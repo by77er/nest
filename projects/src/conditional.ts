@@ -1,6 +1,12 @@
 // Conditional GETs and timing for the JSON API (README.md#the-ui): the page polls, and almost every poll
 // finds nothing new. Each JSON `GET` answer carries an `ETag` of its body, and a request naming it in
 // `If-None-Match` is answered `304` with no body; every answer says how long the Worker took (`Server-Timing`).
+// The tag also goes in the app's own `X-ETag`, named back in `X-If-None-Match`: the page falls back to them
+// when an answer comes without its `ETag` (a proxy or the edge dropped it), so its polls stay conditional.
+
+/** The app's own copy of the validator, and the request header that names it back (src/ui/api/client.ts). */
+export const APP_ETAG = "x-etag";
+export const APP_IF_NONE_MATCH = "x-if-none-match";
 
 /**
  * The ETag of a body: its SHA-256, the first 16 bytes in hex, quoted, and marked weak (RFC 9110 8.8.3).
@@ -21,8 +27,8 @@ export function matches(ifNoneMatch: string | null, etag: string): boolean {
 }
 
 /**
- * An API answer made conditional: a `GET`'s `200` with a JSON body gets its `ETag`, and is `304` (no body)
- * when the request already has it. Anything else (another method or status, another type, the trace's
+ * An API answer made conditional: a `GET`'s `200` with a JSON body gets its `ETag` (and `X-ETag`), and is
+ * `304` (no body) when the request already has it, named in `If-None-Match` or `X-If-None-Match`. Anything else (another method or status, another type, the trace's
  * WebSocket upgrade, `opaque` routes) is returned as it is.
  */
 export async function conditional(req: Request, res: Response, opaque = false): Promise<Response> {
@@ -31,9 +37,10 @@ export async function conditional(req: Request, res: Response, opaque = false): 
   const etag = await etagOf(body);
   const headers = new Headers(res.headers);
   headers.set("etag", etag);
-  if (matches(req.headers.get("if-none-match"), etag)) {
+  headers.set(APP_ETAG, etag);
+  if (matches(req.headers.get("if-none-match"), etag) || matches(req.headers.get(APP_IF_NONE_MATCH), etag)) {
     // What a 304 carries (RFC 9110 15.4.5): the validator and the caching rule, nothing about a body.
-    return new Response(null, { status: 304, headers: { etag, "cache-control": headers.get("cache-control") ?? "no-store" } });
+    return new Response(null, { status: 304, headers: { etag, [APP_ETAG]: etag, "cache-control": headers.get("cache-control") ?? "no-store" } });
   }
   return new Response(body, { status: res.status, statusText: res.statusText, headers });
 }

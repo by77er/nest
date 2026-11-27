@@ -79,6 +79,38 @@ describe("conditional GETs", () => {
     expect(b).not.toBe(a);
   });
 
+  it("with the ETag dropped on the way (the edge, a proxy), falls back to the app's own X-ETag", async () => {
+    let version = 1;
+    const seen: { inm: string | null; own: string | null }[] = [];
+    vi.stubGlobal("fetch", async (_: RequestInfo | URL, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      seen.push({ inm: h.get("if-none-match"), own: h.get("x-if-none-match") });
+      const tag = `W/"v${version}"`;
+      // As the Worker answers through an edge that strips ETag: only X-ETag arrives.
+      return h.get("x-if-none-match") === tag
+        ? new Response(null, { status: 304, headers: { "x-etag": tag } })
+        : new Response(JSON.stringify({ v: version }), { headers: { "content-type": "application/json", "x-etag": tag } });
+    });
+    const first = await api.waits("prj_c7");
+    const second = await api.waits("prj_c7");
+    expect(Object.is(second, first)).toBe(true);
+    version = 2;
+    expect(await api.waits("prj_c7")).toEqual({ v: 2 });
+    expect(seen).toEqual([{ inm: null, own: null }, { inm: null, own: 'W/"v1"' }, { inm: null, own: 'W/"v1"' }]);
+    // With both (as the Worker sends them), the standard ETag wins and goes back in If-None-Match.
+    const both: { inm: string | null; own: string | null }[] = [];
+    vi.stubGlobal("fetch", async (_: RequestInfo | URL, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      both.push({ inm: h.get("if-none-match"), own: h.get("x-if-none-match") });
+      return h.get("if-none-match") === '"std"'
+        ? new Response(null, { status: 304, headers: { etag: '"std"', "x-etag": '"own"' } })
+        : new Response(JSON.stringify({ n: 1 }), { headers: { "content-type": "application/json", etag: '"std"', "x-etag": '"own"' } });
+    });
+    const a = await api.waits("prj_c8");
+    expect(Object.is(await api.waits("prj_c8"), a)).toBe(true);
+    expect(both).toEqual([{ inm: null, own: null }, { inm: '"std"', own: null }]);
+  });
+
   it("never answers a write from what it remembers, and the GET after it gets the new state", async () => {
     let tasks = [{ id: "tsk_a" }];
     const s = server((url, method) => {
