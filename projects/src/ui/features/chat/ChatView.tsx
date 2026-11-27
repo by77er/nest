@@ -10,7 +10,7 @@
 import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Tooltip, VisuallyHidden } from "@mantine/core";
 import { useReducedMotion } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowDown, IconCalendarEvent, IconCopy, IconDots, IconListCheck, IconMessage, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
-import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createContext, memo, startTransition, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "../../api/client";
 import { useChat, useManager, usePostChat, useRetryChat } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
@@ -144,6 +144,21 @@ function ReplySteps({ steps, projectId, label }: { steps: Step[]; projectId: str
 
 /** The manager's mark beside its name. */
 const MANAGER_MARK = <IconMessage size={icon.sm} />;
+
+/** How many of the newest messages the log's first fill draws at once: more than a screen of them. */
+export const DRAWN_FIRST = 8;
+
+/** The key of the oldest item drawn at once, if the newest DRAWN_FIRST messages don't reach back to the first. */
+function cutFor(items: readonly LogItem[]): string | null {
+  let n = 0;
+  for (let i = items.length - 1; i > 0; i--) {
+    const it = items[i]!;
+    n += it.kind === "group" ? it.messages.length : 0;
+    // From its day's separator, if it's the day's first group.
+    if (n >= DRAWN_FIRST) return items[i - 1]!.kind === "day" ? (i - 1 > 0 ? items[i - 1]!.key : null) : it.key;
+  }
+  return null;
+}
 
 /** How close to the bottom counts as at the bottom (px), and to the top starts loading older ones. */
 const NEAR = 24;
@@ -548,6 +563,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   // One page at a time: scroll events that come before the render showing "loading" read the handler as it
   // was, so the flag the guard reads is a ref, set before the request (README.md#performance).
   const loadingOlderRef = useRef(false);
+  // The log's first fill still being drawn above the newest messages (below): the top isn't the top yet.
+  const partialRef = useRef(false);
   const loadOlder = useCallback(async () => {
     const first = messages.find((m) => m.seq > 0);
     if (!first || loadingOlderRef.current || !hasOlder) return;
@@ -582,7 +599,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
       setUnseen(0);
     } else if (el.scrollTop < lastTop.current && atBottomRef.current) setAtBottom(false);
     lastTop.current = el.scrollTop;
-    if (el.scrollTop < OLDER_AT && now.current.latest.length >= PAGE) void now.current.loadOlder();
+    if (el.scrollTop < OLDER_AT && now.current.latest.length >= PAGE && !partialRef.current) void now.current.loadOlder();
   }, [setAtBottom]);
 
   // Posts a message (the composer's, or one the page never had an answer for, again): false if not taken.
@@ -644,6 +661,22 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const stream = items.some((it) => it.kind === "stream");
   emptyRef.current = messages.length === 0 && !stream;
   const isNew = useCallback((m: ChatMessage) => !!seen.current && m.seq > 0 && !seen.current.has(m.seq), []);
+  // The log's first fill (opening the chat on its latest page) drawn newest first: the newest messages, a
+  // screen's worth (DRAWN_FIRST), at once, the ones above them in a transition, which React renders in
+  // slices that yield to the page, so opening the chat is no single long task. The reader is at the end
+  // meanwhile (the log keeps it there as it grows above), and nothing older is asked for until it's drawn.
+  const [filled, setFilled] = useState(false);
+  const [cut, setCut] = useState<string | null>(null);
+  if (!filled && messages.length > 0) {
+    setFilled(true);
+    setCut(cutFor(items));
+  }
+  useEffect(() => {
+    if (cut !== null) startTransition(() => setCut(null));
+  }, [cut]);
+  const from = cut === null ? -1 : items.findIndex((it) => it.key === cut);
+  const drawn = from > 0 ? items.slice(from) : items;
+  partialRef.current = from > 0;
 
   const item = (it: LogItem) =>
     it.kind === "day" ? (
@@ -663,7 +696,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
             {chat.isPending ? (
               <>
                 <LoadingState label="Loading the chat" />
-                {items.map(item)}
+                {drawn.map(item)}
               </>
             ) : chat.isError ? (
               <ErrorState title="The chat couldn't be loaded" error={chat.error} onRetry={() => void chat.refetch()} />
@@ -682,7 +715,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
                 The manager keeps this project's board: it specs tasks, assigns them, and tells you what's blocked.
               </ChatWelcome>
             ) : (
-              items.map(item)
+              drawn.map(item)
             )}
           </ChatLog>
         </ChatFrame>

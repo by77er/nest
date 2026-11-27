@@ -9,15 +9,21 @@ import type { ChatMessage } from "../../api/types";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
-const counts = vi.hoisted(() => ({ rows: 0, markdown: 0 }));
+const counts = vi.hoisted(() => ({ rows: 0, markdown: 0, perCommit: [] as number[] }));
 
 vi.mock("../../layout", async (importOriginal) => {
   const layout = await importOriginal<typeof import("../../layout")>();
+  const { createElement, forwardRef, Profiler } = await import("react");
   const MessageRow = (props: Parameters<typeof layout.MessageRow>[0]) => {
     if (props["data-sender"] !== "stream") counts.rows += 1;
     return layout.MessageRow(props);
   };
-  return { ...layout, MessageRow };
+  // Each commit of the log: the messages it drew since the last.
+  const ChatLog = forwardRef<HTMLDivElement, Parameters<typeof layout.ChatLog>[0]>(function ChatLog(props, ref) {
+    const onRender = () => void counts.perCommit.push(counts.rows - counts.perCommit.reduce((a, b) => a + b, 0));
+    return createElement(Profiler, { id: "log", onRender }, createElement(layout.ChatLog, { ...props, ref }));
+  });
+  return { ...layout, MessageRow, ChatLog };
 });
 vi.mock("react-markdown", async (importOriginal) => {
   const md = await importOriginal<typeof import("react-markdown")>();
@@ -86,12 +92,28 @@ function apiWith(messages: ChatMessage[]) {
 const reset = () => {
   counts.rows = 0;
   counts.markdown = 0;
+  counts.perCommit = [];
 };
 
 afterEach(() => vi.unstubAllGlobals());
 beforeEach(() => window.localStorage.clear());
 
 describe("what the chat re-renders", () => {
+  it("opening on 100 messages draws the newest first, then the rest above them, each message once", async () => {
+    reset();
+    const api = apiWith(msgs(100));
+    renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await within(c).findByText("Message 1");
+    // The first commit with messages: a screen's worth (DRAWN_FIRST, give or take its group); a later one
+    // (the transition, which a browser renders in slices) the rest.
+    const drawn = counts.perCommit.filter((x) => x > 0);
+    expect(drawn[0]).toBeLessThanOrEqual(10);
+    expect(drawn.length).toBeGreaterThanOrEqual(2);
+    // About once each: the group the first commit started at is drawn again under the ones above it.
+    expect(counts.rows).toBeLessThanOrEqual(100 + 10);
+  });
+
   it("typing 20 characters with 100 messages shown renders no message and no Markdown", async () => {
     const api = apiWith(msgs(100));
     const { user } = renderApp("/projects/prj_one/manager", api);
@@ -116,7 +138,8 @@ describe("what the chat re-renders", () => {
     const api = apiWith(msgs(100));
     const { queryClient } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
-    await within(c).findByText("Message 99");
+    // All drawn (the newest first, then the rest).
+    await within(c).findByText("Message 1");
     reset();
     // The manager's, 30 s after its last: it joins that message's group, which is drawn again around it.
     api.chat = [...api.chat, { seq: 101, at_ms: T0 + 100 * 30_000, sender: "manager", text: "Message 101", delivered: true, status: "done", error: null }];
