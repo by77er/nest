@@ -879,6 +879,11 @@ export class OAuthStore {
     return ref.startsWith(CLIENT_OAUTH_PREFIX) ? ref.slice(0, ref.lastIndexOf(":") + 1) : null;
   }
 
+  /** How many writes' revocations reached a client entry (`clientOAuthEntryPrefix`). */
+  writesOfEntry(prefix: string): number {
+    return this.writeRevocations.get(prefix)?.count ?? 0;
+  }
+
   /** How many writes' revocations reached `ref`'s entry (0 for an operator's record). */
   private writesOf(ref: string): number {
     const p = this.entryPrefixOf(ref);

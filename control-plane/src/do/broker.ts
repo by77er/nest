@@ -230,9 +230,17 @@ export class BrokerDO extends DurableObject<Env> {
     // authorization), and a start or callback in flight for another incarnation stores nothing. A delete
     // revokes all, and cancels everything in flight for the capability.
     if (o) {
-      const current = await this.incarnationOf(capability);
-      const keep = current === null ? undefined : clientOAuthRef(client, entry, current);
-      return { revoked: await this.oauth.revokePrefix(clientOAuthEntryPrefix(client, entry), o.caller ?? client, { write: true }, keep) };
+      const prefix = clientOAuthEntryPrefix(client, entry);
+      // Another write's revocation may run while CatalogDO answers (it ran on a newer catalog read): then the
+      // answer is stale, and is read again, so this one never takes what a newer write kept.
+      for (;;) {
+        const before = this.oauth.writesOfEntry(prefix);
+        const current = await this.incarnationOf(capability);
+        if (this.oauth.writesOfEntry(prefix) !== before) continue;
+        const keep = current === null ? undefined : clientOAuthRef(client, entry, current);
+        // `revokePrefix` deletes in its first synchronous step: nothing runs between this check and that.
+        return { revoked: await this.oauth.revokePrefix(prefix, o.caller ?? client, { write: true }, keep) };
+      }
     }
     return { revoked: await this.oauth.revokePrefix(clientOAuthEntryPrefix(client, entry), caller, { capability }) };
   }
