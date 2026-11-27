@@ -424,7 +424,7 @@ export class CatalogDO extends DurableObject<Env> {
     // Expanded as written (no overrides): what it gives must hold together (its launch's model and effort
     // plain tokens, `launchProblem`, whoever writes it), and a client's stay in its grant.
     const spec = expandTemplate({ capabilities: cat.capabilities, templates: { [name]: tpl } }, PLATFORM_TOOL_NAMES, name,
-      scope ? { [scope.name]: scope.client } : {});
+      scope ? { [scope.name]: scope.client } : {}, scope?.name ?? null);
     if (!spec.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, spec.error);
     if (scope) {
       const refusal = grantRefusal(scope.client, specOutsideGrant(spec.value, scope.grant));

@@ -716,11 +716,16 @@ export function expandTemplate(
     const cap = catalog.capabilities[c]!;
     caps.push(cap);
     if (cap.mcp) {
-      const ns = c.includes("/") ? c.slice(0, c.indexOf("/")) : null;
-      const owner = ns !== null && Object.hasOwn(clients, ns) ? clients[ns] : undefined;
-      // A client's own credential is that client's: never expanded where no client owns the namespace.
-      if (isClientMcpAuth(cap.mcp.auth) && owner === undefined) return err(`template ${name}: capability ${c} names a client's own credential, and no client is named ${ns ?? "(the operator's namespace)"}`);
-      const g = grantOf(mcpPrefix(c), cap.mcp, owner, ns === null ? undefined : c.slice(ns.length + 1));
+      const capNs = c.includes("/") ? c.slice(0, c.indexOf("/")) : null;
+      const owner = capNs !== null && Object.hasOwn(clients, capNs) ? clients[capNs] : undefined;
+      if (isClientMcpAuth(cap.mcp.auth)) {
+        // A client's own credential is that client's: never expanded where no client owns the namespace, and only
+        // for an agent joining that client's own subtree (`ns`), so a person's consent to the app never serves
+        // the operator's agents or another subtree's.
+        if (owner === undefined) return err(`template ${name}: capability ${c} names a client's own credential, and no client is named ${capNs ?? "(the operator's namespace)"}`);
+        if (ns !== capNs) return err(`template ${name}: capability ${c} holds ${capNs}'s own credential: only an agent of ${capNs}'s subtree uses it`);
+      }
+      const g = grantOf(mcpPrefix(c), cap.mcp, owner, capNs === null ? undefined : c.slice(capNs.length + 1));
       if (mcp.some((x) => x.capability === g.capability)) return err(`template ${name}: two mcp capabilities make tools named ${g.capability}_*`);
       mcp.push(g);
     }

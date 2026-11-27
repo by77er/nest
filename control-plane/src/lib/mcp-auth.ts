@@ -566,10 +566,10 @@ export interface StoreDeps {
   publicBaseUrl: string;
   allowLoopback: boolean;
   /**
-   * Whether a client's capability still holds the incarnation its record is for (`capability`, `<ns>/<entry>`):
-   * a callback stores a client's tokens only then, in the step after the answer.
+   * The incarnation a client's `{authorize}` capability (`<ns>/<entry>`) holds now in CatalogDO, or null (gone, or
+   * another form). A callback stores a client's tokens only when it is theirs, in the step after the answer.
    */
-  holdsIncarnation?(capability: string, incarnation: string): Promise<boolean>;
+  incarnationOf?(capability: string): Promise<string | null>;
 }
 
 export interface StartInput {
@@ -662,6 +662,7 @@ export class OAuthStore {
     // A revoke (of the capability, or of its client's records) while this start awaits discovery or
     // registration finds no flow to delete yet: seen here by its count, and the flow is never written.
     const revokedBefore = this.revocationsOf({ capability: input.capability, ref: input.auth.oauth });
+    const writesBefore = this.writesOf(input.auth.oauth);
     const server = checkOAuthUrl(input.url, this.d.allowLoopback, "the server URL");
     // A client's record only through its own identity, and only its own record (BrokerDO derives both).
     if ((clientOfRef(input.auth.oauth) ?? undefined) !== input.owner?.id) throw oauthError(`${input.auth.oauth} isn't a record of ${input.owner?.id ?? "the operator"}`, 403);
@@ -705,7 +706,9 @@ export class OAuthStore {
       capability: input.capability, ref: input.auth.oauth, server_url: input.url, resource: found.resource, issuer: found.as.issuer,
       token_endpoint: found.as.token_endpoint, iss_parameter: found.as.iss_parameter, client, verifier, redirect_uri, scopes,
     };
-    if (this.revocationsOf(flow) !== revokedBefore) throw oauthError(`${input.capability}'s authorization was revoked while this one was starting: start again`, 409);
+    if (this.revocationsOf(flow) !== revokedBefore || this.overtakenByWrite(flow.ref, writesBefore)) {
+      throw oauthError(`${input.capability}'s authorization was revoked while this one was starting: start again`, 409);
+    }
     this.d.sql.exec("DELETE FROM oauth_flows WHERE expires_ms <= ?", now);
     this.d.sql.exec("INSERT INTO oauth_flows (state, body, expires_ms) VALUES (?, ?, ?)", state, JSON.stringify(flow), now + OAUTH_FLOW_TTL_MS);
     this.d.audit({ event: "oauth_start", capability: input.capability, ref: input.auth.oauth, resource: found.resource, issuer: found.as.issuer, client: id, scope: scopes?.join(" ") ?? null, caller });
@@ -740,6 +743,7 @@ export class OAuthStore {
     // A revoke that lands while the code is being exchanged finds no flow row (it went above) and no
     // record yet: it is seen here by its count, read before the await and again after.
     const revokedBefore = this.revocationsOf(flow);
+    const writesBefore = this.writesOf(flow.ref);
     const a = await tokenRequest(flow.token_endpoint, client, {
       grant_type: "authorization_code", code: q.code, redirect_uri: flow.redirect_uri, code_verifier: flow.verifier, resource: flow.resource,
     });
@@ -747,8 +751,10 @@ export class OAuthStore {
     // A client's record is stored only while its capability still holds the incarnation it is for: a delete, a
     // new URL or form since the start (whose revocation may have run before this flow existed) means never.
     const incarnation = flow.ref.startsWith(CLIENT_OAUTH_PREFIX) ? flow.ref.slice(flow.ref.lastIndexOf(":") + 1) : null;
-    const held = incarnation === null || !this.d.holdsIncarnation ? true : await this.d.holdsIncarnation(flow.capability, incarnation).catch(() => false);
-    if (!held || this.revocationsOf(flow) !== revokedBefore) {
+    const held = incarnation === null || !this.d.incarnationOf ? true : (await this.d.incarnationOf(flow.capability).catch(() => null)) === incarnation;
+    // A write's revocation that ran across these awaits, keeping another incarnation, outranks the answer above
+    // (it may have been on its way back while the write landed).
+    if (!held || this.revocationsOf(flow) !== revokedBefore || this.overtakenByWrite(flow.ref, writesBefore)) {
       // Revoked meanwhile: these tokens are never stored, and are revoked at the server where it can be.
       const r = await this.revokeAtServer({ issuer: flow.issuer, client: flow.client, refresh_token: a.refresh_token, access_token: a.access_token });
       return refuse(`${flow.capability}'s authorization was revoked while its code was being exchanged; the new tokens were dropped (at the server: ${r.server})`, flow);
@@ -838,9 +844,11 @@ export class OAuthStore {
    * server, best effort, as `revoke` does. `bump`: the capability or client whose count a start or callback in
    * flight reads (their flow rows may be gone already, and their record not written yet).
    */
-  async revokePrefix(prefix: string, caller: string, bump: { capability?: string; client?: string }, keep?: string): Promise<{ ref: string; issuer: string; server: ServerRevocation }[]> {
+  async revokePrefix(prefix: string, caller: string, bump: { capability?: string; client?: string; write?: boolean }, keep?: string): Promise<{ ref: string; issuer: string; server: ServerRevocation }[]> {
     // `keep`: a record (and its flows) that stays, the capability's current incarnation's.
     const owned = (ref: string) => ref.startsWith(prefix) && ref !== keep;
+    // A write's revocation: a start or callback of this entry in flight across it stores nothing unless it is for `keep`.
+    if (bump.write) this.writeRevocations.set(prefix, { count: (this.writeRevocations.get(prefix)?.count ?? 0) + 1, keep: keep ?? null });
     if (bump.client) this.clientRevocations.set(bump.client, (this.clientRevocations.get(bump.client) ?? 0) + 1);
     if (bump.capability) this.revocations.set(bump.capability, (this.revocations.get(bump.capability) ?? 0) + 1);
     const refs = this.d.sql.exec<{ ref: string }>("SELECT ref FROM oauth_grants").toArray().map((r) => r.ref).filter(owned);
@@ -863,6 +871,26 @@ export class OAuthStore {
   private readonly revocations = new Map<string, number>();
   /** Revocations of every record of an API client (`revokePrefix` with a client), by client id, since this object started. */
   private readonly clientRevocations = new Map<string, number>();
+
+  /** Writes' revocations per client entry (`clientOAuthEntryPrefix`), and the record each kept, since this object started. */
+  private readonly writeRevocations = new Map<string, { count: number; keep: string | null }>();
+
+  private entryPrefixOf(ref: string): string | null {
+    return ref.startsWith(CLIENT_OAUTH_PREFIX) ? ref.slice(0, ref.lastIndexOf(":") + 1) : null;
+  }
+
+  /** How many writes' revocations reached `ref`'s entry (0 for an operator's record). */
+  private writesOf(ref: string): number {
+    const p = this.entryPrefixOf(ref);
+    return p === null ? 0 : (this.writeRevocations.get(p)?.count ?? 0);
+  }
+
+  /** Whether a write's revocation of `ref`'s entry ran since `before`, keeping another record than `ref`. */
+  private overtakenByWrite(ref: string, before: number): boolean {
+    const p = this.entryPrefixOf(ref);
+    const w = p === null ? undefined : this.writeRevocations.get(p);
+    return !!w && w.count !== before && w.keep !== ref;
+  }
 
   /** Revocations that reach a flow: of its capability, and of its client's records when it is a client's. */
   private revocationsOf(flow: Pick<Flow, "capability" | "ref">): number {

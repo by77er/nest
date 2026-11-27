@@ -318,19 +318,16 @@ async function clientOAuthCapability(c: { env: Env; caller: Caller; p: { ns: str
   return { scope, name, url: mcp.url, scopes: auth.scopes, incarnation: auth.incarnation ?? "0" };
 }
 
-/** An `{authorize}` capability's incarnation, or null for any other. */
-function incarnationOf(cap: Capability | undefined): string | null {
-  const auth = cap?.mcp?.auth;
-  return isClientMcpAuth(auth) && "authorize" in auth ? (auth.incarnation ?? "0") : null;
-}
+/** Who an audit record names for a client's route: the client itself, or the operator acting on its namespace. */
+const auditCaller = (caller: Caller): string => (caller.kind === "client" ? caller.client : "operator");
 
 /**
  * Revoke a client's entry's OAuth records: all of them (a delete), or all but the incarnation the capability
  * holds now (`keep`, a write). One that can't run yet is a retryable 503: the same request again finishes it.
  */
-async function revokeEntry(env: Env, client: string, name: string, entry: string, o?: { keep: string | null }): Promise<void> {
+async function revokeEntry(env: Env, client: string, name: string, entry: string, caller: string, write: boolean): Promise<void> {
   try {
-    await newMethod("BrokerDO.clientOAuthRevoke", () => broker(env).clientOAuthRevoke(client, name, entry, o));
+    await newMethod("BrokerDO.clientOAuthRevoke", () => broker(env).clientOAuthRevoke(client, name, entry, write ? { write: true, caller } : undefined, caller));
   } catch (e) {
     throw new NestError(ErrorCodes.INTERNAL, `${name}'s earlier OAuth authorizations aren't revoked yet (${e instanceof Error ? e.message : String(e)}): send the same request again`, 503, true);
   }
@@ -1275,7 +1272,7 @@ export const ROUTES: Route[] = [
         const stored = await catalog(c.env).putCapability(name, c.body as Capability, scope);
         // Every authorization but the incarnation it holds now (none, when it isn't `{authorize}`) is for
         // something else: revoked. Idempotent, so the same request again finishes one that couldn't run.
-        await revokeEntry(c.env, scope.client, name, c.p.entry, { keep: incarnationOf(stored) });
+        await revokeEntry(c.env, scope.client, name, c.p.entry, auditCaller(c.caller), true);
         return stored;
       },
     }),
@@ -1286,20 +1283,21 @@ export const ROUTES: Route[] = [
       await catalog(c.env).deleteCapability(name);
       // Its own OAuth tokens go with it (docs/control-plane/api/clients/#mcp-credentials), whatever it held when
       // deleted: by the entry's records, so a retried delete (the capability already gone) still revokes them.
-      await revokeEntry(c.env, scope.client, name, c.p.entry);
+      await revokeEntry(c.env, scope.client, name, c.p.entry, auditCaller(c.caller), false);
       return undefined;
     } }),
   ]),
   // A client's own OAuth for an mcp capability of its namespace whose auth is `{authorize}`
   // (docs/control-plane/api/clients/#mcp-credentials): the client starts it here and sends a person to the
-  // URL; the authorization server redirects their browser to the same callback as the operator's. The record
-  // is derived from the client and the entry, never named. Namespace auth: the client, or the operator.
+  // URL; the authorization server redirects their browser to the client's own callback, /v1/oauth/callback/<cli>.
+  // The record is derived from the client, the entry and its incarnation, never named. Namespace auth: the
+  // client, or the operator.
   route({
     method: "POST", path: "/v1/catalog/capabilities/:ns/:entry/oauth", auth: "owner", optionalBody: true, body: z.strictObject({ scopes: Scopes.optional() }),
     run: async (c) => {
       const { scope, name, url, scopes, incarnation } = await clientOAuthCapability(c);
       return newMethod("BrokerDO.clientOAuthStart", () => broker(c.env).clientOAuthStart({
-        client: scope.client, clientName: scope.name, capability: name, entry: c.p.entry, incarnation, url, ...(c.body.scopes ? { scopes: c.body.scopes } : {}), ...(scopes ? { capScopes: scopes } : {}),
+        client: scope.client, clientName: scope.name, capability: name, entry: c.p.entry, incarnation, url, caller: auditCaller(c.caller), ...(c.body.scopes ? { scopes: c.body.scopes } : {}), ...(scopes ? { capScopes: scopes } : {}),
       }));
     },
   }),
@@ -1310,7 +1308,7 @@ export const ROUTES: Route[] = [
   // By the record alone: it works after the capability was deleted.
   route({ method: "DELETE", path: "/v1/catalog/capabilities/:ns/:entry/oauth", auth: "owner", run: async (c) => {
     const scope = await namespaceScope(c, c.p.ns);
-    return newMethod("BrokerDO.clientOAuthRevoke", () => broker(c.env).clientOAuthRevoke(scope.client, `${c.p.ns}/${c.p.entry}`, c.p.entry));
+    return newMethod("BrokerDO.clientOAuthRevoke", () => broker(c.env).clientOAuthRevoke(scope.client, `${c.p.ns}/${c.p.entry}`, c.p.entry, undefined, auditCaller(c.caller)));
   } }),
 ];
 

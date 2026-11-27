@@ -141,16 +141,7 @@ export class BrokerDO extends DurableObject<Env> {
       publicBaseUrl: env.PUBLIC_BASE_URL,
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
       // CatalogDO holds the capability; a callback asks it, then stores in the next synchronous step.
-      holdsIncarnation: async (capability, incarnation) => {
-        let cap: unknown;
-        try {
-          cap = await env.CATALOG.get(env.CATALOG.idFromName("catalog")).entry("capabilities", capability);
-        } catch {
-          return false;
-        }
-        const auth = (cap as { mcp?: { auth?: unknown } } | undefined)?.mcp?.auth;
-        return isClientMcpAuth(auth) && "authorize" in auth && (auth.incarnation ?? "0") === incarnation;
-      },
+      incarnationOf: (capability) => this.incarnationOf(capability),
     });
   }
 
@@ -208,11 +199,24 @@ export class BrokerDO extends DurableObject<Env> {
    * docs/control-plane/api/clients/#mcp-credentials): as `oauthStart`, its tokens kept under the record
    * derived from the client and the entry, never one it names.
    */
-  async clientOAuthStart(input: { client: string; clientName: string; capability: string; entry: string; incarnation: string; url: string; scopes?: string[]; capScopes?: string[] }): Promise<StartAnswer> {
+  /** The incarnation a client's `{authorize}` capability holds now in CatalogDO, or null (gone, or another form). */
+  private async incarnationOf(capability: string): Promise<string | null> {
+    let cap: unknown;
+    try {
+      cap = await this.env.CATALOG.get(this.env.CATALOG.idFromName("catalog")).entry("capabilities", capability);
+    } catch (e) {
+      if ((e as { status?: number } | null)?.status === 404 || /unknown capability/.test(String(e))) return null;
+      throw e;
+    }
+    const auth = (cap as { mcp?: { auth?: unknown } } | undefined)?.mcp?.auth;
+    return isClientMcpAuth(auth) && "authorize" in auth ? (auth.incarnation ?? "0") : null;
+  }
+
+  async clientOAuthStart(input: { client: string; clientName: string; capability: string; entry: string; incarnation: string; url: string; scopes?: string[]; capScopes?: string[]; caller?: string }): Promise<StartAnswer> {
     const auth = { oauth: clientOAuthRef(input.client, input.entry, input.incarnation), ...(input.capScopes ? { scopes: input.capScopes } : {}) };
     return await this.oauth.start({
       owner: { id: input.client, name: input.clientName }, capability: input.capability, url: input.url, auth, ...(input.scopes ? { scopes: input.scopes } : {}),
-    }, input.client);
+    }, input.caller ?? input.client);
   }
 
   /**
@@ -220,14 +224,17 @@ export class BrokerDO extends DurableObject<Env> {
    * incarnation, so it works after the capability was deleted and never touches a record of another client's.
    * A start or callback in flight for it stores nothing.
    */
-  async clientOAuthRevoke(client: string, capability: string, entry: string, o?: { keep: string | null }): Promise<{ revoked: { ref: string; issuer: string; server: ServerRevocation }[] }> {
-    // A write (`o`) revokes every incarnation but the one the capability holds now, and cancels nothing in
-    // flight: a callback for a stale incarnation is refused by its own check. A delete revokes all and cancels.
+  async clientOAuthRevoke(client: string, capability: string, entry: string, o?: { write: true; caller?: string }, caller = client): Promise<{ revoked: { ref: string; issuer: string; server: ServerRevocation }[] }> {
+    // A write (`o`) revokes every incarnation but the one the capability holds now, as CatalogDO says it (read
+    // here, not taken from the caller, so a write's revocation that arrives late never takes a newer
+    // authorization), and a start or callback in flight for another incarnation stores nothing. A delete
+    // revokes all, and cancels everything in flight for the capability.
     if (o) {
-      const keep = o.keep === null ? undefined : clientOAuthRef(client, entry, o.keep);
-      return { revoked: await this.oauth.revokePrefix(clientOAuthEntryPrefix(client, entry), client, {}, keep) };
+      const current = await this.incarnationOf(capability);
+      const keep = current === null ? undefined : clientOAuthRef(client, entry, current);
+      return { revoked: await this.oauth.revokePrefix(clientOAuthEntryPrefix(client, entry), o.caller ?? client, { write: true }, keep) };
     }
-    return { revoked: await this.oauth.revokePrefix(clientOAuthEntryPrefix(client, entry), client, { capability }) };
+    return { revoked: await this.oauth.revokePrefix(clientOAuthEntryPrefix(client, entry), caller, { capability }) };
   }
 
   /** What an API client may see of its own capability's authorization (its current incarnation's): never a token. */

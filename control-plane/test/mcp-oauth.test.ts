@@ -973,7 +973,7 @@ describe("an API client's own mcp credentials", () => {
     f.holdExchange = true;
     const callback = SELF.fetch(back).then((r) => r.text());
     await eventually("the code exchange to reach the server", () => f.exchangeHeld);
-    // No record yet and no flow row left: only the client's revocation count can stop it.
+    // No record yet and no flow row left; the client's delete (its namespace goes first) stops it.
     await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
     f.holdExchange = false;
     expect(await callback).toContain("revoked while its code was being exchanged");
@@ -1080,11 +1080,14 @@ describe("an API client's own mcp credentials", () => {
       { client_name: `${b.name} (via nest)`, redirect_uris: [`${NEST}/v1/oauth/callback/${b.id}`] },
     ]);
     expect(new URL(sa.authorize_url).searchParams.get("client_id")).not.toBe(new URL(sb.authorize_url).searchParams.get("client_id"));
-    // a's state brought to b's callback (or the operator's) is refused, and spends it.
-    const back = new URL((await fetch(sa.authorize_url, { redirect: "manual" })).headers.get("location")!);
-    for (const path of [`/v1/oauth/callback/${b.id}`, "/v1/oauth/callback"]) {
+    // a's state brought to b's callback, or to the operator's, is refused for that reason (a fresh flow each).
+    const wrongPaths = [`/v1/oauth/callback/${b.id}`, "/v1/oauth/callback"];
+    for (const [k, path] of wrongPaths.entries()) {
+      const flow = k === 0 ? sa : await asJson(a.token, `/v1/catalog/capabilities/${a.name}/reg/oauth`, { method: "POST" });
+      const back = new URL((await fetch(flow.authorize_url, { redirect: "manual" })).headers.get("location")!);
       const wrong = await SELF.fetch(`${NEST}${path}${back.search}`);
       expect(wrong.status).toBe(400);
+      expect(await wrong.text()).toContain("came back to another client");
     }
     expect(await entryRow(a, "reg")).toBeUndefined();
     // A client that isn't (any more) has no metadata document.
@@ -1136,6 +1139,88 @@ describe("an API client's own mcp credentials", () => {
     expect(await entryRow(c, "retry")).toBeDefined();
     await putCap(c, "retry", g, { authorize: true });
     expect(await entryRow(c, "retry")).toBeUndefined();
+  });
+
+  it("the client's revocation count alone: a client's records revoked while its start or its callback is in flight store nothing", async () => {
+    const f = new FakeAuth(rand(), { cimd: true, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "count", f, { authorize: true });
+    // The capability stays in the catalog throughout: only the count can stop these.
+    f.holdDiscovery = true;
+    const started = as(c.token, `/v1/catalog/capabilities/${c.name}/count/oauth`, { method: "POST" });
+    await eventually("the start to reach discovery", () => f.discoveryHeld);
+    await broker().deleteClientSecrets(c.id);
+    f.holdDiscovery = false;
+    expect((await started).status).toBe(409);
+
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/count/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    await broker().deleteClientSecrets(c.id);
+    f.holdExchange = false;
+    expect(await callback).toContain("revoked while its code was being exchanged");
+    expect(await entryRow(c, "count")).toBeUndefined();
+  });
+
+  it("a write that lands while the catalog's answer is on its way back: the callback stores nothing for the old incarnation", async () => {
+    const f = new FakeAuth(rand(), { cimd: true, revocation: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    await putCap(c, "late", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/late/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    // CatalogDO answers "holds the old incarnation", and before the answer reaches BrokerDO the capability moves to
+    // g and the write's revocation runs (as the PUT route does), with nothing stored yet to revoke.
+    const { CatalogDO: Catalog } = await import("../src/do/catalog");
+    const real = Catalog.prototype.entry;
+    let raced = false;
+    Catalog.prototype.entry = async function (this: InstanceType<typeof Catalog>, kind: "templates" | "capabilities", name: string) {
+      const answer = await real.call(this, kind, name);
+      if (!raced && name === `${c.name}/late`) {
+        raced = true;
+        await this.putCapability(name, { ...(answer as any), mcp: { ...(answer as any).mcp, url: g.server, auth: { authorize: true } } }, await env.CLIENT.get(env.CLIENT.idFromName(c.id)).scope());
+        await broker().clientOAuthRevoke(c.id, name, "late", { write: true });
+      }
+      return answer;
+    };
+    try {
+      expect(await (await SELF.fetch(back)).text()).toContain("revoked while its code was being exchanged");
+    } finally {
+      Catalog.prototype.entry = real;
+    }
+    expect(raced).toBe(true);
+    expect(await entryRow(c, "late")).toBeUndefined();
+  });
+
+  it("a write's revocation keeps the incarnation the catalog holds now, whatever arrives late", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    await putCap(c, "keep", f, { authorize: true });
+    await putCap(c, "keep", g, { authorize: true });
+    await clientAuthorize(c, "keep");
+    // A write's revocation (a delayed one, say) runs again: the current authorization stays.
+    await broker().clientOAuthRevoke(c.id, `${c.name}/keep`, "keep", { write: true });
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/keep/oauth`)).status).toBe("authorized");
+  });
+
+  it("a client's own credential serves only its own subtree's agents: the operator's spawn of its template is refused", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "mine", f, { authorize: true });
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/t-mine`, {
+      method: "PUT", body: { capabilities: ["nest", `${c.name}/mine`], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token" },
+    });
+    const refused = await adminJson("/v1/agents", { body: { template: `${c.name}/t-mine`, cell: c.cell } }, 400);
+    expect(refused.error.message).toContain(`only an agent of ${c.name}'s subtree uses it`);
   });
 
   it("deleting the capability revokes its tokens, and so does deleting the client", async () => {

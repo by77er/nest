@@ -20,6 +20,8 @@ const NOT_ADMIN = {
   "GET /v1/oauth/callback": "none",
   // nest's client ID metadata document, fetched by authorization servers: public by design.
   "GET /v1/oauth/client.json": "none",
+  // An API client's own OAuth callback and client ID metadata document (docs/control-plane/api/clients/#mcp-credentials):
+  // public by design, as the operator's are (the browser lands on one, the authorization server fetches the other).
   "GET /v1/oauth/callback/:client": "none",
   "GET /v1/oauth/clients/:file": "none",
   // The caller identity's public keys, fetched by MCP servers that verify Nest-Identity: public by design.
