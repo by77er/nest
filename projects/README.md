@@ -972,42 +972,45 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 
 Measured with [`scripts/ui-review/perf.mjs`](../scripts/ui-review/README.md#perfmjs) (its method, options and how to rerun are there): the built client served as the Worker serves it, in headless Chromium at 1440×900 with the CPU throttled 4×, the API answered from generated fixtures at a realistic size (300 tasks, 200 chat messages, 2,000-event traces, 100 reviews) 40 ms late, one browser per page or flow. A page is loaded cold, then warm, then left idle 15 s; bytes are bodies as sent.
 
-A dated baseline, not a target: `e655ace` (before the perf tasks; measured with `--shape full --assets workers-assets`) against `d059f29` (after #307, #308, #311, #312, #315, #317 and #318), both measured in one 2-vCPU sandbox on 2026-11-19, `d059f29` twice (the mean, and "runs N% apart" where the two differ by more than 20%). Requests and bytes repeat exactly; times on a shared CPU don't, so compare them only within one machine's runs.
+A dated baseline, not a target: `e655ace` (before the perf tasks; measured with `--shape full --assets workers-assets`) against `50b0e54` (the last of them, #323: main after #307, #308, #311, #312, #314, #315, #317, #318, #319 and #322, with #323's fixes), both measured in one 2-vCPU sandbox on 2026-11-27, one run each. Requests and bytes repeat exactly; times on a shared CPU don't (here a page's cold time to content varied up to 2× between runs of one build), so compare them only within one machine's runs, and rerun before trusting a difference under that.
 
-Each cell is `e655ace` → `d059f29`.
+Each cell is `e655ace` → `50b0e54`.
 
 | page | to content, cold | long tasks, cold | transferred, cold / warm | API per idle minute |
 |---|---:|---:|---:|---:|
-| projects | 714 ms → 638 ms | 473 ms → 402 ms | 480 KB / 0.2 KB → 331 KB / 0.2 KB | 4 → 4 req, 0.9 KB → 0.0 KB |
-| board | 2089 ms → 1923 ms | 2243 ms → 1928 ms | 673 KB / 128 KB → 568 KB / 16 KB | 52 → 36 req, 1.52 MB → 0.0 KB |
-| board-drawer | 6236 ms → 6372 ms | 4926 ms → 4808 ms (runs 22% apart) | 691 KB / 146 KB → 583 KB / 31 KB | 60 → 58 (runs 21% apart) req, 1.05 MB → 0.0 KB |
-| manager-chat | 1761 ms → 1715 ms | 2142 ms → 1594 ms | 728 KB / 138 KB → 610 KB / 20 KB | 60 → 64 req, 1.52 MB → 0.0 KB |
-| manager-trace | 1388 ms → 1531 ms (runs 26% apart) | 3167 ms → 2913 ms | 689 KB / 145 KB → 567 KB / 29 KB | 64 → 44 req, 1.53 MB → 0.0 KB |
-| reviews | 1848 ms → 1792 ms | 1606 ms → 1638 ms | 537 KB / 8.1 KB → 432 KB / 8.1 KB | 36 → 20 req, 83 KB → 0.0 KB |
-| reviews-trace (to content: from the click that opens the trace) | 1271 ms → 1372 ms | 2494 ms → 3281 ms (runs 48% apart) | 549 KB / 20 KB → 441 KB / 17 KB | 40 → 30 req, 73 KB → 0.0 KB |
-| routines | 1053 ms → 857 ms | 488 ms → 705 ms | 545 KB / 13 KB → 441 KB / 13 KB | 44 → 28 req, 103 KB → 0.0 KB |
-| routines-trace (to content: from the click that opens the trace) | 797 ms → 1044 ms | 2524 ms → 1866 ms (runs 84% apart) | 558 KB / 22 KB → 450 KB / 22 KB | 40 → 28 req, 91 KB → 0.0 KB |
-| triage | 931 ms → 932 ms | 705 ms → 678 ms | 527 KB / 8.2 KB → 356 KB / 8.2 KB | 44 → 28 req, 116 KB → 0.0 KB |
-| secrets | 907 ms → 828 ms | 664 ms → 618 ms | 526 KB / 5.0 KB → 355 KB / 5.0 KB | 48 → 32 req, 90 KB → 0.0 KB |
-| network | 940 ms → 862 ms | 660 ms → 544 ms | 525 KB / 4.9 KB → 354 KB / 4.9 KB | 48 → 32 req, 88 KB → 0.0 KB |
-| settings | 929 ms → 904 ms | 694 ms → 629 ms | 528 KB / 5.0 KB → 379 KB / 5.0 KB | 48 → 32 req, 90 KB → 0.0 KB |
-| admin | 560 ms → 494 ms | 437 ms → 360 ms | 518 KB / 0.7 KB → 348 KB / 0.7 KB | 4 → 4 req, 0.9 KB → 0.0 KB |
+| projects | 700 ms → 618 ms | 484 ms → 381 ms | 480 KB / 0.2 KB → 331 KB / 0.2 KB | 4 → 4 req, 0.9 KB → 0.0 KB |
+| board | 2134 ms → 1663 ms | 2308 ms → 1463 ms | 673 KB / 128 KB → 571 KB / 16 KB | 52 → 36 req, 1.52 MB → 0.0 KB |
+| board-drawer | 5742 ms → 3839 ms | 4399 ms → 2198 ms | 691 KB / 146 KB → 585 KB / 30 KB | 72 → 52 req, 1.55 MB → 0.0 KB |
+| manager-chat | 1654 ms → 1295 ms | 1848 ms → 1333 ms | 728 KB / 138 KB → 617 KB / 20 KB | 68 → 64 req, 1.53 MB → 0.0 KB |
+| manager-trace | 1384 ms → 2484 ms | 2737 ms → 1025 ms | 688 KB / 142 KB → 570 KB / 30 KB | 56 → 44 req, 1.50 MB → 0.0 KB |
+| reviews | 1844 ms → 1646 ms | 1575 ms → 1504 ms | 537 KB / 8.1 KB → 434 KB / 8.1 KB | 36 → 20 req, 83 KB → 0.0 KB |
+| reviews-trace (to content: from the click that opens the trace) | 1541 ms → 1188 ms | 2676 ms → 2204 ms | 549 KB / 17 KB → 443 KB / 17 KB | 40 → 20 req, 73 KB → 0.0 KB |
+| routines | 1058 ms → 840 ms | 642 ms → 643 ms | 545 KB / 13 KB → 442 KB / 13 KB | 44 → 28 req, 103 KB → 0.0 KB |
+| routines-trace (to content: from the click that opens the trace) | 825 ms → 829 ms | 1669 ms → 1805 ms | 558 KB / 22 KB → 452 KB / 22 KB | 40 → 28 req, 91 KB → 0.0 KB |
+| triage | 977 ms → 885 ms | 741 ms → 631 ms | 527 KB / 8.2 KB → 357 KB / 8.2 KB | 44 → 28 req, 116 KB → 0.0 KB |
+| secrets | 977 ms → 800 ms | 742 ms → 552 ms | 526 KB / 5.0 KB → 355 KB / 5.0 KB | 48 → 32 req, 90 KB → 0.0 KB |
+| network | 972 ms → 818 ms | 672 ms → 550 ms | 525 KB / 4.9 KB → 355 KB / 4.9 KB | 48 → 32 req, 88 KB → 0.0 KB |
+| settings | 953 ms → 879 ms | 704 ms → 629 ms | 528 KB / 5.0 KB → 379 KB / 5.0 KB | 48 → 32 req, 90 KB → 0.0 KB |
+| admin | 584 ms → 475 ms | 404 ms → 298 ms | 518 KB / 0.7 KB → 348 KB / 0.7 KB | 4 → 4 req, 0.9 KB → 0.0 KB |
 
 | flow | time | long tasks | API | worst key→paint |
 |---|---:|---:|---:|---:|
-| switch-view | 2887 ms → 2565 ms | 3214 ms → 2835 ms | 141 KB → 14 KB | – |
-| switch-project | 995 ms → 1185 ms (runs 29% apart) | 547 ms → 992 ms (runs 34% apart) | 40 KB → 7.7 KB | – |
-| drawer | 1288 ms → 2711 ms (runs 104% apart) | 3595 ms → 4389 ms | 145 KB → 15 KB | – |
-| type-composer | – | 9849 ms → 52 ms | 392 KB → 0.0 KB | 531 ms → 72 ms |
-| stream-chat | – | 9174 ms → 272 ms (runs 101% apart) | 138 KB → 4.6 KB (runs 200% apart) | – |
-| stream-trace | – | 9046 ms → 499 ms (runs 127% apart) | 255 KB → 0.0 KB | – |
-| open-trace | 873 ms → 676 ms | 3233 ms → 2644 ms | 20 KB → 14 KB (runs 67% apart) | – |
-| older-chat | 3294 ms → 2064 ms | 3766 ms → 1615 ms | 153 KB → 16 KB (runs 80% apart) | – |
-| older-trace | 3038 ms → 1412 ms | 2710 ms → 1006 ms (runs 21% apart) | 155 KB → 28 KB | – |
-| drag-reorder | – | 1630 ms → 1943 ms | 127 KB → 12 KB | – |
-| tab-switch | 1054 ms → 1029 ms | 11.4 s → 9185 ms | 449 KB → 65 KB | – |
-| idle-board | – | 0 ms → 179 ms (runs 200% apart) | 1.52 MB → 0.0 KB | – |
-| idle-manager | – | 395 ms → 0 ms | 1.41 MB → 0.0 KB | – |
+| switch-view | 3060 ms → 2045 ms | 3344 ms → 2194 ms | 141 KB → 14 KB | – |
+| switch-project | 1192 ms → 1011 ms | 622 ms → 326 ms | 43 KB → 7.7 KB | – |
+| drawer | 1429 ms → 1018 ms | 3169 ms → 1682 ms | 145 KB → 15 KB | 954 ms → 315 ms |
+| type-composer | – | 11.3 s → 52 ms | 390 KB → 0.0 KB | 618 ms → 64 ms |
+| stream-chat | – | 9218 ms → 219 ms | 138 KB → 0.0 KB | – |
+| stream-trace | – | 9048 ms → 158 ms | 255 KB → 0.0 KB | – |
+| open-trace | 1011 ms → 368 ms | 2046 ms → 152 ms | 17 KB → 0.0 KB | – |
+| older-chat | 3578 ms → 1871 ms | 3869 ms → 1478 ms | 153 KB → 9.4 KB | – |
+| older-trace | 3227 ms → 852 ms | 2956 ms → 329 ms | 155 KB → 28 KB | – |
+| drag-reorder | – | 1752 ms → 273 ms | 130 KB → 12 KB | – |
+| tab-switch | 923 ms → 245 ms | 10.2 s → 760 ms | 453 KB → 0.0 KB | – |
+| idle-board | – | 0 ms → 0 ms | 1.52 MB → 0.0 KB | – |
+| idle-manager | – | 921 ms → 258 ms | 1.41 MB → 0.0 KB | – |
+
+- **manager-trace's cold time to content** is the harness's probe, not the page: it waits for the *first* tool line in document order to be laid out, and with `content-visibility` (#322) that's the oldest turn, off screen, laid out when the browser gets to it. Over runs of one build it ranged 1255–2822 ms on `50b0e54` and 1230–1560 ms on main; timed to the first *visible* tool line instead, `50b0e54` took 1306–1617 ms and main 1285–3239 ms (3 runs each).
+- **routines-trace's long tasks** ranged 755–2255 ms over 9 runs of `e655ace`, 1071–1812 ms over 7 of main and 911–1805 ms over 4 of `50b0e54`: within the runs' spread; its trace's backlog is drawn as main draws it.
 
 ## Retention
 
