@@ -23,4 +23,4 @@ export { EmptyState, ErrorState, LoadingState } from "./States";
 export { Toolbar } from "./Toolbar";
 export { icon, weight } from "../theme";
 export { ButtonBusy, Grow, Picker, type PickerItem, RowAction, TriggerBadge } from "./Actions";
-export { PHONE_QUERY, usePhone } from "./media";
+export { isPhoneNow, PHONE_QUERY, usePhone } from "./media";

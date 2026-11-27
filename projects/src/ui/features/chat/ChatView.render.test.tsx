@@ -6,6 +6,7 @@ import { act, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage } from "../../api/types";
+import { PHONE_QUERY } from "../../layout";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
@@ -112,6 +113,20 @@ describe("what the chat re-renders", () => {
     expect(drawn.length).toBeGreaterThanOrEqual(2);
     // About once each: the group the first commit started at is drawn again under the ones above it.
     expect(counts.rows).toBeLessThanOrEqual(100 + 10);
+  });
+
+  it("on a phone (the page scrolls, not the log), opening draws every message at once, as before", async () => {
+    const real = window.matchMedia;
+    window.matchMedia = ((q: string) => ({ ...real(q), matches: q === PHONE_QUERY })) as typeof window.matchMedia;
+    try {
+      reset();
+      renderApp("/projects/prj_one/manager", apiWith(msgs(100)));
+      const c = await chat();
+      await within(c).findByText("Message 1");
+      expect(counts.perCommit.filter((x) => x > 0)[0]).toBe(100);
+    } finally {
+      window.matchMedia = real;
+    }
   });
 
   it("typing 20 characters with 100 messages shown renders no message and no Markdown", async () => {

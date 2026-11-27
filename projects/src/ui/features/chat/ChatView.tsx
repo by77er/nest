@@ -16,7 +16,7 @@ import { useChat, useManager, usePostChat, useRetryChat } from "../../api/querie
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
-  ChatFrame, ChatLog, ChatWelcome, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine,
+  ChatFrame, ChatLog, ChatWelcome, ComposerDock, DaySeparator, ErrorState, icon, isPhoneNow, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useAgentTrace } from "../trace/SharedTrace";
@@ -672,7 +672,9 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const [cut, setCut] = useState<string | null>(null);
   if (!filled && messages.length > 0) {
     setFilled(true);
-    setCut(cutFor(items));
+    // Only where the log scrolls in itself (from `sm` up): on a phone the page is the scroller, and drawing
+    // above the reader there made following the end less steady (the design review's chat-follow-growth).
+    setCut(isPhoneNow() ? null : cutFor(items));
   }
   useEffect(() => {
     if (cut !== null) startTransition(() => setCut(null));
