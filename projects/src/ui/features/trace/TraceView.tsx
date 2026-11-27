@@ -12,8 +12,8 @@
 // at its last drawn height or an estimate (turnSize), so the scroll holds below (Load older, following,
 // Jump to live) are kept while turns take their own heights as they're drawn.
 // And drawn newest first when many come at once (opening on a backlog, a tab opened on a long trace): the
-// newest DRAWN_FIRST turns at once, the ones above them in a transition, which React renders in slices that
-// yield to the page, so a thousand events are never one long task (README.md#performance).
+// newest turns, a screen's worth (DRAWN_FIRST lines), at once, the ones above them in a transition, which
+// React renders in slices that yield to the page, so a thousand events are never one long task.
 
 import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
@@ -315,12 +315,20 @@ function restore(v: HTMLElement, h: Held): boolean | null {
   return true;
 }
 
-/** How many of the newest turns are drawn at once when many come together; the rest follow in a transition. */
-export const DRAWN_FIRST = 10;
+/**
+ * When many turns come together, the newest are drawn at once until they hold this many items (each at least
+ * a line: more than a screen of the log), and the rest follow in a transition.
+ */
+export const DRAWN_FIRST = 40;
 
-/** The key of the first turn drawn at once, if `groups` has more than DRAWN_FIRST. */
+/** The key of the oldest turn drawn at once, if the newest DRAWN_FIRST items don't reach back to the first turn. */
 function cutFor(groups: readonly TurnGroup[]): string | null {
-  return groups.length > DRAWN_FIRST ? groups[groups.length - DRAWN_FIRST]!.key : null;
+  let items = 0;
+  for (let i = groups.length - 1; i > 0; i--) {
+    items += groups[i]!.items.length + 1;
+    if (items >= DRAWN_FIRST) return groups[i]!.key;
+  }
+  return null;
 }
 
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
@@ -336,7 +344,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     setGrouping(current);
   }
   // Many turns at once into an empty log (mounting on a long trace, a backlog arriving): only the newest
-  // DRAWN_FIRST, from the one `cut` names, until the transition below draws the rest. (A history page, or
+  // (DRAWN_FIRST lines), from the one `cut` names, until the transition below draws the rest. (A history page, or
   // anything else added to turns already drawn, is drawn at once, as before.)
   const [cut, setCut] = useState<string | null>(() => cutFor(current.groups));
   const [counted, setCounted] = useState(current.groups.length);

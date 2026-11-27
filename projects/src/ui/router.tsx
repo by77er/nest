@@ -97,7 +97,11 @@ const board = createRoute({
   loader: ({ context: { queryClient }, params: { projectId }, deps: { task } }) => {
     warm(queryClient, reads.tasks(projectId));
     warm(queryClient, reads.attention(projectId));
-    if (task) warm(queryClient, reads.task(projectId, task));
+    // The drawer: its task, and the reviews its PRs show their verdicts from (TaskPrs).
+    if (task) {
+      warm(queryClient, reads.task(projectId, task));
+      warm(queryClient, reads.reviews(projectId));
+    }
   },
   component: BoardPage,
 });
@@ -106,8 +110,9 @@ const manager = createRoute({
   getParentRoute: () => project,
   path: "manager",
   validateSearch: (s: Record<string, unknown>): { view?: "trace" } => (s.view === "trace" ? { view: "trace" } : {}),
-  // The chat, its waits and the status line (ChatView, ManagerStatusLine), and the context column (ManagerContext: its tasks, what needs you).
-  loader: viewReads((id) => [reads.chat(id), reads.manager(id), reads.waits(id), reads.tasks(id), reads.attention(id)]),
+  // The chat, its waits and the status line (ChatView, ManagerStatusLine), and the context column (ManagerContext: its tasks, what
+  // needs you; its task cards show their PRs' verdicts from the reviews, as the chat's do).
+  loader: viewReads((id) => [reads.chat(id), reads.manager(id), reads.waits(id), reads.tasks(id), reads.attention(id), reads.reviews(id)]),
   component: ManagerPage,
 });
 
