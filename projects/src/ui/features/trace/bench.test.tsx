@@ -122,6 +122,18 @@ describe("the trace's cost", () => {
     expect(r.rules).toBeLessThanOrEqual(2 * 100);
   });
 
+  it("a connection's backlog arriving in one frame, with its `live`, is drawn as it comes: all in its first commit", () => {
+    const sock = open();
+    zero();
+    act(() => {
+      for (const m of turns(100)) sock.message(m);
+      sock.message({ type: "live" });
+    });
+    frames();
+    const drawn = n.perCommit.filter((x) => x > 0);
+    expect(drawn[0]).toBe(100);
+  });
+
   it("mounting on a trace already held (the Manager's Trace tab, on the chat's connection): the newest turns first, the rest after", () => {
     const held = traceReducer(initialTrace(), { kind: "messages", data: [...turns(100), { type: "live" }] });
     zero();

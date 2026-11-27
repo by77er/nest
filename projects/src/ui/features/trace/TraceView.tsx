@@ -343,17 +343,12 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     current = groupTurnsFrom(grouping, state.events, state.older);
     setGrouping(current);
   }
-  // Mounting on many turns already held (the Manager's Trace tab opened on the chat's connection), or many
-  // coming at once into an empty log outside a connection's backlog: only the newest (DRAWN_FIRST items,
-  // from the turn `cut` names) at once, then the rest above them in one transition. (A connection's backlog,
-  // a history page, or anything else added to turns already drawn, is drawn as it comes, as before.)
+  // Mounting on many turns already held (the Manager's Trace tab opened on the chat's connection): only the
+  // newest (DRAWN_FIRST items, from the turn `cut` names) at once, then the rest above them in one
+  // transition. Anything that comes after mounting (a connection's backlog, however many frames it takes; a
+  // history page; live events) is drawn as it comes, as before.
   const all = current.groups;
   const [cut, setCut] = useState<string | null>(() => cutFor(all));
-  const [counted, setCounted] = useState(all.length);
-  if (counted !== all.length) {
-    setCounted(all.length);
-    if (counted === 0 && cut === null && state.status !== "connecting" && state.status !== "reconnecting") setCut(cutFor(all));
-  }
   useEffect(() => {
     if (cut !== null) startTransition(() => setCut(null));
   }, [cut]);
