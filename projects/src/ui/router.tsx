@@ -65,8 +65,12 @@ const projects = createRoute({ getParentRoute: () => root, path: "/projects", co
 const project = createRoute({
   getParentRoute: () => root,
   path: "/projects/$projectId",
-  // Every view's frame shows the project; the views' own reads start beside it, not after it.
-  loader: ({ context: { queryClient }, params: { projectId } }) => warm(queryClient, reads.project(projectId)),
+  // Every view's frame shows the project, and its sidebar the Manager row's unread dot (the chat's latest
+  // page); the views' own reads start beside them, not after.
+  loader: ({ context: { queryClient }, params: { projectId } }) => {
+    warm(queryClient, reads.project(projectId));
+    warm(queryClient, reads.chat(projectId));
+  },
 });
 
 /** A view's loader: warms `of(projectId)`'s reads. */

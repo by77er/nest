@@ -54,17 +54,17 @@ afterEach(() => {
 
 const P = "/api/projects/prj_one";
 
-/** Each route, and the reads its page shows first (beside the shell's projects list and the project). */
+/** Each route, and the reads its page shows first (beside the shell's projects list, the project, and the chat its sidebar's unread dot reads). */
 const ROUTES: [string, string, string[]][] = [
-  ["board?task=tsk_t1", "BoardPage", [`${P}/tasks`, `${P}/attention`, `${P}/tasks/tsk_t1`, `${P}/reviews`]],
-  ["board", "BoardPage", [`${P}/tasks`, `${P}/attention`]],
+  ["board?task=tsk_t1", "BoardPage", [`${P}/chat`, `${P}/tasks`, `${P}/attention`, `${P}/tasks/tsk_t1`, `${P}/reviews`]],
+  ["board", "BoardPage", [`${P}/chat`, `${P}/tasks`, `${P}/attention`]],
   ["manager", "ManagerPage", [`${P}/chat`, `${P}/manager`, `${P}/waits`, `${P}/tasks`, `${P}/attention`, `${P}/reviews`]],
-  ["reviews", "ReviewsPage", [`${P}/reviews`, `${P}/reviewers`]],
-  ["routines", "RoutinesPage", [`${P}/routines`, `${P}/routine-runs`, `${P}/proposals`, `${P}/memory`]],
-  ["triage", "TriagePage", [`${P}/issues`, `${P}/proposals`]],
-  ["secrets", "SecretsPage", [`${P}/secrets`]],
-  ["network", "NetworkPage", [`${P}/network`]],
-  ["settings", "SettingsPage", [`${P}/secrets`]],
+  ["reviews", "ReviewsPage", [`${P}/chat`, `${P}/reviews`, `${P}/reviewers`]],
+  ["routines", "RoutinesPage", [`${P}/chat`, `${P}/routines`, `${P}/routine-runs`, `${P}/proposals`, `${P}/memory`]],
+  ["triage", "TriagePage", [`${P}/chat`, `${P}/issues`, `${P}/proposals`]],
+  ["secrets", "SecretsPage", [`${P}/chat`, `${P}/secrets`]],
+  ["network", "NetworkPage", [`${P}/chat`, `${P}/network`]],
+  ["settings", "SettingsPage", [`${P}/chat`, `${P}/secrets`]],
 ];
 
 describe("a route's loader", () => {
@@ -173,7 +173,7 @@ describe("a preload (a link hovered or focused)", () => {
     await router.preloadRoute({ to: "/projects/$projectId/reviews", params: { projectId: "prj_one" } });
     // Well past every interval the page's hooks would poll at.
     await vi.advanceTimersByTimeAsync(4 * POLL.reviews);
-    expect(api.reads.filter((x) => x.startsWith(P))).toEqual([P, `${P}/reviews`]);
+    expect(api.reads.filter((x) => x.startsWith(P))).toEqual([P, `${P}/chat`, `${P}/reviews`]);
     expect(queryClient.getQueryCache().find({ queryKey: keys.reviews("prj_one"), exact: true })!.getObserversCount()).toBe(0);
   });
 });
