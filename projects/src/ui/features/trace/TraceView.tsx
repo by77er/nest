@@ -221,7 +221,7 @@ function turnSize(g: TurnGroup, items: TraceItem[]): { rows: number; chars: numb
 
 /** One line of a turn, fading in if it arrived while watching. */
 const Item = memo(function Item({ item, animate }: { item: TraceItem; animate: boolean }) {
-  return <FadeIn animate={animate}>{item.kind === "tool" ? <ToolCall item={item} /> : <EventItem ev={item.event} />}</FadeIn>;
+  return <FadeIn animate={animate} item={item.key}>{item.kind === "tool" ? <ToolCall item={item} /> : <EventItem ev={item.event} />}</FadeIn>;
 });
 
 const Turn = memo(function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
@@ -259,35 +259,31 @@ const fadesIn = (g: TurnGroup, after: number) => {
   return newest !== undefined && newest !== null && newest > after ? after : Number.POSITIVE_INFINITY;
 };
 
-/** The line being read: the first of a turn's lines not wholly above the log's top, and where it was. */
-type Held = { line: Element; y: number; next: Element | null; yNext: number };
+/**
+ * The line being read: the first of a turn's lines not wholly above the log's top (by its item's key, so it's
+ * found again when its turn is made anew: a page ending inside the first turn does that), and where it was.
+ */
+type Held = { line: Element; item: string; y: number };
 
 function readerLine(v: HTMLElement): Held | null {
   const top = v.getBoundingClientRect().top;
   for (const t of v.querySelectorAll("[data-turn]")) {
     if (t.getBoundingClientRect().bottom <= top) continue;
-    let line: Element = t;
-    for (const c of t.children) {
-      if (c.getBoundingClientRect().bottom > top) {
-        line = c;
-        break;
-      }
+    for (const line of t.querySelectorAll(":scope > [data-item]")) {
+      const r = line.getBoundingClientRect();
+      if (r.bottom > top) return { line, item: line.getAttribute("data-item")!, y: r.top - top };
     }
-    // Its turn's next, too: a page that ends inside the first turn makes that turn again (a new element).
-    const next = t.nextElementSibling;
-    return { line, y: line.getBoundingClientRect().top - top, next, yNext: next ? next.getBoundingClientRect().top - top : 0 };
   }
   return null;
 }
 
-/** Scrolls `v` so `h`'s line (or its turn's next, if the line was made again) is back where it was; false if neither is there. */
+/** Scrolls `v` so `h`'s line is back where it was; false if it's gone. */
 function restore(v: HTMLElement, h: Held): boolean {
-  if (!h.line.isConnected && h.next?.isConnected) {
-    h.line = h.next;
-    h.y = h.yNext;
-    h.next = null;
+  if (!h.line.isConnected) {
+    const again = [...v.querySelectorAll("[data-item]")].find((l) => l.getAttribute("data-item") === h.item);
+    if (!again) return false;
+    h.line = again;
   }
-  if (!h.line.isConnected) return false;
   const d = h.line.getBoundingClientRect().top - v.getBoundingClientRect().top - h.y;
   if (Math.abs(d) >= 0.5) v.scrollTop += d;
   return true;
@@ -310,7 +306,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
   // Following: new lines arrived and are still being drawn (SETTLE_FRAMES). Jumping: "Jump to live" is on its
-  // way down. Held: the line being read when a page was asked for above, kept in place while it's drawn.
+  // way down. Held: the line being read while a page above is on its way (holding -1) and, once it's in,
+  // while the turns around it are drawn (holding 1, or 2 counting quiet frames).
   const settling = useRef(0);
   const jumping = useRef(false);
   const held = useRef<Held | null>(null);
@@ -328,6 +325,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     const v = viewport.current;
     heightBefore.current = v ? v.scrollHeight : null;
     held.current = v ? readerLine(v) : null;
+    holding.current = held.current ? -1 : 0;
     load.current();
   };
 
@@ -352,24 +350,30 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     // else (a result expanded, a turn drawn as the reader scrolls to it) is left to the browser, as before.
     const grown = new ResizeObserver(() => {
       if (v.clientHeight === 0 || hidden) return;
-      if (held.current && holding.current > 0) {
+      // Turns drawn while the page is on its way: the line is where the reader now sees it.
+      if (held.current && holding.current === -1) held.current = readerLine(v) ?? held.current;
+      else if (held.current && holding.current > 0) {
         if (!restore(v, held.current)) held.current = null;
         holding.current = 1; // drawn again: SETTLE_FRAMES more from here
       } else if (settling.current > 0 && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
     });
     if (v.firstElementChild) grown.observe(v.firstElementChild);
-    // The reader taking the scroll back ends a jump and a hold.
+    // The reader taking the scroll back ends a jump and a hold (a page still on its way keeps the line they
+    // scroll to).
     const root = v.parentElement ?? v;
     const takeBack = () => {
       jumping.current = false;
-      holding.current = 0;
-      held.current = null;
+      if (holding.current > 0) {
+        holding.current = 0;
+        held.current = null;
+      }
     };
     const taking = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
     for (const t of taking) root.addEventListener(t, takeBack, { passive: true });
     const onScroll = () => {
       if (v.clientHeight === 0 || hidden) return;
       lastTop = v.scrollTop;
+      if (held.current && holding.current === -1) held.current = readerLine(v) ?? held.current;
       const near = v.scrollHeight - v.scrollTop - v.clientHeight <= NEAR_BOTTOM;
       if (near) jumping.current = false;
       atBottomRef.current = near;
@@ -394,7 +398,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   useLayoutEffect(() => {
     const v = viewport.current;
     if (!v) return;
-    const h = held.current;
+    const h = holding.current === -1 ? held.current : null;
+    holding.current = 0;
     if (atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
     else if (h && restore(v, h)) {
       // Held while the turns around it are drawn (the ResizeObserver above): the new ones are at their
