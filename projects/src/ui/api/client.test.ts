@@ -79,6 +79,31 @@ describe("conditional GETs", () => {
     expect(b).not.toBe(a);
   });
 
+  it("with the ETag dropped on the way (the edge, a proxy), falls back to the app's own X-ETag", async () => {
+    let version = 1;
+    const seen: { inm: string | null; own: string | null }[] = [];
+    vi.stubGlobal("fetch", async (_: RequestInfo | URL, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      seen.push({ inm: h.get("if-none-match"), own: h.get("x-if-none-match") });
+      const tag = `W/"v${version}"`;
+      // As the Worker answers through an edge that strips ETag: only X-ETag arrives.
+      return h.get("x-if-none-match") === tag
+        ? new Response(null, { status: 304, headers: { "x-etag": tag } })
+        : new Response(JSON.stringify({ v: version }), { headers: { "content-type": "application/json", "x-etag": tag } });
+    });
+    const first = await api.waits("prj_c7");
+    const second = await api.waits("prj_c7");
+    expect(Object.is(second, first)).toBe(true);
+    version = 2;
+    expect(await api.waits("prj_c7")).toEqual({ v: 2 });
+    expect(seen).toEqual([{ inm: null, own: null }, { inm: null, own: 'W/"v1"' }, { inm: null, own: 'W/"v1"' }]);
+    // With both, the standard ETag wins and goes back in If-None-Match.
+    const s = server(() => ({ body: { n: 1 }, etag: '"std"' }));
+    await api.waits("prj_c8");
+    await api.waits("prj_c8");
+    expect(s.seen.map((x) => x.ifNoneMatch)).toEqual([null, '"std"']);
+  });
+
   it("never answers a write from what it remembers, and the GET after it gets the new state", async () => {
     let tasks = [{ id: "tsk_a" }];
     const s = server((url, method) => {

@@ -15,12 +15,16 @@ export class ApiError extends Error {
 
 /** How many GET answers `call` remembers (by URL, least recently used dropped first): a project's pages poll about 20. */
 export const REMEMBERED = 64;
-/** The last answer with an `ETag` to each GET, parsed: a `304` hands back the very same value. */
-const remembered = new Map<string, { etag: string; value: unknown }>();
+/**
+ * The last answer with a validator to each GET, parsed: a `304` hands back the very same value. The
+ * validator is the answer's `ETag`, or, when it came without one (the edge or a proxy dropped it), the
+ * app's own copy in `X-ETag`, named back in `X-If-None-Match` (src/conditional.ts).
+ */
+const remembered = new Map<string, { etag: string; own: boolean; value: unknown }>();
 
-function remember(url: string, etag: string, value: unknown): void {
+function remember(url: string, etag: string, own: boolean, value: unknown): void {
   remembered.delete(url);
-  remembered.set(url, { etag, value });
+  remembered.set(url, { etag, own, value });
   if (remembered.size > REMEMBERED) remembered.delete(remembered.keys().next().value!);
 }
 
@@ -36,7 +40,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
         headers: {
           accept: "application/json",
           ...(body === undefined ? {} : { "content-type": "application/json" }),
-          ...(conditional && had ? { "if-none-match": had.etag } : {}),
+          ...(conditional && had ? { [had.own ? "x-if-none-match" : "if-none-match"]: had.etag } : {}),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
@@ -47,7 +51,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   let res = await send(true);
   if (res.status === 304 && method === "GET") {
     if (had) {
-      remember(url, had.etag, had.value);
+      remember(url, had.etag, had.own, had.value);
       return had.value as T;
     }
     // A 304 to an answer this page doesn't have: asked once more, unconditionally.
@@ -65,8 +69,12 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     const error = typeof data === "object" && data !== null && typeof (data as { error?: unknown }).error === "string" ? (data as { error: string }).error : null;
     throw new ApiError(res.status, error ?? `${res.status} ${res.statusText}`.trim(), data);
   }
-  const etag = method === "GET" && res.status === 200 ? res.headers.get("etag") : null;
-  if (etag) remember(url, etag, data);
+  if (method === "GET" && res.status === 200) {
+    const etag = res.headers.get("etag");
+    const own = etag ? null : res.headers.get("x-etag");
+    if (etag) remember(url, etag, false, data);
+    else if (own) remember(url, own, true, data);
+  }
   return data as T;
 }
 

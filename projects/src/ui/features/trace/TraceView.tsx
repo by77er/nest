@@ -22,7 +22,7 @@ import {
   type TurnGroup,
 } from "./model";
 import { TraceMarkdown } from "./TraceMarkdown";
-import { useTrace } from "./useTrace";
+import { useAgentTrace } from "./SharedTrace";
 
 /** Within this many px of the bottom counts as at the bottom (a fraction of a line); of the top, as asking for more. */
 const NEAR_BOTTOM = 24;
@@ -660,9 +660,9 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   );
 }
 
-/** An agent's live trace, connected while shown; `empty` says why there's no agent yet. */
+/** An agent's live trace, connected while shown (or by a SharedTrace above it); `empty` says why there's no agent yet. */
 export function TraceView({ title, agent, empty = "No agent yet." }: { title: string; agent: string | null; empty?: string }) {
-  const { state, loadOlder } = useTrace(agent);
+  const { state, loadOlder } = useAgentTrace(agent);
   if (!agent) {
     return (
       <Section title={title} region={false}>

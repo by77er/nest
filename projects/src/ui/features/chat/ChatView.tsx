@@ -19,7 +19,7 @@ import {
   ChatFrame, ChatLog, ChatWelcome, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
-import { useTrace } from "../trace/useTrace";
+import { useAgentTrace } from "../trace/SharedTrace";
 import { Composer, type ComposerHandle } from "./Composer";
 import { type LogItem, markRead, type Step, stepsBySeq, timeline, type ToolStep, TurnReader } from "./model";
 
@@ -392,7 +392,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const chat = useChat(projectId);
   const post = usePostChat(projectId);
   const retryChat = useRetryChat(projectId);
-  const trace = useTrace(agent);
+  const trace = useAgentTrace(agent);
   // Each turn of the trace read once (README.md#the-manager-chat): only the one in progress again as it grows.
   const reader = useMemo(() => new TurnReader(), [agent]);
   const { live, finished } = useMemo(() => reader.read(trace.state.events), [reader, trace.state.events]);
@@ -451,11 +451,17 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   // Hold the stream until its message lands (a manager message newer than when it began; any, for a turn
   // first seen in the backlog replayed on opening, whose message may be in the log already); another turn
   // starting lets the last one go.
+  // A turn this view first sees in its first render was read from the backlog, as a fresh connection replays
+  // it, even when the trace (shared with the Trace tab) was live before the view mounted.
+  const firstRender = useRef(true);
   useEffect(() => {
     if (!live) return;
-    const since = trace.state.status === "live" ? lastManagerSeq : 0;
+    const since = trace.state.status === "live" && !firstRender.current ? lastManagerSeq : 0;
     setHeld((h) => (live.steps.length ? { turn: live.turn, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : since } : h?.turn === live.turn ? h : null));
   }, [live]); // `lastManagerSeq` and the trace's status are read at each turn's start only
+  useEffect(() => {
+    firstRender.current = false;
+  }, []);
   // The held turn as it ended (a call it never answered reads stopped), while the ring has it.
   const heldEnd = !live && held ? (finished.find((t) => t.turn === held.turn) ?? null) : null;
   // Its message, once in the log: one of the manager's since it began, by what it says (an older one
@@ -539,9 +545,13 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     }
   }, [older]);
 
+  // One page at a time: scroll events that come before the render showing "loading" read the handler as it
+  // was, so the flag the guard reads is a ref, set before the request (README.md#performance).
+  const loadingOlderRef = useRef(false);
   const loadOlder = useCallback(async () => {
     const first = messages.find((m) => m.seq > 0);
-    if (!first || loadingOlder || !hasOlder) return;
+    if (!first || loadingOlderRef.current || !hasOlder) return;
+    loadingOlderRef.current = true;
     setLoadingOlder(true);
     try {
       const page = await api.chat(projectId, first.seq);
@@ -552,9 +562,10 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     } catch {
       // Tried again on the next scroll.
     } finally {
+      loadingOlderRef.current = false;
       setLoadingOlder(false);
     }
-  }, [messages, loadingOlder, hasOlder, projectId]);
+  }, [messages, hasOlder, projectId]);
 
   // What the handlers below read as it is now, so they keep one identity (the log's rows and the composer
   // aren't drawn again for a new handler).
