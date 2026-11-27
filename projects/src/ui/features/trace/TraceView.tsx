@@ -11,10 +11,13 @@
 // And drawn only where it's seen: each turn is a TermTurn (`content-visibility: auto`), skipped off screen
 // at its last drawn height or an estimate (turnSize), so the scroll holds below (Load older, following,
 // Jump to live) are kept while turns take their own heights as they're drawn.
+// A change of many events at once (the backlog on connecting, a page of history) is drawn in a transition
+// (useDrawn), which React renders in slices: the log shows what it showed until then, and the page stays
+// responsive, rather than one long task of a second or more.
 
 import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
-import { memo, type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, type ReactNode, startTransition, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { exact } from "../../common/time";
 import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, TermTurn, useFillColumn, weight } from "../../layout";
 import {
@@ -312,8 +315,31 @@ function restore(v: HTMLElement, h: Held): boolean | null {
   return true;
 }
 
+/** At least this many events more (or fewer) than the log shows: drawn in a transition (useDrawn). */
+export const DRAWN_IN_TRANSITION = 50;
+const held = (s: TraceState) => s.events.length + s.older.length;
+
+/**
+ * The state the log draws: `state` itself, except while a change of DRAWN_IN_TRANSITION events or more
+ * (the backlog, a history page) is being drawn in a transition, when it's the state drawn before. React
+ * renders the transition in slices that yield to the page, so drawing a thousand events is no long task;
+ * a live event or a status changes the log at once, as before.
+ */
+function useDrawn(state: TraceState): TraceState {
+  const [drawn, setDrawn] = useState(state);
+  let shown = state;
+  if (drawn !== state) {
+    if (Math.abs(held(state) - held(drawn)) < DRAWN_IN_TRANSITION) setDrawn(state);
+    else shown = drawn;
+  }
+  useEffect(() => {
+    if (shown !== state) startTransition(() => setDrawn(state));
+  }, [shown, state]);
+  return shown;
+}
+
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
-export function TraceLog({ title, state, loadOlder = () => {} }: { title: string; state: TraceState; loadOlder?: () => void }) {
+export const TraceLog = memo(function TraceLog({ title, state, loadOlder = noLoad }: { title: string; state: TraceState; loadOlder?: () => void }) {
   const { fill, untitled } = useFillColumn();
   // Grouped from the last state's grouping (kept as state, updated while rendering: React's pattern for
   // information from the previous render): the work is for what came since, and unchanged turns keep their
@@ -360,7 +386,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     const v = viewport.current;
     if (!v) return;
     // Hidden (a tab switched away: `display: none`), the log has no height and the browser may drop its
-    // scroll position: what the reader had is kept, and put back when it shows again.
+    // scroll position: what the reader had is kept, and put back when it shows again (at the bottom, if they
+    // were following it: with what came while it was hidden).
     // Shown for the first time (it mounted hidden), it starts at the newest line, as it would have.
     let hidden = false;
     let lastTop: number | null = null;
@@ -372,7 +399,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
         if (jumping.current) {
           jumping.current = 0;
           v.scrollTop = v.scrollHeight;
-        } else v.scrollTop = lastTop ?? (atBottomRef.current ? v.scrollHeight : 0);
+        } else v.scrollTop = atBottomRef.current ? v.scrollHeight : (lastTop ?? 0); // following: what came meanwhile too
       }
     });
     seen.observe(v);
@@ -658,11 +685,18 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       {body}
     </Section>
   );
-}
+});
+
+function noLoad() {}
 
 /** An agent's live trace, connected while shown (or by a SharedTrace above it); `empty` says why there's no agent yet. */
 export function TraceView({ title, agent, empty = "No agent yet." }: { title: string; agent: string | null; empty?: string }) {
-  const { state, loadOlder } = useAgentTrace(agent);
+  const { state: live, loadOlder } = useAgentTrace(agent);
+  const state = useDrawn(live);
+  // The first page of history as soon as there's a cursor and nothing older is held yet (on open, and after a gap).
+  useEffect(() => {
+    if (typeof live.olderCursor === "string" && live.older.length === 0 && live.olderState === "idle") loadOlder();
+  }, [live.olderCursor, live.older.length, live.olderState, loadOlder]);
   if (!agent) {
     return (
       <Section title={title} region={false}>

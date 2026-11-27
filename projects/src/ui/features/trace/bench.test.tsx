@@ -109,6 +109,8 @@ describe("the trace's cost", () => {
     const r = { ...n };
     console.log(`BENCH backlog-1000: state_changes=${r.states} commits=${r.commits} turn_renders=${r.rules} line_renders=${r.lines} markdown_renders=${r.markdown} ms=${ms.toFixed(0)}`);
     expect(r.states).toBeLessThanOrEqual(5);
+    // The budget (README.md#performance): at most five commits for the backlog, its transition's included.
+    expect(r.commits).toBeLessThanOrEqual(5);
     expect(r.rules).toBeLessThanOrEqual(2 * 100);
   });
 
