@@ -7,6 +7,7 @@
 // browser's own numbers: the PR's measurements in Chromium.)
 import { MantineProvider } from "@mantine/core";
 import { act, render, screen } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cssVariablesResolver, theme } from "../../theme";
 import { initialTrace, type TraceEvent, type TraceState } from "./model";
@@ -378,20 +379,32 @@ describe("a long trace drawn newest first", () => {
       ev(3 * t + 3, "assistant_text", { turn: `t${t}`, text: `turn ${t} b` }),
     ]).flat();
 
-  it("while the first backlog comes, only the newest turns are drawn and nothing older is asked for; once live, all, and the top asks again", () => {
+  it("mounting on many turns: before the rest is drawn, only the newest show and the top asks for nothing older; after, all, and it asks", () => {
     const events = turnsOf(30);
     const loadOlder = vi.fn();
-    const rerender = show(state(events, { status: "connecting", olderCursor: "c1" }), loadOlder);
-    layOut();
-    // The newest turns, a screen's worth of items (DRAWN_FIRST), not the 60 lines held.
-    expect(lines().length).toBeLessThan(40);
-    expect(screen.getByText("turn 29 b")).toBeInTheDocument();
-    expect(screen.queryByText("turn 0 a")).toBeNull();
-    // At the top of what's drawn: it isn't the top yet.
-    scrolled(0);
-    expect(loadOlder).not.toHaveBeenCalled();
-    // The backlog in (live): the rest drawn above, and the top asks for the page before.
-    rerender(state(events, { status: "live", olderCursor: "c1" }));
+    const seen: { lines: number; asked: number }[] = [];
+    // Runs in the first commit's passive effects, after the log's (its scroll listener is on), before the
+    // transition that draws the rest: what a reader scrolling at that moment meets.
+    function Probe() {
+      useEffect(() => {
+        layOut();
+        // (Inside the render's own act: the event dispatched as is.)
+        viewport().scrollTop = 0;
+        viewport().dispatchEvent(new Event("scroll"));
+        seen.push({ lines: lines().length, asked: loadOlder.mock.calls.length });
+      }, []);
+      return null;
+    }
+    render(
+      <MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">
+        <TraceLog title="T" state={state(events, { olderCursor: "c1" })} loadOlder={loadOlder} />
+        <Probe />
+      </MantineProvider>,
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.lines).toBeLessThan(40);
+    expect(seen[0]!.asked).toBe(0);
+    // Drawn: all 60 lines; at the top, the page before is asked for.
     expect(lines()).toHaveLength(60);
     scrolled(0);
     expect(loadOlder).toHaveBeenCalledTimes(1);

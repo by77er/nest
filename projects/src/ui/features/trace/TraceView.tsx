@@ -11,9 +11,9 @@
 // And drawn only where it's seen: each turn is a TermTurn (`content-visibility: auto`), skipped off screen
 // at its last drawn height or an estimate (turnSize), so the scroll holds below (Load older, following,
 // Jump to live) are kept while turns take their own heights as they're drawn.
-// And drawn newest first when many come at once (opening on a backlog, a tab opened on a long trace): the
-// newest turns, a screen's worth (DRAWN_FIRST lines), at once, the ones above them in a transition, which
-// React renders in slices that yield to the page, so a thousand events are never one long task.
+// And drawn newest first when it mounts on many turns (a tab opened on a long trace already held): the
+// newest turns, a screen's worth (DRAWN_FIRST items), at once, the ones above them in a transition, which
+// React renders in slices that yield to the page, rather than one long task.
 
 import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
@@ -343,25 +343,22 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     current = groupTurnsFrom(grouping, state.events, state.older);
     setGrouping(current);
   }
-  // Many turns at once into an empty log (mounting on a long trace, or the first connection's backlog, which
-  // can come over several frames): only the newest (DRAWN_FIRST items), from the turn `cut` names, the window
-  // moving with the backlog as it comes; once it's in, the rest in one transition. (A history page, a
-  // reconnect's events, or anything else added to turns already drawn, is drawn at once, as before.)
-  const receiving = state.status === "connecting";
-  const [cut, setCut] = useState<string | null>(() => cutFor(current.groups));
-  const [counted, setCounted] = useState(current.groups.length);
-  if (counted !== current.groups.length) {
-    setCounted(current.groups.length);
-    if (receiving || (counted === 0 && cut === null)) {
-      const c = cutFor(current.groups);
-      if (c !== cut) setCut(c);
-    }
+  // Mounting on many turns already held (the Manager's Trace tab opened on the chat's connection), or many
+  // coming at once into an empty log outside a connection's backlog: only the newest (DRAWN_FIRST items,
+  // from the turn `cut` names) at once, then the rest above them in one transition. (A connection's backlog,
+  // a history page, or anything else added to turns already drawn, is drawn as it comes, as before.)
+  const all = current.groups;
+  const [cut, setCut] = useState<string | null>(() => cutFor(all));
+  const [counted, setCounted] = useState(all.length);
+  if (counted !== all.length) {
+    setCounted(all.length);
+    if (counted === 0 && cut === null && state.status !== "connecting" && state.status !== "reconnecting") setCut(cutFor(all));
   }
   useEffect(() => {
-    if (cut !== null && !receiving) startTransition(() => setCut(null));
-  }, [cut, receiving]);
-  const from = cut === null ? -1 : current.groups.findIndex((g) => g.key === cut);
-  const groups = from > 0 ? current.groups.slice(from) : current.groups;
+    if (cut !== null) startTransition(() => setCut(null));
+  }, [cut]);
+  const from = cut === null ? 0 : Math.max(0, all.findIndex((g) => g.key === cut));
+  const groups = from > 0 ? all.slice(from) : all;
   const partial = from > 0;
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
