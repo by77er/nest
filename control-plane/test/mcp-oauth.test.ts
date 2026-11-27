@@ -993,7 +993,8 @@ describe("an API client's own mcp credentials", () => {
     f.holdDiscovery = false;
     const res = await started;
     expect(res.status).toBe(409);
-    expect(await res.text()).toContain("revoked while this one was starting");
+    // Refused by its catalog check (the capability changed or went) or its revocation count, whichever sees it first.
+    expect(await res.text()).toMatch(/(changed or went|revoked) while this (authorization|one) was starting: start again/);
     expect(await runInDurableObject(broker(), (_: BrokerDO, st) => st.storage.sql.exec("SELECT body FROM oauth_flows").toArray()
       .filter((r) => String(r.body).includes(`client-oauth:${c.id}:race:`)).length)).toBe(0);
     await putCap(c, "race", f, { authorize: true });
@@ -1253,7 +1254,8 @@ describe("an API client's own mcp credentials", () => {
     f.holdDiscovery = false;
     const res = await started;
     expect(res.status).toBe(409);
-    expect(await res.text()).toContain("revoked while this one was starting");
+    // Refused by its catalog check (the capability changed or went) or its revocation count, whichever sees it first.
+    expect(await res.text()).toMatch(/(changed or went|revoked) while this (authorization|one) was starting: start again/);
   });
 
   it("a write that keeps the incarnation (same URL and form) lets a callback in flight store its tokens", async () => {
@@ -1310,7 +1312,7 @@ describe("an API client's own mcp credentials", () => {
     expect((await asJson(c.token, `/v1/catalog/capabilities/${name}/oauth`)).status).toBe("authorized");
   });
 
-  it("the callback's catalog check alone: a flow started for an incarnation a write already replaced stores nothing", async () => {
+  it("a start for an incarnation a write already replaced is refused before anyone sees a consent screen", async () => {
     const f = new FakeAuth(rand(), { cimd: true });
     const g = new FakeAuth(rand(), { cimd: true });
     fakes.set(f.id, f);
@@ -1318,11 +1320,50 @@ describe("an API client's own mcp credentials", () => {
     const c = await newClient([f.server, g.server]);
     const old = (await putCap(c, "stale", f, { authorize: true })).mcp.auth.incarnation as string;
     await putCap(c, "stale", g, { authorize: true });
-    // A start that read the catalog before the write but reaches BrokerDO after it (its counts already moved).
-    const start = await broker().clientOAuthStart({ client: c.id, clientName: c.name, capability: `${c.name}/stale`, entry: "stale", incarnation: old, url: f.server });
+    // A start whose catalog read (in the Worker) came before the write, reaching BrokerDO after it.
+    await expect(Promise.resolve().then(() => broker().clientOAuthStart({ client: c.id, clientName: c.name, capability: `${c.name}/stale`, entry: "stale", incarnation: old, url: f.server })))
+      .rejects.toThrow("changed or went while this authorization was starting");
+    expect(await runInDurableObject(broker(), (_: BrokerDO, st) => st.storage.sql.exec("SELECT body FROM oauth_flows").toArray()
+      .filter((r) => String(r.body).includes(`client-oauth:${c.id}:stale:`)).length)).toBe(0);
+  });
+
+  it("the callback's catalog check alone: a capability gone with no revocation (one that never ran) gets no tokens", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "gone", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/gone/oauth`, { method: "POST" });
     const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    // Deleted in CatalogDO alone: no count moves, only the callback's question to the catalog can refuse.
+    await (env.CATALOG.get(env.CATALOG.idFromName("catalog")) as unknown as { deleteCapability(n: string): Promise<void> }).deleteCapability(`${c.name}/gone`);
     expect(await (await SELF.fetch(back)).text()).toContain("revoked while its code was being exchanged");
-    expect(await entryRow(c, "stale")).toBeUndefined();
+    expect(await entryRow(c, "gone")).toBeUndefined();
+  });
+
+  it("a write's revocation that finds the capability gone revokes every incarnation", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "race", f, { authorize: true });
+    await clientAuthorize(c, "race");
+    await (env.CATALOG.get(env.CATALOG.idFromName("catalog")) as unknown as { deleteCapability(n: string): Promise<void> }).deleteCapability(`${c.name}/race`);
+    await broker().clientOAuthRevoke(c.id, `${c.name}/race`, "race", { write: true });
+    expect(await entryRow(c, "race")).toBeUndefined();
+  });
+
+  it("a start straddling its client's deletion keeps no registration", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "straddle", f, { authorize: true });
+    f.holdDiscovery = true;
+    const started = as(c.token, `/v1/catalog/capabilities/${c.name}/straddle/oauth`, { method: "POST" });
+    await eventually("the start to reach discovery", () => f.discoveryHeld);
+    await broker().deleteClientSecrets(c.id);
+    f.holdDiscovery = false;
+    expect((await started).status).toBe(409);
+    expect(await runInDurableObject(broker(), (_: BrokerDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM oauth_clients WHERE redirect_uri = ?", `${NEST}/v1/oauth/callback/${c.id}`).toArray().length)).toBe(0);
   });
 
   it("the callback fails closed when CatalogDO can't answer", async () => {

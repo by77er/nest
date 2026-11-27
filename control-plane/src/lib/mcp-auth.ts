@@ -683,6 +683,10 @@ export class OAuthStore {
         id = (JSON.parse(known.client) as OAuthClient).client_id;
       } else {
         const registered = await registerClient(found.as, redirect_uri, input.owner ? ownerClientName(input.owner.name) : "nest");
+        // A client deleted (or its capability revoked) while registering: its registration is never kept.
+        if (this.revocationsOf({ capability: input.capability, ref: input.auth.oauth }) !== revokedBefore) {
+          throw oauthError(`${input.capability}'s authorization was revoked while this one was starting: start again`, 409);
+        }
         // Another start may have registered across the await: the first stored registration wins.
         const again = this.d.sql.exec<{ client: string }>("SELECT client FROM oauth_clients WHERE issuer = ? AND redirect_uri = ?", found.as.issuer, redirect_uri).toArray()[0];
         if (again) {
@@ -706,6 +710,12 @@ export class OAuthStore {
       capability: input.capability, ref: input.auth.oauth, server_url: input.url, resource: found.resource, issuer: found.as.issuer,
       token_endpoint: found.as.token_endpoint, iss_parameter: found.as.iss_parameter, client, verifier, redirect_uri, scopes,
     };
+    // A client's flow only for the incarnation its capability holds now: a start whose catalog read (in the
+    // Worker) a delete or a new URL overtook before it got here sends nobody to a consent screen for nothing.
+    if (flow.ref.startsWith(CLIENT_OAUTH_PREFIX) && this.d.incarnationOf) {
+      const current = await this.d.incarnationOf(input.capability).catch(() => null);
+      if (current !== flow.ref.slice(flow.ref.lastIndexOf(":") + 1)) throw oauthError(`${input.capability} changed or went while this authorization was starting: start again`, 409);
+    }
     if (this.revocationsOf(flow) !== revokedBefore || this.overtakenByWrite(flow.ref, writesBefore)) {
       throw oauthError(`${input.capability}'s authorization was revoked while this one was starting: start again`, 409);
     }
