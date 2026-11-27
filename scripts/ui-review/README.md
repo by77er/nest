@@ -23,6 +23,7 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 - It starts the app's `vite dev` on a free port (log in `<out-dir>/vite.log`) and stops it at exit, or uses `--base-url`.
 - The API is served from `fixtures/<app>/` (`page.route`), so states only live events produce (stalled tasks, asks, reviews, live traces, a busy fleet) are reproducible. Fixtures hold made-up ids only, never a credential.
 - `--pages` takes state names or section names.
+- A full-page screenshot renders what `content-visibility: auto` skips far below the viewport (a long board's lower rows), as a reader scrolling there sees it; the checks run on the page as it is.
 - Output: `<state>-<width>-<scheme>.png` for every screen, and `report.json` (`passed`, failures per check, each screen's frame geometry, and every failure with its screen). Exit 0 if every check passed, 1 if any failed, 2 on a usage or setup error.
 
 ## Checks
@@ -50,6 +51,28 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 | `trace-tabs` (projects, `trace-tabs.mjs`) | switching the task drawer's tabs away from the trace and back opens a second trace socket, fetches a history page again, or loses the log's scroll or what was expanded (a browser-only check: Mantine's test environment renders `keepMounted` tabs without React's `<Activity>`) |
 
 The apps' own `npm test` covers the code side (no inline styles, raw values or off-palette colors; tokens equal the skill's). Judgement (hierarchy, balance, placement) stays the reviewer's.
+
+## perf.mjs
+
+The projects app's performance harness: every page and main flow, played the same way against a built client with large generated fixtures, so a change's speed is measured before and after ([projects' Performance](../../projects/README.md#performance)). Like the captures, it never needs the deployed app or a credential; CI doesn't run it.
+
+```bash
+cd projects && npm ci && npm run build                          # the client, in dist/client
+node scripts/ui-review/perf.mjs <out-dir> --dist projects/dist/client [--commit SHA] [--label NAME]
+node scripts/ui-review/perf.mjs <out-dir> --base-url URL ...   # or a static server of it you run
+node scripts/ui-review/perf.mjs --compare before.json after.json   # a before/after table, with deltas
+```
+
+- **Served:** `--dist` serves the build itself as the app's Worker does: index.html for any other path, an ETag on everything (`304` to a match), br or gzip, and `--assets worker` (the default) caching as `projects/src/asset-cache.ts` does since #318 (a content-hashed `/assets/` file immutable for a year, everything else `no-cache`); `--assets workers-assets` is Workers Assets' own `public, max-age=0, must-revalidate` on everything, for a commit before #318. `--base-url` takes any server of it instead.
+- **The API** comes from `perf-fixtures.mjs`, generated from a seed (`--seed`, default 1) on top of the demo fixture's objects: 6 projects, the open one with 300 tasks (60% done), 200 chat messages (Markdown, code, math, task references; pages of 50), 100 review jobs, 6 routines with 60 runs, 40 issues, 30 secrets, 24 hosts per network rule list. `--shape full` answers the task list with every body and spec (the API before #308); `summary` (the default) without them. Every `GET` answer has an ETag and is `304` to a matching `If-None-Match`; a client that never sends one gets `200`s. Each answer waits `--api-ms` (default 40), a Worker's round trip; its bytes are counted gzipped, as Cloudflare sends them. It's answered through CDP's `Fetch` interception on `*/api/*`, not `page.route`: Playwright turns the HTTP cache off while it routes, and the warm loads need it.
+- **Traces:** every agent's has 2,000 events: 500 in five history pages (Load older), a 1,000-event backlog sent on connecting (`context.routeWebSocket`, as `selftest.mjs` does), and 500 streamed live, only in the streaming flows, at `--rate` events/s (default 20).
+- **Pages**, each loaded cold (a new browser, cache empty), then warm (a new tab, cache filled), then left idle for `--idle` s (default 15): `projects`, `board`, `board-drawer` (a task with a worker's trace), `manager-chat`, `manager-trace`, `reviews`, `reviews-trace`, `routines`, `routines-trace`, `triage`, `secrets`, `network`, `settings`, `admin`.
+- **Flows**, each on its page once loaded: `switch-view` (Board → Manager → Reviews), `switch-project`, `drawer` (open and close), `type-composer` (40 characters, with all 200 messages shown), `stream-chat` and `stream-trace` (a 10 s live turn), `open-trace` (the Trace tab, its 1,000-event backlog), `older-chat` and `older-trace` (three older pages), `drag-reorder` (a board row by pointer), `tab-switch` (Chat ↔ Trace, three times), `idle-board` and `idle-manager` (60 s of polling). `--only` takes names, `page` or `flow`.
+- **Measured** per window (cold, warm, idle, or the flow): requests and bytes by type (document, script, style, font, API; the trace's WebSocket messages apart; bodies as sent, without headers) and API requests per endpoint with their `304`s; for an idle window, API requests and bytes per minute; time to the content (a stated selector, polled every frame); long tasks (`PerformanceObserver('longtask')`: count, total, max and the time over 50 ms); the renderer's script, layout and style time (CDP `Performance.getMetrics` deltas), its DOM nodes and JS heap; for typing, each key's keydown to the frame after its paint (worst and median).
+- **CPU** throttled `--cpu` times (CDP, default 4); the report states it, the shape, the asset caching, the API latency and the rate.
+- **Measuring an older commit:** build it in a `git worktree` and add `--shape full` before #308 and `--assets workers-assets` before #318.
+- **Output:** `<out-dir>/perf.json` and `perf.md` (a row per window); with `--compare other.json`, also `compare.md` (other as before). A scenario that failed, or whose page threw (a fixture whose shape drifted from the API's, say), is an error, and leaves `<name>-error.png` and `.html` there. Each scenario runs alone, in its own browser. Exit 0 whatever the numbers; 2 when a scenario couldn't be played, or on a usage or setup error.
+- **In a sandbox** (small, shared): nothing heavy alongside, `free -m` between runs, and run it detached with its output to a file (a long foreground call gets cut). Absolute times swing between machines and runs: compare runs from one machine, and rerun before trusting a change smaller than the variation [projects' Performance](../../projects/README.md#performance) gives.
 
 ## Adding a page or state
 
