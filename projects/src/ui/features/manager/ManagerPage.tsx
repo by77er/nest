@@ -6,7 +6,7 @@
 import { Tabs } from "@mantine/core";
 import { IconMessage, IconTimeline } from "@tabler/icons-react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { useDeferredValue, useState } from "react";
+import { useState } from "react";
 import { icon, Section, Stack, WithContext } from "../../layout";
 import { ManagerContext } from "./ManagerContext";
 import { ChatView } from "../chat/ChatView";
@@ -20,13 +20,10 @@ export function ManagerPage() {
   const { view } = useSearch({ from: "/projects/$projectId/manager" });
   const navigate = useNavigate({ from: "/projects/$projectId/manager" });
   const tab = view ?? "chat";
-  // The tab chosen is drawn in a transition, which React renders in slices (the trace's thousand events, the
-  // chat's messages): the tabs show the last one until it's ready, and the page stays responsive meanwhile.
-  const shown = useDeferredValue(tab);
   // The trace, once opened, stays (hidden while Chat shows, as the task drawer's does): coming back to it
   // draws nothing again, and the reader's place in it is kept. The chat is drawn anew each time.
-  const [traceOpened, setTraceOpened] = useState(shown === "trace");
-  if (shown === "trace" && !traceOpened) setTraceOpened(true);
+  const [traceOpened, setTraceOpened] = useState(tab === "trace");
+  if (tab === "trace" && !traceOpened) setTraceOpened(true);
   return (
     <ProjectFrame projectId={projectId}>
       {(p) => (
@@ -38,7 +35,7 @@ export function ManagerPage() {
           <ManagerProblem projectId={projectId} />
           {/* `display-none`, not Mantine's default `activity` (React's <Activity hidden>), whose effects' cleanups
               would close the trace's socket and lose its scroll (the Sheet's tabs do the same). */}
-          <Tabs value={shown} onChange={(v) => void navigate({ search: v === "trace" ? { view: "trace" } : {} })} keepMounted keepMountedMode="display-none">
+          <Tabs value={tab} onChange={(v) => void navigate({ search: v === "trace" ? { view: "trace" } : {} })} keepMounted keepMountedMode="display-none">
             <Tabs.List>
               <Tabs.Tab value="chat" leftSection={<IconMessage size={icon.md} />}>
                 Chat
@@ -48,7 +45,7 @@ export function ManagerPage() {
               </Tabs.Tab>
             </Tabs.List>
             <Tabs.Panel value="chat" pt="xl">
-              {shown === "chat" && <ChatView projectId={projectId} agent={p.settings.manager} />}
+              {tab === "chat" && <ChatView projectId={projectId} agent={p.settings.manager} />}
             </Tabs.Panel>
             <Tabs.Panel value="trace" pt="xl">
               {traceOpened && <ManagerTrace settings={p.settings} />}

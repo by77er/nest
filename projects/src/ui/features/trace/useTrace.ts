@@ -1,8 +1,7 @@
 // The socket behind a trace view: connect to the app's trace route, fold what comes into the state, keep
 // it alive, and after a drop reconnect with a backoff from the last seq received, until the agent ends.
-// And the history before the ring, a page each time the view asks (`loadOlder`): a trace view asks for the
-// first as soon as nest offers it (a `history` or `gap` cursor), and each older one as its reader scrolls to
-// the top. The chat, which reads only the turn in progress, asks for none.
+// And the history before the ring: its first page as soon as nest offers it (a `history` or `gap` cursor),
+// each older one when the view asks (`loadOlder`, as its reader scrolls to the top).
 //
 // Messages are applied in batches, at most one per animation frame: a backlog of a thousand events is a
 // handful of state changes, not a thousand. The batch is applied at once on `live` (the backlog is done),
@@ -69,6 +68,11 @@ export function useTrace(agent: string | null): { state: TraceState; loadOlder: 
       }
     })();
   }, []);
+
+  // The first page as soon as there's a cursor and nothing older is shown yet (on open, and after a gap).
+  useEffect(() => {
+    if (typeof state.olderCursor === "string" && state.older.length === 0 && state.olderState === "idle") loadOlder();
+  }, [state.olderCursor, state.older.length, state.olderState, loadOlder]);
 
   useEffect(() => {
     dispatch({ kind: "reset" });
