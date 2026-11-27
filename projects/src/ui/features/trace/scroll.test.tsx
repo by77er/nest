@@ -20,6 +20,7 @@ let heights: Map<string, number>;
 let scroll: { top: number };
 let observers: ResizeObserverCallback[];
 let frames: FrameRequestCallback[];
+let hiddenLog: boolean;
 const realRect = Element.prototype.getBoundingClientRect;
 const realRO = window.ResizeObserver;
 
@@ -53,6 +54,7 @@ beforeEach(() => {
   scroll = { top: 0 };
   observers = [];
   frames = [];
+  hiddenLog = false;
   vi.stubGlobal("requestAnimationFrame", (f: FrameRequestCallback) => frames.push(f));
   vi.stubGlobal("cancelAnimationFrame", () => {});
   window.ResizeObserver = class {
@@ -86,7 +88,7 @@ afterEach(() => {
 function layOut() {
   const v = viewport();
   const calls: ScrollToOptions[] = [];
-  Object.defineProperty(v, "clientHeight", { configurable: true, get: () => VIEW });
+  Object.defineProperty(v, "clientHeight", { configurable: true, get: () => (hiddenLog ? 0 : VIEW) });
   Object.defineProperty(v, "scrollHeight", { configurable: true, get: () => Math.max(VIEW, total()) });
   Object.defineProperty(v, "scrollTop", {
     configurable: true,
@@ -182,7 +184,7 @@ describe("the trace's scroll, as its turns are drawn", () => {
     expect(at(READ)).toBe(y);
   });
 
-  it("lets the hold go once nothing above moves, and to the reader's own scroll or a jump", () => {
+  it("lets the hold go once nothing above it moves", () => {
     // Lines arriving below, drawn frame after frame, keep nothing held: a turn drawn above later moves it.
     const { arrive } = readingAtTop();
     arrive();
@@ -204,6 +206,40 @@ describe("the trace's scroll, as its turns are drawn", () => {
     heights.set("h11.0", 50);
     drawn();
     expect(scroll.top).toBe(300);
+  });
+
+  it("lets the hold go to the reader's wheel", () => {
+    const { arrive } = readingAtTop();
+    arrive();
+    const y = at(READ);
+    act(() => viewport().parentElement!.dispatchEvent(new Event("wheel")));
+    heights.set("h11.0", 50);
+    drawn();
+    expect(at(READ)).toBe(y + 30);
+  });
+
+  it("measures nothing from a page that failed: one that comes later leaves the reader where they are", () => {
+    const { rerender } = readingAtTop();
+    rerender(state(ring, { older: page2, olderCursor: "c1", olderState: "error" }));
+    scrolled(200);
+    rerender(state(ring, { older: [...page1, ...page2], olderCursor: null }));
+    expect(scroll.top).toBe(200);
+  });
+
+  it("follows the bottom while a page is on its way", () => {
+    const loadOlder = vi.fn();
+    const older = page2;
+    const rerender = show(state(ring, { older, olderCursor: "c1" }), loadOlder);
+    layOut();
+    scrolled(total() - VIEW);
+    act(() => screen.getByRole("button", { name: /load earlier/ }).click());
+    expect(loadOlder).toHaveBeenCalledTimes(1);
+    rerender(state(ring, { older, olderCursor: "c1", olderState: "loading" }));
+    rerender(state([...ring, ev(41, "assistant_text", { text: "new" })], { older, olderCursor: "c1", olderState: "loading" }));
+    frame();
+    heights.set("s41", 80);
+    drawn();
+    expect(scroll.top).toBe(total() - VIEW);
   });
 
   it("lets the hold go when Jump to live is pressed", () => {
@@ -235,6 +271,50 @@ describe("the trace's scroll, as its turns are drawn", () => {
     heights.set("s41", 140);
     drawn();
     expect(scroll.top).toBe(top);
+  });
+
+  it("ends Jump to live on the reader's wheel, or a scroll back up (find-in-page), and gives up after a few tries", () => {
+    show(state(ring));
+    const calls = layOut();
+    const jumpTo = () => {
+      scrolled(0);
+      act(() => screen.getByRole("button", { name: "Jump to live" }).click());
+    };
+    const after = (f: () => void) => {
+      const n = calls.length;
+      f();
+      frame(12);
+      return calls.length - n;
+    };
+    // The wheel: it stays where the reader took it.
+    jumpTo();
+    expect(after(() => act(() => viewport().parentElement!.dispatchEvent(new Event("wheel"))))).toBe(0);
+    // Part way down, then sent back up past half the log: the reader's.
+    jumpTo();
+    expect(after(() => {
+      scrolled(350);
+      scrolled(100);
+    })).toBe(0);
+    // Stuck short (nothing moves it): a few tries, then it stops.
+    jumpTo();
+    frame(200);
+    const n = calls.length;
+    frame(40);
+    expect(calls.length).toBe(n);
+  });
+
+  it("lands Jump to live at the bottom when the log is shown again, hidden on its way", () => {
+    show(state(ring));
+    layOut();
+    scrolled(0);
+    act(() => screen.getByRole("button", { name: "Jump to live" }).click());
+    scroll.top = 300;
+    hiddenLog = true;
+    drawn();
+    frame(3);
+    hiddenLog = false;
+    drawn();
+    expect(scroll.top).toBe(total() - VIEW);
   });
 
   it("goes on to the bottom when Jump to live stops short of it, the bottom having moved", async () => {

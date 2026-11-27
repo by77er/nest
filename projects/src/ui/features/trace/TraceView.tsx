@@ -33,6 +33,8 @@ const NEAR_TOP = 80;
  * (TermTurn) becomes its own when the browser first draws it. Its own commit, its fade-in's, then a margin.
  */
 const SETTLE_FRAMES = 4;
+/** How many times "Jump to live" goes on after stopping short of a bottom that moved. */
+const JUMP_TRIES = 8;
 
 const STATUS: Record<TraceStatus, { label: string; color: "success" | "gray" | "warning" }> = {
   live: { label: "Live", color: "success" },
@@ -197,29 +199,46 @@ function tokens(u: unknown): string | null {
 function turnSize(g: TurnGroup, items: TraceItem[]): { rows: number; chars: number; gaps: number } {
   let rows = g.turn ? 1.6 : 0; // the rule: its caption-sized label and its margins
   let chars = 0;
+  for (const i of items) {
+    const one = itemSize(i);
+    rows += one.rows;
+    chars += one.chars;
+  }
+  return { rows, chars, gaps: Math.max(0, items.length - 1 + (g.turn ? 1 : 0)) };
+}
+
+/** A line's share of its turn's estimate, kept per item (an item is a new object when it changes): a turn
+ * growing adds its new line's, not its every line's again. */
+const sizes = new WeakMap<TraceItem, { rows: number; chars: number }>();
+function itemSize(i: TraceItem): { rows: number; chars: number } {
+  const known = sizes.get(i);
+  if (known) return known;
+  let rows = 0;
+  let chars = 0;
   const wraps = (s: string) => {
     chars += s.length;
     rows += 0.35;
   };
-  for (const i of items) {
-    if (i.kind === "tool") {
-      wraps(`${toolName(str(i.call.name))}(${primaryArg(i.call.input)})`);
-      if (!i.result) continue;
+  if (i.kind === "tool") {
+    wraps(`${toolName(str(i.call.name))}(${primaryArg(i.call.input)})`);
+    if (i.result) {
       const { head, more } = resultLines(i.result.summary);
       if (!head.length) rows += 1;
       for (const l of head) wraps(`${l}  `);
       rows += 0.2 + (more > 0 ? 1.2 : 0);
-    } else if (i.event.type === "assistant_text") {
-      let fence = false;
-      for (const line of str(i.event.text).split("\n")) {
-        if (line.startsWith("```")) fence = !fence;
-        if (fence || line.startsWith("```")) rows += 1; // a fence doesn't wrap: it scrolls in itself
-        else if (!line.trim()) rows += 0.4;
-        else wraps(line);
-      }
-    } else rows += 1;
-  }
-  return { rows, chars, gaps: Math.max(0, items.length - 1 + (g.turn ? 1 : 0)) };
+    }
+  } else if (i.event.type === "assistant_text") {
+    let fence = false;
+    for (const line of str(i.event.text).split("\n")) {
+      if (line.startsWith("```")) fence = !fence;
+      if (fence || line.startsWith("```")) rows += 1; // a fence doesn't wrap: it scrolls in itself
+      else if (!line.trim()) rows += 0.4;
+      else wraps(line);
+    }
+  } else rows += 1;
+  const size = { rows, chars };
+  sizes.set(i, size);
+  return size;
 }
 
 /** One line of a turn, fading in if it arrived while watching. */
@@ -351,7 +370,11 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       if (v.clientHeight === 0) hidden = true;
       else if (hidden) {
         hidden = false;
-        v.scrollTop = lastTop ?? (atBottomRef.current ? v.scrollHeight : 0);
+        // A jump hidden on its way down (its loop stopped) arrives now.
+        if (jumping.current) {
+          jumping.current = 0;
+          v.scrollTop = v.scrollHeight;
+        } else v.scrollTop = lastTop ?? (atBottomRef.current ? v.scrollHeight : 0);
       }
     });
     seen.observe(v);
@@ -372,7 +395,9 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
           holding.current = 1; // what's above it drawn again: SETTLE_FRAMES more from here
           heldTop.current = v.scrollTop;
         }
-      } else if (settling.current > 0 && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
+      }
+      // Following, a page on its way or not.
+      if (settling.current > 0 && atBottomRef.current && holding.current <= 0) v.scrollTo({ top: v.scrollHeight });
     });
     if (v.firstElementChild) grown.observe(v.firstElementChild);
     // The reader taking the scroll back ends a jump and a hold (a page still on its way keeps the line they
@@ -389,9 +414,13 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     for (const t of taking) root.addEventListener(t, takeBack, { passive: true });
     const onScroll = () => {
       if (v.clientHeight === 0 || hidden) return;
+      // A jump moved back up (find-in-page, a screen reader): the reader's, so it ends. (Less than half the
+      // log is the browser's anchoring as turns it passed are drawn.)
+      if (jumping.current && lastTop !== null && v.scrollTop < lastTop - v.clientHeight / 2) jumping.current = 0;
       lastTop = v.scrollTop;
       if (held.current && holding.current === -1 && loadingRef.current) held.current = readerLine(v) ?? held.current;
-      // Scrolled by something else than the hold (find-in-page, a screen reader, focus): that's the reader's.
+      // Scrolled by something else than the hold (find-in-page, a screen reader, focus; or the browser's own
+      // anchoring, which then holds the line itself): that's the reader's.
       if (holding.current > 0 && Math.abs(v.scrollTop - heldTop.current) > 1) {
         holding.current = 0;
         held.current = null;
@@ -450,11 +479,13 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     if (canLoadRef.current && v.clientHeight > 0 && v.scrollHeight <= v.clientHeight) older();
   }, [state.older]);
 
-  // A page asked for that didn't come (it failed): nothing is on its way, so nothing is held for it.
+  // A page asked for that didn't come (it failed): nothing is on its way, so nothing is held for it, and a
+  // page that comes later (a retry asks again) isn't measured from then.
   useLayoutEffect(() => {
     if (state.olderState !== "loading" && holding.current === -1) {
       holding.current = 0;
       held.current = null;
+      heightBefore.current = null;
     }
   }, [state.olderState]);
 
@@ -496,12 +527,10 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     // move: when it stops short of the bottom, it goes on to the bottom as it is now.
     let last = -1;
     let still = 0;
+    let tries = 0;
     const tick = () => {
       if (!v || jumping.current !== mine) return; // taken back, arrived, or another jump
-      if (v.clientHeight === 0) {
-        jumping.current = 0; // hidden: it's shown again where it was
-        return;
-      }
+      if (v.clientHeight === 0) return; // hidden: it arrives when shown again (the ResizeObserver above)
       if (v.scrollHeight - v.scrollTop - v.clientHeight <= 1) {
         jumping.current = 0;
         return;
@@ -509,6 +538,11 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       still = v.scrollTop === last ? still + 1 : 0;
       last = v.scrollTop;
       if (still >= SETTLE_FRAMES) {
+        // Each time only what it passed was drawn anew, so a few tries reach it; past those it stops.
+        if (++tries > JUMP_TRIES) {
+          jumping.current = 0;
+          return;
+        }
         still = 0;
         v.scrollTo({ top: v.scrollHeight, behavior: "smooth" });
       }
