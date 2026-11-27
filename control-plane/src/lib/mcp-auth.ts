@@ -872,6 +872,14 @@ export class OAuthStore {
   /** Revocations of every record of an API client (`revokePrefix` with a client), by client id, since this object started. */
   private readonly clientRevocations = new Map<string, number>();
 
+  /**
+   * Forget the registrations made for one redirect URI: a deleted API client's own (`oauthUrls` with its id), once
+   * its records' tokens were revoked (revoking authenticates as the registered client). Answers how many went.
+   */
+  forgetRegistrations(redirectUri: string): number {
+    return this.d.sql.exec("DELETE FROM oauth_clients WHERE redirect_uri = ?", redirectUri).rowsWritten;
+  }
+
   /** Writes' revocations per client entry (`clientOAuthEntryPrefix`), and the record each kept, since this object started. */
   private readonly writeRevocations = new Map<string, { count: number; keep: string | null }>();
 

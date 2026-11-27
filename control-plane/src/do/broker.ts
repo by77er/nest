@@ -4,7 +4,7 @@ import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
-import { CLIENT_OAUTH_PREFIX, clientOAuthClientPrefix, isClientMcpAuth, clientOAuthEntryPrefix, clientOAuthRef, clientOfRef, type OAuthAudit, type OAuthStatus, OAuthStore, type ServerRevocation, type StartAnswer, type StartInput } from "../lib/mcp-auth";
+import { CLIENT_OAUTH_PREFIX, clientOAuthClientPrefix, isClientMcpAuth, oauthUrls, clientOAuthEntryPrefix, clientOAuthRef, clientOfRef, type OAuthAudit, type OAuthStatus, OAuthStore, type ServerRevocation, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import { isClientId } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
@@ -515,7 +515,11 @@ export class BrokerDO extends DurableObject<Env> {
   /** A deleted client's secrets, all of them, and its own OAuth authorizations (revoked at their servers in the background). */
   async deleteClientSecrets(client: string): Promise<number> {
     // Its records go in this call's synchronous first step; the revocations at the servers follow.
-    this.ctx.waitUntil(this.oauth.revokePrefix(clientOAuthClientPrefix(client), "client_deleted", { client }).then(() => undefined, (e: unknown) => {
+    // Then its own registrations (one per authorization server it used), once the revocations, which
+    // authenticate as them, are done: nothing of a deleted client's is left in `oauth_clients`.
+    this.ctx.waitUntil(this.oauth.revokePrefix(clientOAuthClientPrefix(client), "client_deleted", { client }).then(() => {
+      this.oauth.forgetRegistrations(oauthUrls(this.env.PUBLIC_BASE_URL, client).redirect_uri);
+    }, (e: unknown) => {
       console.error("BrokerDO: revoking a deleted client's OAuth tokens", e);
     }));
     const names = this.sql.exec<{ name: string }>("SELECT name FROM client_secrets WHERE client = ?", client).toArray().map((r) => r.name);

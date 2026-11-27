@@ -1108,7 +1108,8 @@ describe("an API client's own mcp credentials", () => {
     f.holdExchange = true;
     const callback = SELF.fetch(back).then((r) => r.text());
     await eventually("the code exchange to reach the server", () => f.exchangeHeld);
-    // A write cancels nothing in flight: only the callback's own check stops these tokens.
+    // The write's revocation counts against this callback (it keeps another incarnation), and the catalog
+    // check would refuse it too; each alone is tested below.
     await putCap(c, "moving", g, { authorize: true });
     f.holdExchange = false;
     expect(await callback).toContain("revoked while its code was being exchanged");
@@ -1307,6 +1308,68 @@ describe("an API client's own mcp credentials", () => {
     }
     // R1 came back late, saw a newer write, read again: h's authorization stays.
     expect((await asJson(c.token, `/v1/catalog/capabilities/${name}/oauth`)).status).toBe("authorized");
+  });
+
+  it("the callback's catalog check alone: a flow started for an incarnation a write already replaced stores nothing", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    const old = (await putCap(c, "stale", f, { authorize: true })).mcp.auth.incarnation as string;
+    await putCap(c, "stale", g, { authorize: true });
+    // A start that read the catalog before the write but reaches BrokerDO after it (its counts already moved).
+    const start = await broker().clientOAuthStart({ client: c.id, clientName: c.name, capability: `${c.name}/stale`, entry: "stale", incarnation: old, url: f.server });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    expect(await (await SELF.fetch(back)).text()).toContain("revoked while its code was being exchanged");
+    expect(await entryRow(c, "stale")).toBeUndefined();
+  });
+
+  it("the callback fails closed when CatalogDO can't answer", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "down", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/down/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    const { CatalogDO: Catalog } = await import("../src/do/catalog");
+    const real = Catalog.prototype.entry;
+    Catalog.prototype.entry = async function () {
+      throw new Error("catalog unavailable");
+    };
+    try {
+      expect(await (await SELF.fetch(back)).text()).toContain("Not authorized");
+    } finally {
+      Catalog.prototype.entry = real;
+    }
+    expect(await entryRow(c, "down")).toBeUndefined();
+  });
+
+  it("DELETE …/oauth while a person still has the authorize URL open: finishing it later stores nothing", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "open", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/open/oauth`, { method: "POST" });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/open/oauth`, { method: "DELETE" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    expect(await (await SELF.fetch(back)).text()).toContain("unknown or expired state");
+    expect(await entryRow(c, "open")).toBeUndefined();
+  });
+
+  it("deleting a client forgets its registrations, once its tokens are revoked", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: true, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "reg", f, { authorize: true });
+    await clientAuthorize(c, "reg");
+    const registrations = () => runInDurableObject(broker(), (_: BrokerDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM oauth_clients WHERE redirect_uri = ?", `${NEST}/v1/oauth/callback/${c.id}`).toArray().length);
+    expect(await registrations()).toBe(1);
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
+    await eventually("the deleted client's registration forgotten", async () => (await registrations()) === 0);
+    // Its token was revoked first, as the registered client.
+    expect(f.revocations).toHaveLength(1);
   });
 
   it("deleting the capability revokes its tokens, and so does deleting the client", async () => {
