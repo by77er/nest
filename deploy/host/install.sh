@@ -13,8 +13,8 @@ REGION="@REGION@"
 CLAUDE_VERSION="2.1.325"
 # cloudflared: the host's Cloudflare Tunnel, run by nestd when enrollment hands it a tunnel token.
 # A GitHub release binary, pinned by version and checksum (never committed to the repo).
-CLOUDFLARED_VERSION="2026.10.3"
-CLOUDFLARED_SHA256="053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0"
+CLOUDFLARED_VERSION="2026.11.2"
+CLOUDFLARED_SHA256="56f13335143ec0e22772963290683a84a04114a35ec64cbc794a4d39ff9bb8cf"
 PACKAGES="nftables iproute util-linux bubblewrap e2fsprogs xfsprogs zstd"
 export HOME=/root
 
