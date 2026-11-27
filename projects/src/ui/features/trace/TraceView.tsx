@@ -259,6 +259,40 @@ const fadesIn = (g: TurnGroup, after: number) => {
   return newest !== undefined && newest !== null && newest > after ? after : Number.POSITIVE_INFINITY;
 };
 
+/** The line being read: the first of a turn's lines not wholly above the log's top, and where it was. */
+type Held = { line: Element; y: number; next: Element | null; yNext: number };
+
+function readerLine(v: HTMLElement): Held | null {
+  const top = v.getBoundingClientRect().top;
+  for (const t of v.querySelectorAll("[data-turn]")) {
+    if (t.getBoundingClientRect().bottom <= top) continue;
+    let line: Element = t;
+    for (const c of t.children) {
+      if (c.getBoundingClientRect().bottom > top) {
+        line = c;
+        break;
+      }
+    }
+    // Its turn's next, too: a page that ends inside the first turn makes that turn again (a new element).
+    const next = t.nextElementSibling;
+    return { line, y: line.getBoundingClientRect().top - top, next, yNext: next ? next.getBoundingClientRect().top - top : 0 };
+  }
+  return null;
+}
+
+/** Scrolls `v` so `h`'s line (or its turn's next, if the line was made again) is back where it was; false if neither is there. */
+function restore(v: HTMLElement, h: Held): boolean {
+  if (!h.line.isConnected && h.next?.isConnected) {
+    h.line = h.next;
+    h.y = h.yNext;
+    h.next = null;
+  }
+  if (!h.line.isConnected) return false;
+  const d = h.line.getBoundingClientRect().top - v.getBoundingClientRect().top - h.y;
+  if (Math.abs(d) >= 0.5) v.scrollTop += d;
+  return true;
+}
+
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
 export function TraceLog({ title, state, loadOlder = () => {} }: { title: string; state: TraceState; loadOlder?: () => void }) {
   const { fill, untitled } = useFillColumn();
@@ -275,9 +309,12 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
-  // Following: new lines arrived and are still being drawn (SETTLE_FRAMES); jumping: "Jump to live" is on its way down.
+  // Following: new lines arrived and are still being drawn (SETTLE_FRAMES). Jumping: "Jump to live" is on its
+  // way down. Held: the line being read when a page was asked for above, kept in place while it's drawn.
   const settling = useRef(0);
   const jumping = useRef(false);
+  const held = useRef<Held | null>(null);
+  const holding = useRef(0);
   const [unseen, setUnseen] = useState(0);
   const seen = useRef(state.last);
   const heightBefore = useRef<number | null>(null);
@@ -290,6 +327,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const older = () => {
     const v = viewport.current;
     heightBefore.current = v ? v.scrollHeight : null;
+    held.current = v ? readerLine(v) : null;
     load.current();
   };
 
@@ -309,19 +347,23 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       }
     });
     seen.observe(v);
-    // The log's content resized. While what just arrived is drawn, the log stays at the bottom it follows; a
-    // jump goes on to the bottom as it is now (turns it passes are drawn on the way, at their own heights).
-    // Anything else (a result expanded, a page loaded above) leaves the reader where they are, as before.
+    // The log's content resized (before it's painted). While a page loaded above is drawn, the reader's line
+    // stays where it was; while what just arrived is drawn, the log stays at the bottom it follows. Anything
+    // else (a result expanded, a turn drawn as the reader scrolls to it) is left to the browser, as before.
     const grown = new ResizeObserver(() => {
       if (v.clientHeight === 0 || hidden) return;
-      if (jumping.current) v.scrollTo({ top: v.scrollHeight, behavior: "smooth" });
-      else if (settling.current > 0 && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
+      if (held.current && holding.current > 0) {
+        if (!restore(v, held.current)) held.current = null;
+        holding.current = 1; // drawn again: SETTLE_FRAMES more from here
+      } else if (settling.current > 0 && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
     });
     if (v.firstElementChild) grown.observe(v.firstElementChild);
-    // The reader taking the scroll back ends a jump.
+    // The reader taking the scroll back ends a jump and a hold.
     const root = v.parentElement ?? v;
     const takeBack = () => {
       jumping.current = false;
+      holding.current = 0;
+      held.current = null;
     };
     const taking = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
     for (const t of taking) root.addEventListener(t, takeBack, { passive: true });
@@ -343,6 +385,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       seen.disconnect();
       grown.disconnect();
       settling.current = 0;
+      jumping.current = false;
+      holding.current = 0;
     };
   }, []);
 
@@ -350,9 +394,29 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   useLayoutEffect(() => {
     const v = viewport.current;
     if (!v) return;
+    const h = held.current;
     if (atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
-    else if (heightBefore.current !== null) v.scrollTo({ top: v.scrollTop + v.scrollHeight - heightBefore.current });
+    else if (h && restore(v, h)) {
+      // Held while the turns around it are drawn (the ResizeObserver above): the new ones are at their
+      // estimated heights until then, which the browser's own anchoring doesn't hold the reader across.
+      holding.current = 1;
+      let quiet = 0;
+      const tick = () => {
+        if (holding.current === 0 || held.current !== h) return; // taken back, or another page asked for
+        if (holding.current === 1) {
+          holding.current = 2;
+          quiet = 0;
+        }
+        if (++quiet < SETTLE_FRAMES) requestAnimationFrame(tick);
+        else {
+          holding.current = 0;
+          held.current = null;
+        }
+      };
+      requestAnimationFrame(tick);
+    } else if (heightBefore.current !== null) v.scrollTo({ top: v.scrollTop + v.scrollHeight - heightBefore.current });
     heightBefore.current = null;
+    if (holding.current === 0) held.current = null;
     // Not enough yet to scroll (so no way to reach the top): the page before, too.
     if (canLoadRef.current && v.clientHeight > 0 && v.scrollHeight <= v.clientHeight) older();
   }, [state.older]);
@@ -386,6 +450,25 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     atBottomRef.current = true;
     setAtBottom(true);
     setUnseen(0);
+    // The turns it passes on its way down are drawn at their own heights, so the bottom it set out for can
+    // move: when it stops short of the bottom, it goes on to the bottom as it is now.
+    let last = -1;
+    let still = 0;
+    const tick = () => {
+      if (!v || !jumping.current || v.clientHeight === 0) return;
+      if (v.scrollHeight - v.scrollTop - v.clientHeight <= 1) {
+        jumping.current = false;
+        return;
+      }
+      still = v.scrollTop === last ? still + 1 : 0;
+      last = v.scrollTop;
+      if (still >= SETTLE_FRAMES) {
+        still = 0;
+        v.scrollTo({ top: v.scrollHeight, behavior: "smooth" });
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
   };
 
   const status = STATUS[state.status];
