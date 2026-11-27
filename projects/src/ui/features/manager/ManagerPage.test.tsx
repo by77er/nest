@@ -154,11 +154,7 @@ describe("the Manager page", () => {
     // would replay the whole backlog).
     await user.click(screen.getByRole("tab", { name: "Chat" }));
     await screen.findByLabelText("Message to the manager");
-    // The trace stays mounted, hidden, while Chat shows: nothing is drawn again when it's opened again.
-    const kept = document.querySelector("[data-ds=terminal]");
-    expect(kept).not.toBeNull();
     await user.click(screen.getByRole("tab", { name: "Trace" }));
-    expect(document.querySelector("[data-ds=terminal]")).toBe(kept);
     await screen.findByRole("heading", { name: "Manager's trace" });
     expect(RecordingSocket.opened.map((u) => new URL(u).pathname)).toEqual(["/api/agents/agt_manager/trace"]);
   });

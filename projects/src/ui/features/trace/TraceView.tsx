@@ -400,8 +400,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     const v = viewport.current;
     if (!v) return;
     // Hidden (a tab switched away: `display: none`), the log has no height and the browser may drop its
-    // scroll position: what the reader had is kept, and put back when it shows again (at the bottom, if they
-    // were following it: with what came while it was hidden).
+    // scroll position: what the reader had is kept, and put back when it shows again.
     // Shown for the first time (it mounted hidden), it starts at the newest line, as it would have.
     let hidden = false;
     let lastTop: number | null = null;
@@ -413,7 +412,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
         if (jumping.current) {
           jumping.current = 0;
           v.scrollTop = v.scrollHeight;
-        } else v.scrollTop = atBottomRef.current ? v.scrollHeight : (lastTop ?? 0); // following: what came meanwhile too
+        } else v.scrollTop = lastTop ?? (atBottomRef.current ? v.scrollHeight : 0);
       }
     });
     seen.observe(v);
