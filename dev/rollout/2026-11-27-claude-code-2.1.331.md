@@ -11,8 +11,8 @@
 
   Normally no release is built. Its inputs (`crates/`, `protocol/`, the Cargo files, the toolchain, `.cargo/`, `scripts/publish-release.sh`) are unchanged, so the release job's `release-inputs-<digest>` cache marker hits. If that marker was evicted, the job rebuilds, and `publish-release.sh` publishes nothing only if the binaries come out byte-identical.
 
-  Without a publish, no host AMI build starts. The AMI the launch templates resolve then keeps whatever version it was built with: 2.1.325 if a build ran after that pin's apply, or 2.1.301 if not. Every host installs the pin at boot either way.
-- **Right after the apply, start a host AMI build.** It needs the owner's AWS access. The commands are the ones `deploy.yml`'s release job runs:
+  Without a publish, no host AMI build starts, and the AMI the launch templates resolve keeps the version it was built with. That is most likely 2.1.325: the deploy of `34eab2e` (#316, 2026-11-19), after the 2.1.325 pin, ran the release job's "Host AMI" step. That shows a build was started, not that it finished. Every host installs the pin at boot either way.
+- **Right after the apply, start a host AMI build.** It needs the owner's AWS access. The first two commands are the ones `deploy.yml`'s release job runs (it also runs `scripts/prune-images.sh` before them); the last two wait for the build and read the new AMI's id:
 
   ```bash
   arn=$(aws imagebuilder list-image-pipelines --region us-east-1 --query "imagePipelineList[?name=='nest-use1-host'].arn | [0]" --output text)
@@ -25,7 +25,7 @@
 
   This applies to both host kinds, though only brain hosts run Claude Code. Every boot therefore depends on Anthropic's download host: `bootstrap.sh` runs `install.sh` under `set -e`. If a download fails, the host never enrolls, the launch ends in `enroll_timeout`, and it counts toward the enrolment breaker.
 - **When a host gets 2.1.331:** at launch, after the apply, from user data or from the new AMI once built. A host that is already running keeps its version until it is replaced (idle retirement, spot loss, autoscaling). That is 2.1.325, or 2.1.301 on a host launched before the 2.1.325 apply that is still running. Check for those too ([the 2.1.325 rule](2026-11-18-claude-code-2.1.325.md)).
-- **A mixed fleet:** both host sets run the same nest release, and brain placement doesn't look at Claude Code versions. It prefers the host that ran the agent last, or else the fullest brain host with room ([brain hosts](../../docs/compute/brain-hosts/)). So until the last 2.1.325 brain host is gone, a session can cross versions in either direction:
+- **A mixed fleet:** brain placement doesn't look at Claude Code versions. It skips a host of the previous nest release (by its hello), but an older host whose nest release is current is a candidate like any other. It prefers the host that ran the agent last, or else the fullest brain host with room ([brain hosts](../../docs/compute/brain-hosts/)). So until the last 2.1.325 brain host is gone, a session can cross versions in either direction:
   - **Written by 2.1.325, resumed by 2.1.331:** this is the upgrade gate (resuming the previous baseline's sessions, [runner](../../docs/agents/runner/)). The owner checks it before approving.
 
     **The owner runs all three gates:** the `claude-verify` probes, the hands fidelity eval and this resume. Each needs a real turn on the owner's subscription token. That token never enters a VM ([AGENTS.md](../../AGENTS.md), invariant 1), so no agent can run them. The owner's approval of this change records that they passed.
