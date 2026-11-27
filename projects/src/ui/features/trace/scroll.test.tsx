@@ -164,8 +164,13 @@ describe("the trace's scroll, as its turns are drawn", () => {
     heights.set("h11.0", 63).set("h12.0", 41);
     drawn();
     expect(at(READ)).toBe(y);
-    frame();
+    // Still held three frames on (each draw that moved it starts the count again), to the pixel.
+    frame(3);
     heights.set("h13.0", 7);
+    drawn();
+    expect(at(READ)).toBe(y);
+    frame(3);
+    heights.set("h12.0", 43);
     drawn();
     expect(at(READ)).toBe(y);
     // Once it's settled, a turn drawn as the reader scrolls is the browser's to anchor, as before.
@@ -265,6 +270,14 @@ describe("the trace's scroll, as its turns are drawn", () => {
     heights.set("s41", 80);
     drawn();
     expect(scroll.top).toBe(total() - VIEW);
+    // Scrolled up while it's drawn: no longer followed.
+    rerender(state([...ring, ev(41, "assistant_text", { text: "new" }), ev(42, "assistant_text", { text: "newer" })]));
+    scrolled(total() - VIEW - 200);
+    const up = scroll.top;
+    heights.set("s42", 90);
+    drawn();
+    expect(scroll.top).toBe(up);
+    scrolled(total() - VIEW);
     // Long after, content growing (a result expanded) leaves the reader where they are.
     frame(5);
     const top = scroll.top;
@@ -311,10 +324,22 @@ describe("the trace's scroll, as its turns are drawn", () => {
     scroll.top = 300;
     hiddenLog = true;
     drawn();
-    frame(3);
+    frame(60);
     hiddenLog = false;
     drawn();
     expect(scroll.top).toBe(total() - VIEW);
+  });
+
+  it("stops following what's being drawn at the reader's wheel, before the log has moved", () => {
+    const rerender = show(state(ring));
+    layOut();
+    scrolled(total() - VIEW);
+    rerender(state([...ring, ev(41, "assistant_text", { text: "new" })]));
+    const top = scroll.top;
+    act(() => viewport().parentElement!.dispatchEvent(new Event("wheel")));
+    heights.set("s41", 80);
+    drawn();
+    expect(scroll.top).toBe(top);
   });
 
   it("goes on to the bottom when Jump to live stops short of it, the bottom having moved", async () => {

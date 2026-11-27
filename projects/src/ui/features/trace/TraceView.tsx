@@ -339,8 +339,6 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const held = useRef<Held | null>(null);
   const holding = useRef(0);
   const heldTop = useRef(0); // where the hold last put the log
-  const loadingRef = useRef(false);
-  loadingRef.current = state.olderState === "loading";
   const [unseen, setUnseen] = useState(0);
   const seen = useRef(state.last);
   const heightBefore = useRef<number | null>(null);
@@ -384,9 +382,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     const grown = new ResizeObserver(() => {
       if (v.clientHeight === 0 || hidden) return;
       // Turns drawn while the page is on its way: the line is where the reader now sees it.
-      if (held.current && holding.current === -1) {
-        if (loadingRef.current) held.current = readerLine(v) ?? held.current;
-      } else if (held.current && holding.current > 0) {
+      if (held.current && holding.current === -1) held.current = readerLine(v) ?? held.current;
+      else if (held.current && holding.current > 0) {
         const moved = restore(v, held.current);
         if (moved === null) {
           holding.current = 0;
@@ -397,14 +394,15 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
         }
       }
       // Following, a page on its way or not.
-      if (settling.current > 0 && atBottomRef.current && holding.current <= 0) v.scrollTo({ top: v.scrollHeight });
+      if (settling.current > 0 && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
     });
     if (v.firstElementChild) grown.observe(v.firstElementChild);
-    // The reader taking the scroll back ends a jump and a hold (a page still on its way keeps the line they
-    // scroll to).
+    // The reader taking the scroll back ends a jump, a hold and following what's being drawn (a page still
+    // on its way keeps the line they scroll to).
     const root = v.parentElement ?? v;
     const takeBack = () => {
       jumping.current = 0;
+      settling.current = 0;
       if (holding.current > 0) {
         holding.current = 0;
         held.current = null;
@@ -418,7 +416,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       // log is the browser's anchoring as turns it passed are drawn.)
       if (jumping.current && lastTop !== null && v.scrollTop < lastTop - v.clientHeight / 2) jumping.current = 0;
       lastTop = v.scrollTop;
-      if (held.current && holding.current === -1 && loadingRef.current) held.current = readerLine(v) ?? held.current;
+      if (held.current && holding.current === -1) held.current = readerLine(v) ?? held.current;
       // Scrolled by something else than the hold (find-in-page, a screen reader, focus; or the browser's own
       // anchoring, which then holds the line itself): that's the reader's.
       if (holding.current > 0 && Math.abs(v.scrollTop - heldTop.current) > 1) {
