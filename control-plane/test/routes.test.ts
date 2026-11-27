@@ -20,6 +20,8 @@ const NOT_ADMIN = {
   "GET /v1/oauth/callback": "none",
   // nest's client ID metadata document, fetched by authorization servers: public by design.
   "GET /v1/oauth/client.json": "none",
+  "GET /v1/oauth/callback/:client": "none",
+  "GET /v1/oauth/clients/:file": "none",
   // The caller identity's public keys, fetched by MCP servers that verify Nest-Identity: public by design.
   "GET /.well-known/jwks.json": "none",
   // An API client's token is accepted too, on its own subtree (docs/control-plane/api/clients/; test/clients.test.ts).
@@ -32,6 +34,8 @@ const NOT_ADMIN = {
     "GET /v1/sandboxes/:sandbox/policy", "GET /v1/sandboxes/:sandbox/client-policy", "PUT /v1/sandboxes/:sandbox/client-policy",
     "GET /v1/catalog",
     ...["GET", "PUT", "DELETE"].flatMap((m) => ["templates", "capabilities"].map((k) => `${m} /v1/catalog/${k}/:ns/:entry`)),
+    // A client authorizes its own `{authorize}` capability (docs/control-plane/api/clients/#mcp-credentials).
+    ...["POST", "GET", "DELETE"].map((m) => `${m} /v1/catalog/capabilities/:ns/:entry/oauth`),
     // A client's own (test/client-events.test.ts): the operator has no `self`.
     "GET /v1/clients/self", "PUT /v1/clients/self/webhook",
     // Its own secrets (test/client-secrets.test.ts): write-only values, a listing of names.

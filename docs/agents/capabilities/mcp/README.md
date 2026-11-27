@@ -11,7 +11,7 @@ prompt: The notes server.
 ```
 
 - **`url`:** `https` only, no credentials or fragment. A loopback host (`127.0.0.1`, `localhost`, `[::1]`, `http` or `https`) only where the Worker has `ALLOW_LOOPBACK_MCP=1` (tests and local dev, as in e2e). Checked when the capability is written and again at each use.
-- **`auth`:** the BrokerDO secret holding the bearer token, `cap:<name>`, stored with `PUT /v1/admin/secrets/cap:<name>`. Only AgentDO (for calls) and the server's connector (for listing) read it, both through `mcpToken` (`mcpBearer`: the secret, or the OAuth access token); `cap:` never resolves into a host command. Or the [oauth form](#oauth), `{oauth: cap:<name>, client?: cap:<name>, scopes?: [...]}`. Or absent: [no bearer](#no-bearer).
+- **`auth`:** the BrokerDO secret holding the bearer token, `cap:<name>`, stored with `PUT /v1/admin/secrets/cap:<name>`. Only AgentDO (for calls) and the server's connector (for listing) read it, both through `mcpToken` (`mcpBearer`: the secret, or the OAuth access token); `cap:` never resolves into a host command. Or the [oauth form](#oauth), `{oauth: cap:<name>, client?: cap:<name>, scopes?: [...]}`. Or, in an API client's namespace only, one of its own: `{secret: <name>}` or `{authorize: true, scopes?}` ([mcp credentials](../../../control-plane/api/clients/#mcp-credentials)). Or absent: [no bearer](#no-bearer).
 - **`tools`:** the allowlist. Absent: whatever the server lists (at most 128 per capability).
 - **`idempotent`:** the operator's override of the server's annotations: a list of tools that are idempotent, or a map of tool to whether it is. Otherwise a tool is idempotent when the server marks it `readOnlyHint` or `idempotentHint` ([annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)), else not.
 - **`read_only`:** the tools that aren't [sinks](#sinks), as a list or a map like `idempotent`.
@@ -99,7 +99,7 @@ mcp: {url: https://mcp.example.com/mcp, auth: {oauth: cap:notes, client: cap:not
 - **`oauth`** (required) names the BrokerDO record that holds this capability's tokens; nest writes it, the operator doesn't. It is not in BrokerDO's `secrets`, so a previous release, reading `auth` as a static secret, finds nothing and sends nothing.
 - **`client`** (optional) names a BrokerDO secret holding a pre-registered client, `{"client_id", "client_secret"?, "token_endpoint_auth_method"?}`. It must differ from `oauth`.
 - **`scopes`** (optional) is what to ask for. Without it, nest asks for the 401 challenge's `scope`, then the resource metadata's `scopes_supported`, then nothing, as the spec's scope selection says. The start route's `{"scopes": [...]}` overrides both, for a step-up.
-- **Authorizing (the operator, once):**
+- **Authorizing (the operator, once; an API client authorizes its own `{authorize}` capabilities the same way through its namespace routes, [mcp credentials](../../../control-plane/api/clients/#mcp-credentials)):**
   1. `POST /v1/admin/capabilities/<name>/oauth` discovers the server and answers `{authorize_url, expires_ms, client, resource, issuer, scopes}`.
   2. The operator opens `authorize_url` and approves.
   3. The authorization server redirects the browser to `<PUBLIC_BASE_URL>/v1/oauth/callback`, which exchanges the code and answers a page that holds no token.
@@ -111,7 +111,7 @@ mcp: {url: https://mcp.example.com/mcp, auth: {oauth: cap:notes, client: cap:not
   - Every URL is `https` (loopback `http` only with `ALLOW_LOOPBACK_MCP=1`); redirects aren't followed; each exchange has 10 s and 64 KiB.
 - **Client identity, in the spec's order:**
   1. The pre-registered `client`. It authenticates with `client_secret_basic`, or with `client_secret_post` when the server lists only that.
-  2. **nest's client ID metadata document**, when the server advertises `client_id_metadata_document_supported` and `PUBLIC_BASE_URL` is https. The Worker serves it at `/v1/oauth/client.json`, and that URL is the client id: a public client (`none`), with the callback as its only redirect URI ([draft-ietf-oauth-client-id-metadata-document-00](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00)).
+  2. **nest's client ID metadata document** (an API client's flows use its own, [mcp credentials](../../../control-plane/api/clients/#mcp-credentials)), when the server advertises `client_id_metadata_document_supported` and `PUBLIC_BASE_URL` is https. The Worker serves it at `/v1/oauth/client.json`, and that URL is the client id: a public client (`none`), with the callback as its only redirect URI ([draft-ietf-oauth-client-id-metadata-document-00](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00)).
   3. [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) registration as a public client, once per authorization server, kept in BrokerDO.
   4. Otherwise the start fails and says to register a client by hand.
 

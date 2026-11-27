@@ -20,7 +20,10 @@ export const ClientSecretPut = z.strictObject({
    */
   expires_at: z.iso.datetime({ offset: true }).optional(),
 });
-/** Where BrokerDO keeps a client's secret value (its `secrets` table): only `secrets_update` resolves the prefix. */
+/**
+ * Where BrokerDO keeps a client's secret value (its `secrets` table). Resolved only by `secrets_update` (injection)
+ * and by `capabilityToken`, for a `{secret}` mcp capability of the same client (docs/control-plane/api/clients/#mcp-credentials).
+ */
 export const CLIENT_SECRET_PREFIX = "client-secret:";
 export const clientSecretKey = (client: string, name: string) => `${CLIENT_SECRET_PREFIX}${client}:${name}`;
 /** A grant's default ceiling on secrets: none stored, 4 KiB each. */

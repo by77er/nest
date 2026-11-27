@@ -1,0 +1,17 @@
+# Client-owned MCP credentials (2026-11-27)
+
+[MCP credentials](../../docs/control-plane/api/clients/README.md#mcp-credentials): `{secret}` and `{authorize}` auth in a client's capabilities, and the client's `…/oauth` routes.
+
+- **Not a one-way deploy, and no ordering constraint.** No new Durable Object class, table or column. BrokerDO's existing `oauth_grants` and `oauth_flows` rows hold the new records, under refs a previous release never writes (`client-oauth:<cli>:<entry>:<incarnation>`). Agent specs keep the existing `McpGrant` shape.
+- **In the gap after the Worker deploys,** before every Durable Object runs this release (the usual minutes):
+  - The new routes call new BrokerDO methods; on a BrokerDO still on the previous release they answer 503 `internal`, retryable (`newMethod`).
+  - Every write and delete of a client's capability (any client's, the projects app's included) also revokes through BrokerDO. Until BrokerDO runs this release, each does its catalog part and then answers 503 `internal`, retryable; the same request again finishes. An app that writes its catalog at deploy (the projects app's sync) may see that for the gap's minutes.
+  - The new public routes (`/v1/oauth/callback/<cli>`, `/v1/oauth/clients/<cli>.json`) answer as soon as the Worker runs this release. A callback there needs BrokerDO's new `oauthCallback` (503 until then).
+  - Writing a capability with either new form to a CatalogDO still on the previous release is refused (400: its schema doesn't know them). It succeeds again once CatalogDO runs this release.
+  - An agent whose BrokerDO is still on the previous release fails these calls with `forbidden` (`not a capability credential`), never sending a wrong bearer. An AgentDO of the previous release with a BrokerDO of this one works: the spec's grant shape is unchanged.
+- **A `wrangler rollback`:**
+  - CatalogDO logs and skips each capability holding `{secret}` or `{authorize}` (it can't parse them), keeping the rows. Templates listing one don't expand, so their spawns fail until the roll-forward, which reads the rows again.
+  - BrokerDO refuses the derived refs as bearers, so these agents' calls fail closed. The stored OAuth records stay and serve again after the roll-forward.
+  - A client capability deleted, or written with another URL or form, under the rolled-back Worker isn't revoked. Its records stay but are never served: a capability made again under the entry gets a new incarnation, and `DELETE …/oauth` (or deleting it again) after the roll-forward revokes them.
+  - The previous release's client delete doesn't revoke a client's OAuth records. They are unreachable (their client id is gone, and a new client gets a new id) and expire at their servers.
+- **No shim to drop.**

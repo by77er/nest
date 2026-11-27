@@ -12,7 +12,7 @@ import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, EntryName, OperatorOverrides, RemovedRepoFields, type SpawnerOverrides, type Template, TemplateInput } from "./lib/spec";
 import { cellIdleTtlMs, MIN_IDLE_TTL_MS, OPERATOR_ENDER } from "./lib/lifetimes";
 import {
-  CLIENT_ID, ClientName, grantForPreviousRelease, GrantInput, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
+  CLIENT_ID, ClientName, grantForPreviousRelease, GrantInput, grantRefusal, isAgentId, Labels, mcpUrlAllowed, newClientToken, parseClientToken,
   parseLabelFilters, tokenHash,
 } from "./lib/clients";
 import type { ClientScope } from "./do/catalog";
@@ -26,7 +26,7 @@ import { ClientEgress, egressOutsideGrant } from "./lib/client-egress";
 import { ClientGuards } from "./lib/client-guards";
 import { SandboxEnv, unboundPlaceholders } from "./lib/sandbox-env";
 import { TimerName } from "./lib/timers";
-import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
+import { clientMetadataDocument, isClientMcpAuth, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { EgressBaseInput, Port, SandboxPolicyLayerInput } from "./do/sandbox";
 import { type AgentDO, type CreateAgent, type RestartResult, TRACE_HEADER } from "./do/agent";
@@ -297,10 +297,43 @@ async function oauthCapability(env: Env, raw: string) {
   const cap = (await catalog(env).catalog()).capabilities[name];
   if (!cap) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown capability ${name}`, 404);
   const mcp = cap.mcp;
-  if (!mcp || mcp.auth === undefined || typeof mcp.auth === "string") {
+  if (!mcp || mcp.auth === undefined || typeof mcp.auth === "string" || !("oauth" in mcp.auth)) {
     throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name} is not an mcp capability with auth {oauth: cap:<name>}`, 409);
   }
   return { name, mcp: { ...mcp, auth: mcp.auth } };
+}
+
+/**
+ * A client's mcp capability whose `auth` is `{authorize}` (404 for an unknown one, 409 for any other), within
+ * its client's grant as it is now (`mcp_urls`: 403).
+ */
+async function clientOAuthCapability(c: { env: Env; caller: Caller; p: { ns: string; entry: string } }) {
+  const scope = await namespaceScope(c, c.p.ns);
+  const name = `${c.p.ns}/${c.p.entry}`;
+  const mcp = (await catalog(c.env).catalog()).capabilities[name]?.mcp;
+  if (!mcp) throw new NestError(ErrorCodes.NOT_FOUND, `no mcp capability ${name}`, 404);
+  const auth = mcp.auth;
+  if (!isClientMcpAuth(auth) || !("authorize" in auth)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name}'s auth isn't {authorize: true}`, 409);
+  if (!mcpUrlAllowed(scope.grant, mcp.url)) throw new NestError(ErrorCodes.FORBIDDEN, `${name}: ${mcp.url} is outside ${scope.client}'s grant (mcp_urls)`, 403);
+  return { scope, name, url: mcp.url, scopes: auth.scopes, incarnation: auth.incarnation ?? "0" };
+}
+
+/** An `{authorize}` capability's incarnation, or null for any other. */
+function incarnationOf(cap: Capability | undefined): string | null {
+  const auth = cap?.mcp?.auth;
+  return isClientMcpAuth(auth) && "authorize" in auth ? (auth.incarnation ?? "0") : null;
+}
+
+/**
+ * Revoke a client's entry's OAuth records: all of them (a delete), or all but the incarnation the capability
+ * holds now (`keep`, a write). One that can't run yet is a retryable 503: the same request again finishes it.
+ */
+async function revokeEntry(env: Env, client: string, name: string, entry: string, o?: { keep: string | null }): Promise<void> {
+  try {
+    await newMethod("BrokerDO.clientOAuthRevoke", () => broker(env).clientOAuthRevoke(client, name, entry, o));
+  } catch (e) {
+    throw new NestError(ErrorCodes.INTERNAL, `${name}'s earlier OAuth authorizations aren't revoked yet (${e instanceof Error ? e.message : String(e)}): send the same request again`, 503, true);
+  }
 }
 
 const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -745,16 +778,21 @@ export const ROUTES: Route[] = [
     newMethod("BrokerDO.oauthRevoke", () => broker(env).oauthRevoke(catalogName(p.name))) }),
   // No admin token: a browser follows the authorization server's redirect here. The single-use, 10-minute
   // state names the flow the operator started, and the code is useless without that flow's PKCE verifier.
-  route({ method: "GET", path: "/v1/oauth/callback", auth: "none", run: async ({ env, url }) => {
+  ...["/v1/oauth/callback", "/v1/oauth/callback/:client"].map((path) => route({ method: "GET", path, auth: "none", run: async ({ env, url, p }) => {
     const q = url.searchParams;
     const opt = (k: string) => (q.has(k) ? { [k]: q.get(k)! } : {});
-    const r = await broker(env).oauthCallback({ ...opt("state"), ...opt("code"), ...opt("error"), ...opt("iss") });
+    // An API client's flows come back to its own path (its own client identity); the state must be one of its own.
+    const owner = (p as { client?: string }).client;
+    if (owner !== undefined && !/^cli_[A-Za-z0-9]+$/.test(owner)) throw new NestError(ErrorCodes.NOT_FOUND, "no such callback", 404);
+    const r = owner === undefined
+      ? await broker(env).oauthCallback({ ...opt("state"), ...opt("code"), ...opt("error"), ...opt("iss") })
+      : await newMethod("BrokerDO.oauthCallback", () => broker(env).oauthCallback({ ...opt("state"), ...opt("code"), ...opt("error"), ...opt("iss") }, owner));
     const page = `<!doctype html><meta charset="utf-8"><title>nest</title><p>${escapeHtml(r.ok ? `${r.message}. You can close this tab.` : `Not authorized: ${r.message}`)}</p>`;
     // The query held a code: never sent on as a Referer, never cached.
     return new Response(page, {
       status: r.ok ? 200 : 400, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer" },
     });
-  } }),
+  } })),
   // The caller identity's public keys (docs/control-plane/api/clients/#caller-identity-for-mcp-servers):
   // what an MCP server verifies `Nest-Identity` against. A next key is listed a day before it signs.
   route({ method: "GET", path: "/.well-known/jwks.json", auth: "none", run: async ({ env }) =>
@@ -762,6 +800,15 @@ export const ROUTES: Route[] = [
   // nest's client ID metadata document: its URL is the client id an authorization server fetches.
   route({ method: "GET", path: "/v1/oauth/client.json", auth: "none", run: async ({ env }) =>
     json(clientMetadataDocument(env.PUBLIC_BASE_URL), 200, { "cache-control": "public, max-age=300" }) }),
+  // An API client's own client ID metadata document (docs/control-plane/api/clients/#mcp-credentials): its
+  // name for consent screens, and its own callback. Public, as the authorization server fetches it; a client
+  // that doesn't exist (or is being deleted) has none.
+  route({ method: "GET", path: "/v1/oauth/clients/:file", auth: "none", run: async ({ env, p }) => {
+    const id = /^(cli_[A-Za-z0-9]+)\.json$/.exec(p.file)?.[1];
+    const row = id ? await directory(env).nameOf(id) : null;
+    if (!id || !row || row.phase !== "live") throw new NestError(ErrorCodes.NOT_FOUND, "no such client", 404);
+    return json(clientMetadataDocument(env.PUBLIC_BASE_URL, { id, name: row.name }), 200, { "cache-control": "public, max-age=300" });
+  } }),
   route({ method: "DELETE", path: "/v1/admin/templates/:name", auth: "admin", run: ({ env, p }) => catalog(env).deleteTemplate(catalogName(p.name)) }),
 
   // Sandboxes.
@@ -1221,16 +1268,50 @@ export const ROUTES: Route[] = [
       run: async (c) => {
         const scope = await namespaceScope(c, c.p.ns);
         const name = `${c.p.ns}/${c.p.entry}`;
-        if (kind === "templates") await refuseSecretValues(c.env, c.caller, (c.body as Template).env);
-        return kind === "templates" ? catalog(c.env).putTemplate(name, c.body as Template, scope) : catalog(c.env).putCapability(name, c.body as Capability, scope);
+        if (kind === "templates") {
+          await refuseSecretValues(c.env, c.caller, (c.body as Template).env);
+          return catalog(c.env).putTemplate(name, c.body as Template, scope);
+        }
+        const stored = await catalog(c.env).putCapability(name, c.body as Capability, scope);
+        // Every authorization but the incarnation it holds now (none, when it isn't `{authorize}`) is for
+        // something else: revoked. Idempotent, so the same request again finishes one that couldn't run.
+        await revokeEntry(c.env, scope.client, name, c.p.entry, { keep: incarnationOf(stored) });
+        return stored;
       },
     }),
     route({ method: "DELETE", path: `/v1/catalog/${kind}/:ns/:entry`, auth: "owner", run: async (c) => {
-      await namespaceScope(c, c.p.ns);
+      const scope = await namespaceScope(c, c.p.ns);
       const name = `${c.p.ns}/${c.p.entry}`;
-      return kind === "templates" ? catalog(c.env).deleteTemplate(name) : catalog(c.env).deleteCapability(name);
+      if (kind === "templates") return catalog(c.env).deleteTemplate(name);
+      await catalog(c.env).deleteCapability(name);
+      // Its own OAuth tokens go with it (docs/control-plane/api/clients/#mcp-credentials), whatever it held when
+      // deleted: by the entry's records, so a retried delete (the capability already gone) still revokes them.
+      await revokeEntry(c.env, scope.client, name, c.p.entry);
+      return undefined;
     } }),
   ]),
+  // A client's own OAuth for an mcp capability of its namespace whose auth is `{authorize}`
+  // (docs/control-plane/api/clients/#mcp-credentials): the client starts it here and sends a person to the
+  // URL; the authorization server redirects their browser to the same callback as the operator's. The record
+  // is derived from the client and the entry, never named. Namespace auth: the client, or the operator.
+  route({
+    method: "POST", path: "/v1/catalog/capabilities/:ns/:entry/oauth", auth: "owner", optionalBody: true, body: z.strictObject({ scopes: Scopes.optional() }),
+    run: async (c) => {
+      const { scope, name, url, scopes, incarnation } = await clientOAuthCapability(c);
+      return newMethod("BrokerDO.clientOAuthStart", () => broker(c.env).clientOAuthStart({
+        client: scope.client, clientName: scope.name, capability: name, entry: c.p.entry, incarnation, url, ...(c.body.scopes ? { scopes: c.body.scopes } : {}), ...(scopes ? { capScopes: scopes } : {}),
+      }));
+    },
+  }),
+  route({ method: "GET", path: "/v1/catalog/capabilities/:ns/:entry/oauth", auth: "owner", run: async (c) => {
+    const { scope, incarnation } = await clientOAuthCapability(c);
+    return newMethod("BrokerDO.clientOAuthStatus", () => broker(c.env).clientOAuthStatus(scope.client, c.p.entry, incarnation));
+  } }),
+  // By the record alone: it works after the capability was deleted.
+  route({ method: "DELETE", path: "/v1/catalog/capabilities/:ns/:entry/oauth", auth: "owner", run: async (c) => {
+    const scope = await namespaceScope(c, c.p.ns);
+    return newMethod("BrokerDO.clientOAuthRevoke", () => broker(c.env).clientOAuthRevoke(scope.client, `${c.p.ns}/${c.p.entry}`, c.p.entry));
+  } }),
 ];
 
 async function dispatch(req: Request, env: Env): Promise<Response> {

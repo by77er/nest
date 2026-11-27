@@ -4,6 +4,7 @@
 import { z } from "zod";
 import { InjectHost, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT } from "./client-secrets";
 import { EgressHost, egressOutsideGrant } from "./client-egress";
+import { clientOfRef, isClientMcpAuth } from "./mcp-auth";
 import type { AgentSpec, Capability } from "./spec";
 import { hex, sha256 } from "./util";
 
@@ -86,7 +87,12 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
   for (const m of spec.mcp ?? []) {
     if (!mcpUrlAllowed(grant, m.url)) out.push(`mcp url ${m.url} (${m.capability})`);
     // A server that takes no bearer (no `auth`) has no secret to cover: its caller identity is the credential.
-    if (m.auth !== undefined && !creds.has(m.auth)) out.push(`credential ${m.auth} (${m.capability})`);
+    // A client's own record (its secret, its OAuth tokens: docs/control-plane/api/clients/#mcp-credentials)
+    // needs no grant, only to be the capability's own client's: expansion derives it from the namespace.
+    const own = m.auth === undefined ? null : clientOfRef(m.auth);
+    if (own !== null) {
+      if (own !== m.client) out.push(`credential of ${own} in a capability of ${m.client ?? "the operator"} (${m.capability})`);
+    } else if (m.auth !== undefined && !creds.has(m.auth)) out.push(`credential ${m.auth} (${m.capability})`);
     if (m.oauth?.client && !creds.has(m.oauth.client)) out.push(`credential ${m.oauth.client} (${m.capability})`);
   }
   for (const b of spec.brokered ?? []) out.push(`brokered action ${b.action} (${b.capability})`);
@@ -102,7 +108,8 @@ export function capabilityOutsideGrant(name: string, cap: Capability, grant: Gra
   if (cap.mcp) {
     if (!mcpUrlAllowed(grant, cap.mcp.url)) out.push(`mcp url ${cap.mcp.url}`);
     const auth = cap.mcp.auth;
-    for (const s of auth === undefined ? [] : typeof auth === "string" ? [auth] : [auth.oauth, ...(auth.client ? [auth.client] : [])]) {
+    // A client's own form names nothing of the operator's: the record is derived from the client itself.
+    for (const s of auth === undefined || isClientMcpAuth(auth) ? [] : typeof auth === "string" ? [auth] : [auth.oauth, ...(auth.client ? [auth.client] : [])]) {
       if (!creds.has(s)) out.push(`credential ${s}`);
     }
   }

@@ -4,6 +4,7 @@
 // expansion itself is pure (lib/spec.ts).
 import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
+import { isClientMcpAuth } from "../lib/mcp-auth";
 import type { Env } from "../env";
 import { PLATFORM_TOOL_NAMES } from "../lib/registry";
 import {
@@ -32,6 +33,9 @@ const templateRow = (t: Template): string => JSON.stringify({ ...PREVIOUS_RELEAS
  * A client acting on the catalog (docs/control-plane/api/clients/#the-clients-catalog): it sees the
  * operator's entries and its own namespace, and everything it writes or spawns is held to its grant.
  */
+/** A fresh `{authorize}` incarnation: 16 random lowercase hex characters. */
+const newIncarnation = () => [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
 export interface ClientScope {
   /** Its id, `cli_…` (named in refusals). */
   client: string;
@@ -357,6 +361,19 @@ export class CatalogDO extends DurableObject<Env> {
       name: mcpPrefix(name), allowLoopback: this.env.ALLOW_LOOPBACK_MCP === "1", allowLoopbackBrokered: this.env.ALLOW_LOOPBACK_BROKERED === "1",
     });
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `capability ${name}: ${r.error}`);
+    // A client's own credential (`{secret}`, `{authorize}`) is derived from the namespace's client: the
+    // operator's namespace has none (docs/control-plane/api/clients/#mcp-credentials).
+    if (cap.mcp && isClientMcpAuth(cap.mcp.auth) && !name.includes("/")) {
+      throw new NestError(ErrorCodes.INVALID_MESSAGE, `capability ${name}: mcp.auth {secret} and {authorize} are for a capability in an API client's namespace`);
+    }
+    // An `{authorize}` capability's incarnation is CatalogDO's (whatever the writer sent): kept while its URL and
+    // form stay, new otherwise, so its OAuth record (`clientOAuthRef`) never outlives the capability it was for.
+    const auth = cap.mcp?.auth;
+    if (cap.mcp && isClientMcpAuth(auth) && "authorize" in auth) {
+      const prev = this.load().capabilities[name]?.mcp;
+      const held = prev?.url === cap.mcp.url && isClientMcpAuth(prev.auth) && "authorize" in prev.auth ? prev.auth.incarnation : undefined;
+      cap = { ...cap, mcp: { ...cap.mcp, auth: { ...auth, incarnation: held ?? newIncarnation() } } };
+    }
     if (scope) {
       refuseHidden(cap.spawn ?? [], scope, `capability ${name}: spawn`);
       const refusal = grantRefusal(scope.client, capabilityOutsideGrant(name, cap, scope.grant));
