@@ -151,7 +151,9 @@ export function TermProse({ children }: { children: ReactNode }) {
  * still found by find-in-page, focused, selected and read out as before. Skipped, it keeps the height it had
  * when last drawn; one not drawn yet is held at an estimate so the scrollbar barely moves when it is:
  * `rows` lines, `chars` characters of text wrapping at the log's width (`--nest-log-cols`, ScrollLog's) and
- * `gaps` gaps of `md`. The last turn (the one growing) is never skipped.
+ * `gaps` gaps of `md`. The last turn (the one growing) is never skipped. The estimate is rounded (whole rows,
+ * characters by 50, gaps by 2) so a turn growing restyles itself every few lines, not at each: a turn's own
+ * errors average out over a log, and a turn drawn once keeps its real height anyway.
  */
 export function TermTurn({ rows, chars, gaps, children, ...rest }: {
   rows: number; chars: number; gaps: number; children: ReactNode;
@@ -162,7 +164,7 @@ export function TermTurn({ rows, chars, gaps, children, ...rest }: {
       gap="md"
       className={classes.turn}
       {...rest}
-      style={{ "--nest-turn-rows": rows.toFixed(1), "--nest-turn-chars": String(Math.round(chars)), "--nest-turn-gaps": String(gaps) } as CSSProperties}
+      style={{ "--nest-turn-rows": String(Math.round(rows)), "--nest-turn-chars": String(Math.round(chars / 50) * 50), "--nest-turn-gaps": String(Math.round(gaps / 2) * 2) } as CSSProperties}
     >
       {children}
     </MantineStack>

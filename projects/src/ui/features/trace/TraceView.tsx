@@ -309,7 +309,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   // way down. Held: the line being read while a page above is on its way (holding -1) and, once it's in,
   // while the turns around it are drawn (holding 1, or 2 counting quiet frames).
   const settling = useRef(0);
-  const jumping = useRef(false);
+  const jumping = useRef(0); // the jump on its way (each its own number), or 0
+  const jumpRun = useRef(0);
   const held = useRef<Held | null>(null);
   const holding = useRef(0);
   const [unseen, setUnseen] = useState(0);
@@ -362,7 +363,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     // scroll to).
     const root = v.parentElement ?? v;
     const takeBack = () => {
-      jumping.current = false;
+      jumping.current = 0;
       if (holding.current > 0) {
         holding.current = 0;
         held.current = null;
@@ -375,7 +376,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       lastTop = v.scrollTop;
       if (held.current && holding.current === -1) held.current = readerLine(v) ?? held.current;
       const near = v.scrollHeight - v.scrollTop - v.clientHeight <= NEAR_BOTTOM;
-      if (near) jumping.current = false;
+      if (near) jumping.current = 0;
       atBottomRef.current = near;
       setAtBottom(near);
       if (near) setUnseen(0);
@@ -389,7 +390,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       seen.disconnect();
       grown.disconnect();
       settling.current = 0;
-      jumping.current = false;
+      jumping.current = 0;
       holding.current = 0;
     };
   }, []);
@@ -451,7 +452,8 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const jump = () => {
     const v = viewport.current;
     v?.scrollTo({ top: v.scrollHeight, behavior: "smooth" });
-    jumping.current = true;
+    const mine = ++jumpRun.current;
+    jumping.current = mine;
     atBottomRef.current = true;
     setAtBottom(true);
     setUnseen(0);
@@ -460,9 +462,9 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     let last = -1;
     let still = 0;
     const tick = () => {
-      if (!v || !jumping.current || v.clientHeight === 0) return;
+      if (!v || jumping.current !== mine || v.clientHeight === 0) return; // taken back, arrived, or another jump
       if (v.scrollHeight - v.scrollTop - v.clientHeight <= 1) {
-        jumping.current = false;
+        jumping.current = 0;
         return;
       }
       still = v.scrollTop === last ? still + 1 : 0;
