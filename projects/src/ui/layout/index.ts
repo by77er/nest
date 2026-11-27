@@ -5,7 +5,7 @@ export { AppFrame } from "./AppFrame";
 export { ScrollLog } from "./Chat";
 export { ChatFrame, ChatLog, ChatWelcome, CodeFrame, ComposerBox, ComposerDock, DaySeparator, MessageGroup, MessageRow, SpinnerSlot, Starter, StepField, StepList, StepRow, StepsDisclosure, type StepStatus, WorkingLine } from "./ChatLog";
 export { FadeIn } from "./FadeIn";
-export { Glyph, GLYPH, Terminal, TermLine, TermProse, TermRule, TermStatus, type TermTone } from "./Terminal";
+export { Glyph, GLYPH, Terminal, TermLine, TermProse, TermRule, TermStatus, TermTurn, type TermTone } from "./Terminal";
 export { FieldGroup } from "./FieldGroup";
 export { BadgeAnchor, CardGrid, SectionGrid, WithContext } from "./Layouts";
 export { MetaItem, MetaRow, Token } from "./Meta";

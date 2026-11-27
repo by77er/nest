@@ -6,7 +6,7 @@
 // Its rows are text-line targets (the skill's exception to the 32 px rule): a row that acts is a real
 // button as wide as its row.
 
-import { Box, UnstyledButton } from "@mantine/core";
+import { Box, Stack as MantineStack, UnstyledButton } from "@mantine/core";
 import type { CSSProperties, ReactNode } from "react";
 import classes from "./Terminal.module.css";
 
@@ -142,6 +142,30 @@ export function TermProse({ children }: { children: ReactNode }) {
     <div className={classes.md} data-ds="term-prose">
       {children}
     </div>
+  );
+}
+
+/**
+ * One turn of the transcript, its lines `md` apart. Off screen, the browser skips its style, layout and paint
+ * (`content-visibility: auto`, Terminal.module.css), so a long trace costs only what is on screen; it is
+ * still found by find-in-page, focused, selected and read out as before. Skipped, it keeps the height it had
+ * when last drawn; one not drawn yet is held at an estimate so the scrollbar barely moves when it is:
+ * `rows` lines, `chars` characters of text wrapping at the log's width (`--nest-log-cols`, ScrollLog's) and
+ * `gaps` gaps of `md`. The last turn (the one growing) is never skipped.
+ */
+export function TermTurn({ rows, chars, gaps, children, ...rest }: {
+  rows: number; chars: number; gaps: number; children: ReactNode;
+  role?: string; "aria-label"?: string; [k: `data-${string}`]: string | undefined;
+}) {
+  return (
+    <MantineStack
+      gap="md"
+      className={classes.turn}
+      {...rest}
+      style={{ "--nest-turn-rows": rows.toFixed(1), "--nest-turn-chars": String(Math.round(chars)), "--nest-turn-gaps": String(gaps) } as CSSProperties}
+    >
+      {children}
+    </MantineStack>
   );
 }
 
