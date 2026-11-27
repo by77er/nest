@@ -10,7 +10,7 @@ set -euo pipefail
 
 BUCKET="@BUCKET@"
 REGION="@REGION@"
-CLAUDE_VERSION="2.1.325"
+CLAUDE_VERSION="2.1.331"
 # cloudflared: the host's Cloudflare Tunnel, run by nestd when enrollment hands it a tunnel token.
 # A GitHub release binary, pinned by version and checksum (never committed to the repo).
 CLOUDFLARED_VERSION="2026.10.3"
