@@ -92,6 +92,9 @@
   content-visibility: auto;
   contain-intrinsic-block-size: auto calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 20px + var(--nest-turn-gaps) * var(--mantine-spacing-md));
   contain-intrinsic-block-size: auto calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 1lh + var(--nest-turn-gaps) * var(--mantine-spacing-md));
+  /* Whole pixels: a fraction would put everything below it (the bottom the log follows) between pixels,
+     where a drawn glyph's edges blur differently. */
+  contain-intrinsic-block-size: auto round(calc((var(--nest-turn-rows) + var(--nest-turn-chars) / (var(--nest-log-cols, 80) - 10)) * 1lh + var(--nest-turn-gaps) * var(--mantine-spacing-md)), 1px);
   overflow-clip-margin: var(--mantine-spacing-xs);
 }
 
