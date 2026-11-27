@@ -132,7 +132,7 @@ describe("the trace's cost", () => {
         </Profiler>
       </MantineProvider>,
     );
-    // The first commit draws a screen's worth (DRAWN_FIRST items: here 7 turns), a later one the rest above
+    // The first commit draws a screen's worth (DRAWN_FIRST items: here 5 turns), a later one the rest above
     // them (in a transition, which a browser renders in slices), each turn once.
     const drawn = n.perCommit.filter((x) => x > 0);
     expect(drawn[0]).toBeLessThan(10);

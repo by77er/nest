@@ -319,7 +319,7 @@ function restore(v: HTMLElement, h: Held): boolean | null {
  * When many turns come together, the newest are drawn at once until they hold this many items (each at least
  * a line: more than a screen of the log), and the rest follow in a transition.
  */
-export const DRAWN_FIRST = 40;
+export const DRAWN_FIRST = 30;
 
 /** The key of the oldest turn drawn at once, if the newest DRAWN_FIRST items don't reach back to the first turn. */
 function cutFor(groups: readonly TurnGroup[]): string | null {
