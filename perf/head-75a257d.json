@@ -1,7 +1,7 @@
 {
-  "label": "final-50b0e54",
-  "commit": "50b0e54",
-  "at": "2026-11-27T10:39:28.540Z",
+  "label": "final-75a257d",
+  "commit": "75a257d",
+  "at": "2026-11-27T11:15:22.461Z",
   "cpu": 4,
   "shape": "summary",
   "apiMs": 40,
@@ -21,7 +21,7 @@
           "net": {
             "total": {
               "requests": 19,
-              "bytes": 339214
+              "bytes": 339230
             },
             "cached": 0,
             "document": {
@@ -30,7 +30,7 @@
             },
             "script": {
               "requests": 12,
-              "bytes": 252401
+              "bytes": 252418
             },
             "style": {
               "requests": 4,
@@ -42,7 +42,7 @@
             },
             "api": {
               "requests": 1,
-              "bytes": 230,
+              "bytes": 229,
               "notModified": 0,
               "raw": 713
             },
@@ -57,28 +57,28 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 370.3,
-            "layout": 22.8,
-            "style": 37,
-            "task": 790.3,
+            "script": 377.7,
+            "layout": 27.5,
+            "style": 34.3,
+            "task": 800.1,
             "nodes": 341,
-            "heapMB": 6.7
+            "heapMB": 7.2
           },
-          "content": 617.5,
+          "content": 626.9,
           "selector": "a[href='/projects/prj_demo/board'], a[href='/projects/prj_demo']",
           "fcp": 592,
-          "h1": 516.8,
+          "h1": 519,
           "long": {
             "count": 3,
-            "total": 381,
-            "max": 214,
-            "blocking": 231
+            "total": 383,
+            "max": 218,
+            "blocking": 233
           }
         },
         {
@@ -87,7 +87,7 @@
           "net": {
             "total": {
               "requests": 3,
-              "bytes": 230
+              "bytes": 229
             },
             "cached": 16,
             "document": {
@@ -108,7 +108,7 @@
             },
             "api": {
               "requests": 1,
-              "bytes": 230,
+              "bytes": 229,
               "notModified": 0,
               "raw": 713
             },
@@ -123,28 +123,28 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 353.9,
-            "layout": 27.1,
-            "style": 31.7,
-            "task": 528.3,
+            "script": 360.5,
+            "layout": 31.3,
+            "style": 33,
+            "task": 539.5,
             "nodes": 341,
-            "heapMB": 6.8
+            "heapMB": 7.2
           },
-          "content": 566.6,
+          "content": 575.8,
           "selector": "a[href='/projects/prj_demo/board'], a[href='/projects/prj_demo']",
-          "fcp": 500,
-          "h1": 491.7,
+          "fcp": 504,
+          "h1": 496.1,
           "long": {
             "count": 3,
-            "total": 363,
-            "max": 215,
-            "blocking": 213
+            "total": 373,
+            "max": 227,
+            "blocking": 223
           }
         },
         {
@@ -195,12 +195,12 @@
             }
           },
           "cdp": {
-            "script": 3.7,
+            "script": 4.7,
             "layout": 0,
             "style": 0,
-            "task": 55.7,
+            "task": 10.8,
             "nodes": 341,
-            "heapMB": 6.9
+            "heapMB": 7.3
           },
           "idle": {
             "seconds": 15,
@@ -225,11 +225,11 @@
       "windows": [
         {
           "name": "cold",
-          "seconds": 2.3,
+          "seconds": 2.4,
           "net": {
             "total": {
               "requests": 36,
-              "bytes": 584300
+              "bytes": 584280
             },
             "cached": 0,
             "document": {
@@ -238,7 +238,7 @@
             },
             "script": {
               "requests": 23,
-              "bytes": 434223
+              "bytes": 434211
             },
             "style": {
               "requests": 5,
@@ -250,7 +250,7 @@
             },
             "api": {
               "requests": 5,
-              "bytes": 16223,
+              "bytes": 16215,
               "notModified": 0,
               "raw": 158747
             },
@@ -265,7 +265,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -275,38 +275,38 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3251,
+                3248,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11762,
+                11759,
                 0
               ],
               "GET /projects/prj_demo/attention": [
                 1,
-                575,
+                574,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1362.9,
-            "layout": 111.1,
-            "style": 100.2,
-            "task": 2011.6,
-            "nodes": 11124,
-            "heapMB": 31
+            "script": 1392.6,
+            "layout": 79,
+            "style": 75,
+            "task": 2032.7,
+            "nodes": 11112,
+            "heapMB": 30.9
           },
-          "content": 1662.7,
+          "content": 1787.2,
           "selector": "[data-ds=task-row]",
-          "fcp": 724,
-          "h1": 1663.3,
+          "fcp": null,
+          "h1": 1787.2,
           "long": {
             "count": 4,
-            "total": 1463,
-            "max": 997,
-            "blocking": 1263
+            "total": 1544,
+            "max": 1055,
+            "blocking": 1344
           }
         },
         {
@@ -314,8 +314,8 @@
           "seconds": 1.9,
           "net": {
             "total": {
-              "requests": 7,
-              "bytes": 16223
+              "requests": 8,
+              "bytes": 16635
             },
             "cached": 29,
             "document": {
@@ -335,10 +335,10 @@
               "bytes": 0
             },
             "api": {
-              "requests": 5,
-              "bytes": 16223,
+              "requests": 6,
+              "bytes": 16635,
               "notModified": 0,
-              "raw": 158747
+              "raw": 159600
             },
             "ws": {
               "requests": 0,
@@ -351,7 +351,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -361,38 +361,43 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3251,
+                3248,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11762,
+                11759,
                 0
               ],
               "GET /projects/prj_demo/attention": [
                 1,
-                575,
+                574,
+                0
+              ],
+              "GET /projects/prj_demo/attention?local=1": [
+                1,
+                420,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1341,
-            "layout": 72.4,
-            "style": 59.1,
-            "task": 1712.8,
-            "nodes": 11080,
-            "heapMB": 30.2
+            "script": 1314.2,
+            "layout": 75.9,
+            "style": 75.9,
+            "task": 1726,
+            "nodes": 11081,
+            "heapMB": 30.7
           },
-          "content": 1668.3,
+          "content": 1664.5,
           "selector": "[data-ds=task-row]",
-          "fcp": null,
-          "h1": 1668.4,
+          "fcp": 644,
+          "h1": 634.5,
           "long": {
             "count": 4,
-            "total": 1466,
-            "max": 1025,
-            "blocking": 1266
+            "total": 1451,
+            "max": 979,
+            "blocking": 1251
           }
         },
         {
@@ -435,12 +440,12 @@
               "bytes": 0
             },
             "apiPaths": {
-              "GET /projects/prj_demo/attention": [
+              "GET /projects/prj_demo/tasks": [
                 3,
                 0,
                 3
               ],
-              "GET /projects/prj_demo/tasks": [
+              "GET /projects/prj_demo/attention": [
                 3,
                 0,
                 3
@@ -463,12 +468,12 @@
             }
           },
           "cdp": {
-            "script": 246.6,
+            "script": 215.8,
             "layout": 0,
-            "style": 0.3,
-            "task": 351.3,
+            "style": 0.5,
+            "task": 310.2,
             "nodes": 11169,
-            "heapMB": 25.3
+            "heapMB": 25.2
           },
           "idle": {
             "seconds": 15,
@@ -493,11 +498,11 @@
       "windows": [
         {
           "name": "cold",
-          "seconds": 3.9,
+          "seconds": 4.6,
           "net": {
             "total": {
-              "requests": 39,
-              "bytes": 599301
+              "requests": 40,
+              "bytes": 599693
             },
             "cached": 0,
             "document": {
@@ -506,7 +511,7 @@
             },
             "script": {
               "requests": 23,
-              "bytes": 434223
+              "bytes": 434211
             },
             "style": {
               "requests": 5,
@@ -517,10 +522,10 @@
               "bytes": 88660
             },
             "api": {
-              "requests": 8,
-              "bytes": 31224,
+              "requests": 9,
+              "bytes": 31628,
               "notModified": 0,
-              "raw": 281867
+              "raw": 282720
             },
             "ws": {
               "requests": 1002,
@@ -533,7 +538,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -543,12 +548,12 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3248,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11769,
+                11760,
                 0
               ],
               "GET /projects/prj_demo/attention": [
@@ -563,42 +568,47 @@
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3852,
+                3850,
+                0
+              ],
+              "GET /projects/prj_demo/attention?local=1": [
+                1,
+                421,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9453,
+                9450,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1791.2,
-            "layout": 138.4,
-            "style": 167.5,
-            "task": 3292.8,
-            "nodes": 13212,
+            "script": 1882.2,
+            "layout": 124.8,
+            "style": 152.3,
+            "task": 3828.4,
+            "nodes": 13194,
             "heapMB": 32.3
           },
-          "content": 3838.5,
+          "content": 4510.7,
           "selector": "[role=dialog] [data-ds=terminal] [data-kind=tool]",
-          "fcp": 740,
-          "h1": 2012.6,
+          "fcp": 728,
+          "h1": 778.4,
           "long": {
             "count": 7,
-            "total": 2198,
-            "max": 1345,
-            "blocking": 1848
+            "total": 1968,
+            "max": 972,
+            "blocking": 1618
           }
         },
         {
           "name": "warm",
-          "seconds": 4.4,
+          "seconds": 3.8,
           "net": {
             "total": {
-              "requests": 10,
-              "bytes": 31224
+              "requests": 11,
+              "bytes": 31628
             },
             "cached": 29,
             "document": {
@@ -618,10 +628,10 @@
               "bytes": 0
             },
             "api": {
-              "requests": 8,
-              "bytes": 31224,
+              "requests": 9,
+              "bytes": 31628,
               "notModified": 0,
-              "raw": 281867
+              "raw": 282720
             },
             "ws": {
               "requests": 1002,
@@ -634,7 +644,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -644,12 +654,12 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3248,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11769,
+                11760,
                 0
               ],
               "GET /projects/prj_demo/attention": [
@@ -664,33 +674,38 @@
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3852,
+                3850,
+                0
+              ],
+              "GET /projects/prj_demo/attention?local=1": [
+                1,
+                421,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9453,
+                9450,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 2233.9,
-            "layout": 176.8,
-            "style": 167.1,
-            "task": 3575.6,
-            "nodes": 18153,
-            "heapMB": 55.4
+            "script": 1847.3,
+            "layout": 115.2,
+            "style": 101.8,
+            "task": 3302.5,
+            "nodes": 13247,
+            "heapMB": 32.3
           },
-          "content": 3653.4,
+          "content": 3773.6,
           "selector": "[role=dialog] [data-ds=terminal] [data-kind=tool]",
-          "fcp": 2228,
-          "h1": 2109.1,
+          "fcp": 700,
+          "h1": 689.2,
           "long": {
-            "count": 5,
-            "total": 2596,
-            "max": 1666,
-            "blocking": 2346
+            "count": 6,
+            "total": 1927,
+            "max": 991,
+            "blocking": 1627
           }
         },
         {
@@ -699,7 +714,7 @@
           "net": {
             "total": {
               "requests": 18,
-              "bytes": 135805
+              "bytes": 135810
             },
             "cached": 0,
             "document": {
@@ -708,7 +723,7 @@
             },
             "script": {
               "requests": 3,
-              "bytes": 132273
+              "bytes": 132278
             },
             "style": {
               "requests": 2,
@@ -733,12 +748,12 @@
               "bytes": 0
             },
             "apiPaths": {
-              "GET /projects/prj_demo/attention": [
+              "GET /projects/prj_demo/tasks": [
                 3,
                 0,
                 3
               ],
-              "GET /projects/prj_demo/tasks": [
+              "GET /projects/prj_demo/attention": [
                 3,
                 0,
                 3
@@ -771,12 +786,12 @@
             }
           },
           "cdp": {
-            "script": 424.7,
-            "layout": 1.3,
-            "style": 13.5,
-            "task": 637.5,
-            "nodes": 22687,
-            "heapMB": 41.8
+            "script": 1203.5,
+            "layout": 2.4,
+            "style": 30,
+            "task": 1401.1,
+            "nodes": 22602,
+            "heapMB": 40.8
           },
           "idle": {
             "seconds": 15,
@@ -786,10 +801,10 @@
             "api304": 13
           },
           "long": {
-            "count": 1,
-            "total": 111,
-            "max": 111,
-            "blocking": 61
+            "count": 0,
+            "total": 0,
+            "max": 0,
+            "blocking": 0
           }
         }
       ],
@@ -801,11 +816,11 @@
       "windows": [
         {
           "name": "cold",
-          "seconds": 3.4,
+          "seconds": 2.6,
           "net": {
             "total": {
-              "requests": 43,
-              "bytes": 631763
+              "requests": 42,
+              "bytes": 631305
             },
             "cached": 0,
             "document": {
@@ -814,7 +829,7 @@
             },
             "script": {
               "requests": 22,
-              "bytes": 419390
+              "bytes": 419361
             },
             "style": {
               "requests": 5,
@@ -825,10 +840,10 @@
               "bytes": 136840
             },
             "api": {
-              "requests": 10,
-              "bytes": 30339,
+              "requests": 9,
+              "bytes": 29910,
               "notModified": 0,
-              "raw": 273758
+              "raw": 272905
             },
             "ws": {
               "requests": 1002,
@@ -841,17 +856,17 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                231,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
                 1,
-                404,
+                405,
                 0
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3248,
                 0
               ],
               "GET /projects/prj_demo/manager": [
@@ -861,53 +876,48 @@
               ],
               "GET /projects/prj_demo/waits": [
                 1,
-                300,
+                298,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11763,
+                11759,
                 0
               ],
               "GET /projects/prj_demo/attention": [
                 1,
-                574,
+                575,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3851,
-                0
-              ],
-              "GET /projects/prj_demo/attention?local=1": [
-                1,
-                420,
+                3849,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9451,
+                9452,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1357.4,
-            "layout": 168,
-            "style": 102.7,
-            "task": 2859.4,
-            "nodes": 6743,
-            "heapMB": 24.4
+            "script": 920.4,
+            "layout": 92.4,
+            "style": 77.5,
+            "task": 2136.6,
+            "nodes": 1586,
+            "heapMB": 16.8
           },
-          "content": 1295.2,
+          "content": 1231.4,
           "selector": "[data-ds=bubble], [data-ds=message]",
-          "fcp": 1000,
-          "h1": 775.6,
+          "fcp": 724,
+          "h1": 1231.5,
           "long": {
-            "count": 7,
-            "total": 1333,
-            "max": 485,
-            "blocking": 983
+            "count": 4,
+            "total": 1048,
+            "max": 541,
+            "blocking": 848
           }
         },
         {
@@ -915,8 +925,8 @@
           "seconds": 2.3,
           "net": {
             "total": {
-              "requests": 10,
-              "bytes": 20468
+              "requests": 12,
+              "bytes": 30330
             },
             "cached": 31,
             "document": {
@@ -936,10 +946,10 @@
               "bytes": 0
             },
             "api": {
-              "requests": 8,
-              "bytes": 20468,
+              "requests": 10,
+              "bytes": 30330,
               "notModified": 0,
-              "raw": 227602
+              "raw": 273758
             },
             "ws": {
               "requests": 1002,
@@ -952,17 +962,17 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                231,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
                 1,
-                404,
+                405,
                 0
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3248,
                 0
               ],
               "GET /projects/prj_demo/manager": [
@@ -972,43 +982,53 @@
               ],
               "GET /projects/prj_demo/waits": [
                 1,
-                300,
+                298,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11763,
+                11759,
                 0
               ],
               "GET /projects/prj_demo/attention": [
                 1,
-                574,
+                575,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3851,
+                3849,
+                0
+              ],
+              "GET /projects/prj_demo/attention?local=1": [
+                1,
+                420,
+                0
+              ],
+              "GET /agents/agt_*/trace/history?before": [
+                1,
+                9452,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 766.5,
-            "layout": 122.8,
-            "style": 64.1,
-            "task": 1912.4,
-            "nodes": 1491,
-            "heapMB": 15.4
+            "script": 848.3,
+            "layout": 121.8,
+            "style": 67.9,
+            "task": 1943.1,
+            "nodes": 1636,
+            "heapMB": 17.3
           },
-          "content": 1197,
+          "content": 1094.5,
           "selector": "[data-ds=bubble], [data-ds=message]",
           "fcp": null,
-          "h1": 1197.1,
+          "h1": 1095.4,
           "long": {
-            "count": 3,
-            "total": 953,
-            "max": 777,
-            "blocking": 803
+            "count": 4,
+            "total": 1001,
+            "max": 679,
+            "blocking": 801
           }
         },
         {
@@ -1094,12 +1114,12 @@
             }
           },
           "cdp": {
-            "script": 690.6,
-            "layout": 44.1,
-            "style": 108.2,
-            "task": 1130,
+            "script": 697.8,
+            "layout": 43.5,
+            "style": 126.5,
+            "task": 1143.2,
             "nodes": 4338,
-            "heapMB": 24.7
+            "heapMB": 24.9
           },
           "idle": {
             "seconds": 15,
@@ -1110,9 +1130,9 @@
           },
           "long": {
             "count": 2,
-            "total": 172,
+            "total": 176,
             "max": 98,
-            "blocking": 72
+            "blocking": 76
           }
         }
       ],
@@ -1124,11 +1144,11 @@
       "windows": [
         {
           "name": "cold",
-          "seconds": 3.1,
+          "seconds": 3.7,
           "net": {
             "total": {
               "requests": 40,
-              "bytes": 583580
+              "bytes": 583553
             },
             "cached": 0,
             "document": {
@@ -1137,7 +1157,7 @@
             },
             "script": {
               "requests": 22,
-              "bytes": 419390
+              "bytes": 419361
             },
             "style": {
               "requests": 5,
@@ -1149,7 +1169,7 @@
             },
             "api": {
               "requests": 10,
-              "bytes": 30336,
+              "bytes": 30338,
               "notModified": 0,
               "raw": 273758
             },
@@ -1164,7 +1184,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -1174,7 +1194,7 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3249,
                 0
               ],
               "GET /projects/prj_demo/manager": [
@@ -1184,62 +1204,62 @@
               ],
               "GET /projects/prj_demo/waits": [
                 1,
-                298,
+                299,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11763,
+                11756,
                 0
               ],
               "GET /projects/prj_demo/attention": [
                 1,
-                574,
+                575,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3850,
+                3857,
                 0
               ],
               "GET /projects/prj_demo/attention?local=1": [
                 1,
-                421,
+                420,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9450,
+                9453,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1290.3,
-            "layout": 66.9,
-            "style": 82,
-            "task": 2618.3,
-            "nodes": 6953,
-            "heapMB": 23.5
+            "script": 1609.9,
+            "layout": 104.6,
+            "style": 101.9,
+            "task": 3006.2,
+            "nodes": 10646,
+            "heapMB": 19.7
           },
-          "content": 2484.3,
+          "content": 1273.1,
           "selector": "[data-ds=terminal] [data-kind=tool]",
-          "fcp": 1120,
-          "h1": 819.4,
+          "fcp": 972,
+          "h1": 727.4,
           "long": {
-            "count": 5,
-            "total": 1025,
-            "max": 411,
-            "blocking": 775
+            "count": 8,
+            "total": 1734,
+            "max": 794,
+            "blocking": 1334
           }
         },
         {
           "name": "warm",
-          "seconds": 3.2,
+          "seconds": 3,
           "net": {
             "total": {
-              "requests": 12,
-              "bytes": 30336
+              "requests": 11,
+              "bytes": 29918
             },
             "cached": 28,
             "document": {
@@ -1259,10 +1279,10 @@
               "bytes": 0
             },
             "api": {
-              "requests": 10,
-              "bytes": 30336,
+              "requests": 9,
+              "bytes": 29918,
               "notModified": 0,
-              "raw": 273758
+              "raw": 272905
             },
             "ws": {
               "requests": 1002,
@@ -1275,7 +1295,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -1285,7 +1305,7 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3249,
                 0
               ],
               "GET /projects/prj_demo/manager": [
@@ -1295,53 +1315,48 @@
               ],
               "GET /projects/prj_demo/waits": [
                 1,
-                298,
+                299,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11763,
+                11756,
                 0
               ],
               "GET /projects/prj_demo/attention": [
                 1,
-                574,
+                575,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3850,
-                0
-              ],
-              "GET /projects/prj_demo/attention?local=1": [
-                1,
-                421,
+                3857,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9450,
+                9453,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1670.6,
-            "layout": 87,
-            "style": 106.1,
-            "task": 2697.7,
-            "nodes": 10750,
-            "heapMB": 19.7
+            "script": 1573.7,
+            "layout": 85,
+            "style": 111.1,
+            "task": 2612.6,
+            "nodes": 10732,
+            "heapMB": 19.6
           },
-          "content": 1058.5,
+          "content": 890.1,
           "selector": "[data-ds=terminal] [data-kind=tool]",
-          "fcp": 736,
-          "h1": 717,
+          "fcp": 556,
+          "h1": 763,
           "long": {
-            "count": 5,
-            "total": 1644,
-            "max": 734,
-            "blocking": 1394
+            "count": 7,
+            "total": 1597,
+            "max": 642,
+            "blocking": 1247
           }
         },
         {
@@ -1399,12 +1414,12 @@
                 0,
                 1
               ],
-              "GET /projects/prj_demo/manager": [
+              "GET /projects/prj_demo": [
                 1,
                 0,
                 1
               ],
-              "GET /projects/prj_demo": [
+              "GET /projects/prj_demo/manager": [
                 1,
                 0,
                 1
@@ -1422,11 +1437,11 @@
             }
           },
           "cdp": {
-            "script": 68.1,
+            "script": 75.1,
             "layout": 0,
             "style": 0,
-            "task": 90,
-            "nodes": 10750,
+            "task": 90.8,
+            "nodes": 10732,
             "heapMB": 21.7
           },
           "idle": {
@@ -1456,7 +1471,7 @@
           "net": {
             "total": {
               "requests": 28,
-              "bytes": 444025
+              "bytes": 444036
             },
             "cached": 0,
             "document": {
@@ -1465,7 +1480,7 @@
             },
             "script": {
               "requests": 16,
-              "bytes": 308781
+              "bytes": 308795
             },
             "style": {
               "requests": 4,
@@ -1477,7 +1492,7 @@
             },
             "api": {
               "requests": 5,
-              "bytes": 8257,
+              "bytes": 8254,
               "notModified": 0,
               "raw": 87645
             },
@@ -1492,7 +1507,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -1502,47 +1517,47 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3254,
+                3249,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3850,
+                3855,
                 0
               ],
               "GET /projects/prj_demo/reviewers": [
                 1,
-                518,
+                516,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1247.6,
-            "layout": 195.7,
-            "style": 77.4,
-            "task": 1987.3,
+            "script": 1206.6,
+            "layout": 189.5,
+            "style": 76.8,
+            "task": 1919.1,
             "nodes": 5658,
-            "heapMB": 28.8
+            "heapMB": 29
           },
-          "content": 1646.1,
+          "content": 1564,
           "selector": "[aria-label^='Show the trace of #']",
           "fcp": null,
-          "h1": 1647.3,
+          "h1": 1565,
           "long": {
-            "count": 5,
-            "total": 1504,
-            "max": 847,
-            "blocking": 1254
+            "count": 4,
+            "total": 1328,
+            "max": 795,
+            "blocking": 1128
           }
         },
         {
           "name": "warm",
-          "seconds": 1.8,
+          "seconds": 2,
           "net": {
             "total": {
               "requests": 7,
-              "bytes": 8257
+              "bytes": 8254
             },
             "cached": 21,
             "document": {
@@ -1563,7 +1578,7 @@
             },
             "api": {
               "requests": 5,
-              "bytes": 8257,
+              "bytes": 8254,
               "notModified": 0,
               "raw": 87645
             },
@@ -1578,7 +1593,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -1588,38 +1603,38 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3254,
+                3249,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3850,
+                3855,
                 0
               ],
               "GET /projects/prj_demo/reviewers": [
                 1,
-                518,
+                516,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1218.9,
-            "layout": 182.4,
-            "style": 75.4,
-            "task": 1735.3,
-            "nodes": 5658,
-            "heapMB": 28.8
+            "script": 1374.9,
+            "layout": 189.5,
+            "style": 77.4,
+            "task": 1822.3,
+            "nodes": 5655,
+            "heapMB": 32.8
           },
-          "content": 1555.3,
+          "content": 1833.6,
           "selector": "[aria-label^='Show the trace of #']",
-          "fcp": 520,
-          "h1": 1556.3,
+          "fcp": null,
+          "h1": 1834.7,
           "long": {
-            "count": 4,
-            "total": 1363,
-            "max": 830,
-            "blocking": 1163
+            "count": 3,
+            "total": 1688,
+            "max": 1450,
+            "blocking": 1538
           }
         },
         {
@@ -1667,12 +1682,12 @@
                 0,
                 1
               ],
-              "GET /projects/prj_demo": [
+              "GET /projects/prj_demo/chat": [
                 1,
                 0,
                 1
               ],
-              "GET /projects/prj_demo/chat": [
+              "GET /projects/prj_demo": [
                 1,
                 0,
                 1
@@ -1690,12 +1705,12 @@
             }
           },
           "cdp": {
-            "script": 12.4,
+            "script": 10.5,
             "layout": 0,
             "style": 0,
-            "task": 105.1,
+            "task": 70.2,
             "nodes": 5630,
-            "heapMB": 18.5
+            "heapMB": 20.2
           },
           "idle": {
             "seconds": 15,
@@ -1720,11 +1735,11 @@
       "windows": [
         {
           "name": "cold",
-          "seconds": 4.8,
+          "seconds": 5.2,
           "net": {
             "total": {
               "requests": 29,
-              "bytes": 453475
+              "bytes": 453487
             },
             "cached": 0,
             "document": {
@@ -1733,7 +1748,7 @@
             },
             "script": {
               "requests": 16,
-              "bytes": 308781
+              "bytes": 308795
             },
             "style": {
               "requests": 4,
@@ -1745,7 +1760,7 @@
             },
             "api": {
               "requests": 6,
-              "bytes": 17707,
+              "bytes": 17705,
               "notModified": 0,
               "raw": 132948
             },
@@ -1760,7 +1775,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                231,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -1770,17 +1785,17 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3248,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3850,
+                3855,
                 0
               ],
               "GET /projects/prj_demo/reviewers": [
                 1,
-                518,
+                515,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
@@ -1791,20 +1806,20 @@
             }
           },
           "cdp": {
-            "script": 1801.5,
-            "layout": 238.6,
-            "style": 160.1,
-            "task": 3326.8,
-            "nodes": 5943,
-            "heapMB": 42.5
+            "script": 2769.2,
+            "layout": 282.2,
+            "style": 187.1,
+            "task": 4644.2,
+            "nodes": 14808,
+            "heapMB": 49.7
           },
-          "content": 1187.6,
+          "content": 1149.1,
           "selector": "the click, then [data-ds=terminal] [data-kind=tool]",
           "long": {
-            "count": 8,
-            "total": 2204,
-            "max": 798,
-            "blocking": 1804
+            "count": 10,
+            "total": 3306,
+            "max": 962,
+            "blocking": 2806
           }
         },
         {
@@ -1813,7 +1828,7 @@
           "net": {
             "total": {
               "requests": 8,
-              "bytes": 17707
+              "bytes": 17705
             },
             "cached": 21,
             "document": {
@@ -1834,7 +1849,7 @@
             },
             "api": {
               "requests": 6,
-              "bytes": 17707,
+              "bytes": 17705,
               "notModified": 0,
               "raw": 132948
             },
@@ -1849,7 +1864,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                231,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -1859,17 +1874,17 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3248,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3850,
+                3855,
                 0
               ],
               "GET /projects/prj_demo/reviewers": [
                 1,
-                518,
+                515,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
@@ -1880,20 +1895,20 @@
             }
           },
           "cdp": {
-            "script": 1886.1,
-            "layout": 250.6,
-            "style": 165.1,
-            "task": 3457.9,
-            "nodes": 6244,
-            "heapMB": 54.7
+            "script": 1919.4,
+            "layout": 248.6,
+            "style": 168,
+            "task": 3506.1,
+            "nodes": 6938,
+            "heapMB": 34.4
           },
-          "content": 1133,
+          "content": 1284.7,
           "selector": "the click, then [data-ds=terminal] [data-kind=tool]",
           "long": {
             "count": 9,
-            "total": 2354,
-            "max": 799,
-            "blocking": 1904
+            "total": 2315,
+            "max": 842,
+            "blocking": 1865
           }
         },
         {
@@ -1964,11 +1979,11 @@
             }
           },
           "cdp": {
-            "script": 146,
-            "layout": 6.5,
-            "style": 12.4,
-            "task": 305.4,
-            "nodes": 15785,
+            "script": 150.1,
+            "layout": 8.1,
+            "style": 18.4,
+            "task": 320.9,
+            "nodes": 15865,
             "heapMB": 36.8
           },
           "idle": {
@@ -1980,9 +1995,9 @@
           },
           "long": {
             "count": 1,
-            "total": 125,
-            "max": 125,
-            "blocking": 75
+            "total": 129,
+            "max": 129,
+            "blocking": 79
           }
         }
       ],
@@ -1998,7 +2013,7 @@
           "net": {
             "total": {
               "requests": 32,
-              "bytes": 453115
+              "bytes": 453146
             },
             "cached": 0,
             "document": {
@@ -2007,7 +2022,7 @@
             },
             "script": {
               "requests": 18,
-              "bytes": 312682
+              "bytes": 312716
             },
             "style": {
               "requests": 4,
@@ -2019,7 +2034,7 @@
             },
             "api": {
               "requests": 7,
-              "bytes": 13446,
+              "bytes": 13443,
               "notModified": 0,
               "raw": 82432
             },
@@ -2034,7 +2049,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -2044,7 +2059,7 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3249,
                 0
               ],
               "GET /projects/prj_demo/routines": [
@@ -2054,7 +2069,7 @@
               ],
               "GET /projects/prj_demo/routine-runs": [
                 1,
-                7481,
+                7480,
                 0
               ],
               "GET /projects/prj_demo/proposals": [
@@ -2070,22 +2085,22 @@
             }
           },
           "cdp": {
-            "script": 631.5,
-            "layout": 60.3,
-            "style": 67.6,
-            "task": 1144.5,
+            "script": 606.5,
+            "layout": 59.2,
+            "style": 68.6,
+            "task": 1150.5,
             "nodes": 975,
-            "heapMB": 11.1
+            "heapMB": 9.1
           },
-          "content": 839.7,
+          "content": 848.5,
           "selector": "[aria-label='Routine runs'] [aria-label^='Show ']",
-          "fcp": 652,
-          "h1": 841,
+          "fcp": 676,
+          "h1": 850,
           "long": {
-            "count": 4,
-            "total": 643,
-            "max": 244,
-            "blocking": 443
+            "count": 5,
+            "total": 685,
+            "max": 249,
+            "blocking": 435
           }
         },
         {
@@ -2094,7 +2109,7 @@
           "net": {
             "total": {
               "requests": 9,
-              "bytes": 13446
+              "bytes": 13443
             },
             "cached": 23,
             "document": {
@@ -2115,7 +2130,7 @@
             },
             "api": {
               "requests": 7,
-              "bytes": 13446,
+              "bytes": 13443,
               "notModified": 0,
               "raw": 82432
             },
@@ -2130,7 +2145,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -2140,7 +2155,7 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3249,
                 0
               ],
               "GET /projects/prj_demo/routines": [
@@ -2150,7 +2165,7 @@
               ],
               "GET /projects/prj_demo/routine-runs": [
                 1,
-                7481,
+                7480,
                 0
               ],
               "GET /projects/prj_demo/proposals": [
@@ -2166,22 +2181,22 @@
             }
           },
           "cdp": {
-            "script": 593.3,
-            "layout": 54.2,
-            "style": 64.8,
-            "task": 979.9,
+            "script": 585.9,
+            "layout": 55.4,
+            "style": 66.2,
+            "task": 953.9,
             "nodes": 975,
             "heapMB": 9.2
           },
-          "content": 783,
+          "content": 771.5,
           "selector": "[aria-label='Routine runs'] [aria-label^='Show ']",
-          "fcp": 552,
-          "h1": 784.7,
+          "fcp": 536,
+          "h1": 773.1,
           "long": {
-            "count": 5,
-            "total": 652,
-            "max": 237,
-            "blocking": 402
+            "count": 6,
+            "total": 681,
+            "max": 229,
+            "blocking": 381
           }
         },
         {
@@ -2262,10 +2277,10 @@
             }
           },
           "cdp": {
-            "script": 12.1,
+            "script": 11.4,
             "layout": 0,
             "style": 0,
-            "task": 25.7,
+            "task": 27.7,
             "nodes": 975,
             "heapMB": 9.3
           },
@@ -2292,11 +2307,11 @@
       "windows": [
         {
           "name": "cold",
-          "seconds": 3.7,
+          "seconds": 3.6,
           "net": {
             "total": {
               "requests": 33,
-              "bytes": 462564
+              "bytes": 462601
             },
             "cached": 0,
             "document": {
@@ -2305,7 +2320,7 @@
             },
             "script": {
               "requests": 18,
-              "bytes": 312682
+              "bytes": 312716
             },
             "style": {
               "requests": 4,
@@ -2317,7 +2332,7 @@
             },
             "api": {
               "requests": 8,
-              "bytes": 22895,
+              "bytes": 22898,
               "notModified": 0,
               "raw": 127735
             },
@@ -2332,7 +2347,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                228,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -2342,17 +2357,17 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3251,
                 0
               ],
               "GET /projects/prj_demo/routines": [
                 1,
-                1251,
+                1252,
                 0
               ],
               "GET /projects/prj_demo/routine-runs": [
                 1,
-                7481,
+                7480,
                 0
               ],
               "GET /projects/prj_demo/proposals": [
@@ -2362,40 +2377,40 @@
               ],
               "GET /projects/prj_demo/memory": [
                 1,
-                416,
+                417,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9451,
+                9454,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1669.9,
-            "layout": 114.1,
-            "style": 102.1,
-            "task": 3045.5,
-            "nodes": 10282,
-            "heapMB": 32.1
+            "script": 1658.7,
+            "layout": 107.1,
+            "style": 107.1,
+            "task": 2970,
+            "nodes": 10230,
+            "heapMB": 31.7
           },
-          "content": 829,
+          "content": 2510.2,
           "selector": "the click, then [data-ds=terminal] [data-kind=tool]",
           "long": {
-            "count": 9,
-            "total": 1805,
-            "max": 764,
-            "blocking": 1355
+            "count": 8,
+            "total": 1734,
+            "max": 846,
+            "blocking": 1334
           }
         },
         {
           "name": "warm",
-          "seconds": 3,
+          "seconds": 3.1,
           "net": {
             "total": {
               "requests": 10,
-              "bytes": 22895
+              "bytes": 22898
             },
             "cached": 23,
             "document": {
@@ -2416,7 +2431,7 @@
             },
             "api": {
               "requests": 8,
-              "bytes": 22895,
+              "bytes": 22898,
               "notModified": 0,
               "raw": 127735
             },
@@ -2431,7 +2446,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                228,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -2441,17 +2456,17 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3251,
                 0
               ],
               "GET /projects/prj_demo/routines": [
                 1,
-                1251,
+                1252,
                 0
               ],
               "GET /projects/prj_demo/routine-runs": [
                 1,
-                7481,
+                7480,
                 0
               ],
               "GET /projects/prj_demo/proposals": [
@@ -2461,31 +2476,31 @@
               ],
               "GET /projects/prj_demo/memory": [
                 1,
-                416,
+                417,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9451,
+                9454,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 1014.1,
-            "layout": 99.9,
-            "style": 87,
-            "task": 2089,
-            "nodes": 3476,
-            "heapMB": 18.6
+            "script": 905.9,
+            "layout": 99.4,
+            "style": 87.8,
+            "task": 2030.5,
+            "nodes": 2249,
+            "heapMB": 17
           },
-          "content": 1025.1,
+          "content": 851.5,
           "selector": "the click, then [data-ds=terminal] [data-kind=tool]",
           "long": {
-            "count": 7,
-            "total": 1036,
-            "max": 329,
-            "blocking": 686
+            "count": 8,
+            "total": 979,
+            "max": 230,
+            "blocking": 579
           }
         },
         {
@@ -2566,11 +2581,11 @@
             }
           },
           "cdp": {
-            "script": 126.4,
-            "layout": 2.4,
-            "style": 12.6,
-            "task": 238.3,
-            "nodes": 11194,
+            "script": 133,
+            "layout": 1.7,
+            "style": 10.5,
+            "task": 237.7,
+            "nodes": 11198,
             "heapMB": 20.6
           },
           "idle": {
@@ -2582,9 +2597,9 @@
           },
           "long": {
             "count": 1,
-            "total": 94,
-            "max": 94,
-            "blocking": 44
+            "total": 103,
+            "max": 103,
+            "blocking": 53
           }
         }
       ],
@@ -2596,11 +2611,11 @@
       "windows": [
         {
           "name": "cold",
-          "seconds": 1.5,
+          "seconds": 1.4,
           "net": {
             "total": {
               "requests": 24,
-              "bytes": 365260
+              "bytes": 365278
             },
             "cached": 0,
             "document": {
@@ -2609,7 +2624,7 @@
             },
             "script": {
               "requests": 12,
-              "bytes": 229849
+              "bytes": 229870
             },
             "style": {
               "requests": 4,
@@ -2621,7 +2636,7 @@
             },
             "api": {
               "requests": 5,
-              "bytes": 8424,
+              "bytes": 8421,
               "notModified": 0,
               "raw": 43200
             },
@@ -2636,17 +2651,17 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
                 1,
-                405,
+                404,
                 0
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3251,
                 0
               ],
               "GET /projects/prj_demo/issues": [
@@ -2656,37 +2671,37 @@
               ],
               "GET /projects/prj_demo/proposals": [
                 1,
-                412,
+                410,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 555,
-            "layout": 95.8,
-            "style": 101.4,
-            "task": 1182.8,
+            "script": 540.8,
+            "layout": 92.4,
+            "style": 94.4,
+            "task": 1155.3,
             "nodes": 2091,
-            "heapMB": 8.2
+            "heapMB": 8
           },
-          "content": 884.7,
+          "content": 846.9,
           "selector": "[data-ds=page] [data-ds=panel]",
-          "fcp": 584,
-          "h1": 884.9,
+          "fcp": 572,
+          "h1": 847,
           "long": {
             "count": 4,
-            "total": 631,
-            "max": 248,
-            "blocking": 431
+            "total": 615,
+            "max": 236,
+            "blocking": 415
           }
         },
         {
           "name": "warm",
-          "seconds": 1.3,
+          "seconds": 1.4,
           "net": {
             "total": {
               "requests": 7,
-              "bytes": 8424
+              "bytes": 8421
             },
             "cached": 17,
             "document": {
@@ -2707,7 +2722,7 @@
             },
             "api": {
               "requests": 5,
-              "bytes": 8424,
+              "bytes": 8421,
               "notModified": 0,
               "raw": 43200
             },
@@ -2722,17 +2737,17 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
                 1,
-                405,
+                404,
                 0
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3251,
                 0
               ],
               "GET /projects/prj_demo/issues": [
@@ -2742,28 +2757,28 @@
               ],
               "GET /projects/prj_demo/proposals": [
                 1,
-                412,
+                410,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 511.8,
-            "layout": 89.7,
-            "style": 75.5,
-            "task": 960.5,
+            "script": 536.2,
+            "layout": 91,
+            "style": 73.4,
+            "task": 967.8,
             "nodes": 2091,
             "heapMB": 8
           },
-          "content": 808.6,
+          "content": 826.4,
           "selector": "[data-ds=page] [data-ds=panel]",
           "fcp": 488,
-          "h1": 808.8,
+          "h1": 827.2,
           "long": {
             "count": 4,
-            "total": 598,
-            "max": 219,
-            "blocking": 398
+            "total": 609,
+            "max": 238,
+            "blocking": 409
           }
         },
         {
@@ -2834,10 +2849,10 @@
             }
           },
           "cdp": {
-            "script": 15.2,
+            "script": 16.6,
             "layout": 0,
             "style": 0,
-            "task": 28.9,
+            "task": 29.7,
             "nodes": 2091,
             "heapMB": 8.2
           },
@@ -2868,7 +2883,7 @@
           "net": {
             "total": {
               "requests": 22,
-              "bytes": 363945
+              "bytes": 363965
             },
             "cached": 0,
             "document": {
@@ -2877,7 +2892,7 @@
             },
             "script": {
               "requests": 11,
-              "bytes": 231861
+              "bytes": 231881
             },
             "style": {
               "requests": 4,
@@ -2904,12 +2919,12 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
                 1,
-                404,
+                405,
                 0
               ],
               "GET /projects/prj_demo/chat": [
@@ -2925,22 +2940,22 @@
             }
           },
           "cdp": {
-            "script": 497.3,
-            "layout": 97.1,
-            "style": 62.9,
-            "task": 1034.8,
+            "script": 468,
+            "layout": 93.3,
+            "style": 65,
+            "task": 1061.9,
             "nodes": 1939,
-            "heapMB": 8
+            "heapMB": 8.3
           },
-          "content": 799.8,
+          "content": 821.3,
           "selector": "[data-ds=page] [data-ds=table-frame], [data-ds=page] [data-ds=panel]",
-          "fcp": 552,
-          "h1": 800.2,
+          "fcp": 568,
+          "h1": 597.6,
           "long": {
             "count": 4,
-            "total": 552,
-            "max": 182,
-            "blocking": 352
+            "total": 526,
+            "max": 203,
+            "blocking": 326
           }
         },
         {
@@ -2985,12 +3000,12 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
                 1,
-                404,
+                405,
                 0
               ],
               "GET /projects/prj_demo/chat": [
@@ -3006,22 +3021,22 @@
             }
           },
           "cdp": {
-            "script": 466.9,
-            "layout": 94.3,
-            "style": 58.2,
-            "task": 851.2,
+            "script": 467.6,
+            "layout": 93.9,
+            "style": 63.1,
+            "task": 883.2,
             "nodes": 1939,
             "heapMB": 8
           },
-          "content": 757.3,
+          "content": 769.2,
           "selector": "[data-ds=page] [data-ds=table-frame], [data-ds=page] [data-ds=panel]",
-          "fcp": 484,
-          "h1": 757.8,
+          "fcp": 448,
+          "h1": 770.3,
           "long": {
-            "count": 4,
-            "total": 526,
-            "max": 186,
-            "blocking": 326
+            "count": 5,
+            "total": 600,
+            "max": 200,
+            "blocking": 350
           }
         },
         {
@@ -3087,10 +3102,10 @@
             }
           },
           "cdp": {
-            "script": 21.8,
+            "script": 20.8,
             "layout": 0,
             "style": 0,
-            "task": 39,
+            "task": 36.6,
             "nodes": 1939,
             "heapMB": 8.2
           },
@@ -3121,7 +3136,7 @@
           "net": {
             "total": {
               "requests": 22,
-              "bytes": 363395
+              "bytes": 363420
             },
             "cached": 0,
             "document": {
@@ -3130,7 +3145,7 @@
             },
             "script": {
               "requests": 11,
-              "bytes": 231415
+              "bytes": 231442
             },
             "style": {
               "requests": 4,
@@ -3142,7 +3157,7 @@
             },
             "api": {
               "requests": 4,
-              "bytes": 4993,
+              "bytes": 4991,
               "notModified": 0,
               "raw": 23583
             },
@@ -3157,43 +3172,43 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
                 1,
-                405,
+                404,
                 0
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3251,
                 0
               ],
               "GET /projects/prj_demo/network": [
                 1,
-                1108,
+                1107,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 542.6,
-            "layout": 60.7,
-            "style": 54.8,
-            "task": 1072.3,
+            "script": 510.5,
+            "layout": 65.6,
+            "style": 57.5,
+            "task": 1045.7,
             "nodes": 1095,
-            "heapMB": 8.5
+            "heapMB": 8.6
           },
-          "content": 817.8,
+          "content": 803.1,
           "selector": "[data-ds=page] [data-ds=panel]",
-          "fcp": 528,
-          "h1": 537.8,
+          "fcp": 568,
+          "h1": 804.2,
           "long": {
             "count": 3,
-            "total": 550,
-            "max": 275,
-            "blocking": 400
+            "total": 540,
+            "max": 264,
+            "blocking": 390
           }
         },
         {
@@ -3202,7 +3217,7 @@
           "net": {
             "total": {
               "requests": 6,
-              "bytes": 4993
+              "bytes": 4991
             },
             "cached": 16,
             "document": {
@@ -3223,7 +3238,7 @@
             },
             "api": {
               "requests": 4,
-              "bytes": 4993,
+              "bytes": 4991,
               "notModified": 0,
               "raw": 23583
             },
@@ -3238,43 +3253,43 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo": [
                 1,
-                405,
+                404,
                 0
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3250,
+                3251,
                 0
               ],
               "GET /projects/prj_demo/network": [
                 1,
-                1108,
+                1107,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 506.6,
-            "layout": 58.8,
-            "style": 56.2,
-            "task": 820.8,
+            "script": 499.6,
+            "layout": 58.5,
+            "style": 55.4,
+            "task": 794.8,
             "nodes": 1095,
             "heapMB": 8.6
           },
-          "content": 771.3,
+          "content": 766.6,
           "selector": "[data-ds=page] [data-ds=panel]",
-          "fcp": 456,
-          "h1": 771.9,
+          "fcp": 460,
+          "h1": 766.7,
           "long": {
             "count": 3,
-            "total": 536,
-            "max": 262,
-            "blocking": 386
+            "total": 529,
+            "max": 250,
+            "blocking": 379
           }
         },
         {
@@ -3340,10 +3355,10 @@
             }
           },
           "cdp": {
-            "script": 22,
+            "script": 25.3,
             "layout": 0,
             "style": 0,
-            "task": 43.5,
+            "task": 41.4,
             "nodes": 1095,
             "heapMB": 8.8
           },
@@ -3374,7 +3389,7 @@
           "net": {
             "total": {
               "requests": 26,
-              "bytes": 388191
+              "bytes": 388210
             },
             "cached": 0,
             "document": {
@@ -3383,7 +3398,7 @@
             },
             "script": {
               "requests": 15,
-              "bytes": 256107
+              "bytes": 256127
             },
             "style": {
               "requests": 4,
@@ -3395,7 +3410,7 @@
             },
             "api": {
               "requests": 4,
-              "bytes": 5097,
+              "bytes": 5096,
               "notModified": 0,
               "raw": 32435
             },
@@ -3410,7 +3425,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                231,
+                228,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -3420,33 +3435,33 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3248,
+                3251,
                 0
               ],
               "GET /projects/prj_demo/secrets": [
                 1,
-                1213,
+                1212,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 569.7,
-            "layout": 56.4,
-            "style": 60,
-            "task": 1130.4,
+            "script": 568.4,
+            "layout": 53.8,
+            "style": 57.7,
+            "task": 1125.9,
             "nodes": 780,
-            "heapMB": 8.3
+            "heapMB": 8.4
           },
-          "content": 878.9,
+          "content": 866.5,
           "selector": "[data-ds=page] [data-ds=panel]",
-          "fcp": 628,
-          "h1": 879.1,
+          "fcp": 612,
+          "h1": 866.7,
           "long": {
             "count": 3,
-            "total": 629,
-            "max": 303,
-            "blocking": 479
+            "total": 615,
+            "max": 289,
+            "blocking": 465
           }
         },
         {
@@ -3455,7 +3470,7 @@
           "net": {
             "total": {
               "requests": 6,
-              "bytes": 5097
+              "bytes": 5096
             },
             "cached": 20,
             "document": {
@@ -3476,7 +3491,7 @@
             },
             "api": {
               "requests": 4,
-              "bytes": 5097,
+              "bytes": 5096,
               "notModified": 0,
               "raw": 32435
             },
@@ -3491,7 +3506,7 @@
             "apiPaths": {
               "GET /projects": [
                 1,
-                231,
+                228,
                 0
               ],
               "GET /projects/prj_demo": [
@@ -3501,33 +3516,33 @@
               ],
               "GET /projects/prj_demo/chat": [
                 1,
-                3248,
+                3251,
                 0
               ],
               "GET /projects/prj_demo/secrets": [
                 1,
-                1213,
+                1212,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 552.6,
-            "layout": 53.5,
-            "style": 61.9,
-            "task": 866.8,
+            "script": 542.3,
+            "layout": 55.8,
+            "style": 58,
+            "task": 865.5,
             "nodes": 780,
-            "heapMB": 8.4
+            "heapMB": 10.1
           },
-          "content": 828.5,
+          "content": 821.2,
           "selector": "[data-ds=page] [data-ds=panel]",
-          "fcp": 508,
-          "h1": 828.7,
+          "fcp": 496,
+          "h1": 822,
           "long": {
             "count": 3,
-            "total": 597,
-            "max": 276,
-            "blocking": 447
+            "total": 611,
+            "max": 289,
+            "blocking": 461
           }
         },
         {
@@ -3593,12 +3608,12 @@
             }
           },
           "cdp": {
-            "script": 22.1,
+            "script": 19.6,
             "layout": 0,
             "style": 0,
-            "task": 39.2,
+            "task": 40.2,
             "nodes": 780,
-            "heapMB": 8.5
+            "heapMB": 10.3
           },
           "idle": {
             "seconds": 15,
@@ -3627,7 +3642,7 @@
           "net": {
             "total": {
               "requests": 19,
-              "bytes": 356600
+              "bytes": 356617
             },
             "cached": 0,
             "document": {
@@ -3636,7 +3651,7 @@
             },
             "script": {
               "requests": 9,
-              "bytes": 228853
+              "bytes": 228871
             },
             "style": {
               "requests": 4,
@@ -3648,7 +3663,7 @@
             },
             "api": {
               "requests": 3,
-              "bytes": 760,
+              "bytes": 759,
               "notModified": 0,
               "raw": 1770
             },
@@ -3673,28 +3688,28 @@
               ],
               "GET /admin/bindings": [
                 1,
-                390,
+                389,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 363.2,
-            "layout": 45.1,
-            "style": 40.4,
-            "task": 917.8,
+            "script": 356.8,
+            "layout": 53.9,
+            "style": 39.7,
+            "task": 883.8,
             "nodes": 400,
             "heapMB": 5.3
           },
-          "content": 474.7,
+          "content": 484,
           "selector": "[data-ds=page] [data-ds=panel], [data-ds=page] [data-ds=table-frame]",
-          "fcp": 568,
-          "h1": 474.8,
+          "fcp": 576,
+          "h1": 484.1,
           "long": {
             "count": 2,
-            "total": 298,
-            "max": 200,
-            "blocking": 198
+            "total": 299,
+            "max": 203,
+            "blocking": 199
           }
         },
         {
@@ -3703,7 +3718,7 @@
           "net": {
             "total": {
               "requests": 5,
-              "bytes": 760
+              "bytes": 759
             },
             "cached": 14,
             "document": {
@@ -3724,7 +3739,7 @@
             },
             "api": {
               "requests": 3,
-              "bytes": 760,
+              "bytes": 759,
               "notModified": 0,
               "raw": 1770
             },
@@ -3749,28 +3764,28 @@
               ],
               "GET /admin/bindings": [
                 1,
-                390,
+                389,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 346.6,
-            "layout": 48.2,
-            "style": 36,
-            "task": 644.4,
+            "script": 301.5,
+            "layout": 53.9,
+            "style": 35.6,
+            "task": 592.7,
             "nodes": 400,
-            "heapMB": 5.3
+            "heapMB": 6
           },
-          "content": 485.6,
+          "content": 429.8,
           "selector": "[data-ds=page] [data-ds=panel], [data-ds=page] [data-ds=table-frame]",
-          "fcp": 496,
-          "h1": 485.7,
+          "fcp": 440,
+          "h1": 430.5,
           "long": {
             "count": 2,
-            "total": 292,
-            "max": 197,
-            "blocking": 192
+            "total": 260,
+            "max": 195,
+            "blocking": 160
           }
         },
         {
@@ -3821,12 +3836,12 @@
             }
           },
           "cdp": {
-            "script": 3.5,
+            "script": 4.3,
             "layout": 0,
             "style": 0,
-            "task": 9.4,
+            "task": 8.6,
             "nodes": 400,
-            "heapMB": 5.4
+            "heapMB": 6.1
           },
           "idle": {
             "seconds": 15,
@@ -3851,11 +3866,11 @@
       "windows": [
         {
           "name": "flow",
-          "seconds": 4.4,
+          "seconds": 4.3,
           "net": {
             "total": {
-              "requests": 9,
-              "bytes": 70720
+              "requests": 10,
+              "bytes": 70669
             },
             "cached": 0,
             "document": {
@@ -3864,7 +3879,7 @@
             },
             "script": {
               "requests": 1,
-              "bytes": 8318
+              "bytes": 8275
             },
             "style": {
               "requests": 0,
@@ -3875,9 +3890,9 @@
               "bytes": 48180
             },
             "api": {
-              "requests": 5,
-              "bytes": 14222,
-              "notModified": 0,
+              "requests": 6,
+              "bytes": 14214,
+              "notModified": 1,
               "raw": 115223
             },
             "ws": {
@@ -3896,45 +3911,50 @@
               ],
               "GET /projects/prj_demo/waits": [
                 1,
-                301,
+                297,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3856,
+                3852,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9452,
+                9455,
                 0
               ],
               "GET /projects/prj_demo/reviewers": [
                 1,
-                518,
+                515,
                 0
+              ],
+              "GET /projects/prj_demo": [
+                1,
+                0,
+                1
               ]
             }
           },
           "cdp": {
-            "script": 2210.2,
-            "layout": 144,
-            "style": 120,
-            "task": 3595.2,
-            "nodes": 17583,
-            "heapMB": 43.3
+            "script": 2024.7,
+            "layout": 141.6,
+            "style": 105.9,
+            "task": 3507.5,
+            "nodes": 6592,
+            "heapMB": 32.2
           },
           "steps": {
-            "toManager": 606.1,
-            "toReviews": 1439
+            "toManager": 573.4,
+            "toReviews": 1301.4
           },
-          "content": 2045.1,
+          "content": 1874.8,
           "selector": "Manager, then Reviews",
           "long": {
             "count": 6,
-            "total": 2194,
-            "max": 1136,
-            "blocking": 1894
+            "total": 1972,
+            "max": 1002,
+            "blocking": 1672
           }
         }
       ],
@@ -3950,7 +3970,7 @@
           "net": {
             "total": {
               "requests": 4,
-              "bytes": 7901
+              "bytes": 7903
             },
             "cached": 0,
             "document": {
@@ -3971,7 +3991,7 @@
             },
             "api": {
               "requests": 4,
-              "bytes": 7901,
+              "bytes": 7903,
               "notModified": 0,
               "raw": 56590
             },
@@ -3991,7 +4011,7 @@
               ],
               "GET /projects/prj_other/chat": [
                 1,
-                3175,
+                3177,
                 0
               ],
               "GET /projects/prj_other/tasks": [
@@ -4007,20 +4027,20 @@
             }
           },
           "cdp": {
-            "script": 393.7,
-            "layout": 24.2,
-            "style": 157.6,
-            "task": 1051.5,
-            "nodes": 14666,
-            "heapMB": 28.2
+            "script": 447.3,
+            "layout": 25.3,
+            "style": 140.6,
+            "task": 1069.7,
+            "nodes": 14670,
+            "heapMB": 27.6
           },
-          "content": 1010.8,
+          "content": 1002.6,
           "selector": "[data-task^=tsk_othe] (Widgets' board rows)",
           "long": {
-            "count": 2,
-            "total": 326,
-            "max": 223,
-            "blocking": 226
+            "count": 3,
+            "total": 458,
+            "max": 252,
+            "blocking": 308
           }
         }
       ],
@@ -4032,11 +4052,11 @@
       "windows": [
         {
           "name": "flow",
-          "seconds": 3.5,
+          "seconds": 4,
           "net": {
             "total": {
-              "requests": 3,
-              "bytes": 14999
+              "requests": 5,
+              "bytes": 14998
             },
             "cached": 0,
             "document": {
@@ -4056,9 +4076,9 @@
               "bytes": 0
             },
             "api": {
-              "requests": 3,
-              "bytes": 14999,
-              "notModified": 0,
+              "requests": 5,
+              "bytes": 14998,
+              "notModified": 2,
               "raw": 123120
             },
             "ws": {
@@ -4072,45 +4092,55 @@
             "apiPaths": {
               "GET /projects/prj_demo/tasks/tsk_*": [
                 1,
-                1690,
+                1691,
                 0
               ],
               "GET /projects/prj_demo/reviews": [
                 1,
-                3858,
+                3852,
                 0
               ],
               "GET /agents/agt_*/trace/history?before": [
                 1,
-                9451,
+                9455,
                 0
+              ],
+              "GET /projects/prj_demo/attention": [
+                1,
+                0,
+                1
+              ],
+              "GET /projects/prj_demo/tasks": [
+                1,
+                0,
+                1
               ]
             }
           },
           "cdp": {
-            "script": 1387.2,
-            "layout": 75.8,
-            "style": 209.9,
-            "task": 2815.7,
+            "script": 1515.3,
+            "layout": 76.4,
+            "style": 217.3,
+            "task": 3044.7,
             "nodes": 21619,
-            "heapMB": 27.3
+            "heapMB": 28.7
           },
           "steps": {
-            "open": 1018.4,
-            "close": 378.3
+            "open": 1168.7,
+            "close": 1090.9
           },
-          "content": 1018.4,
+          "content": 1168.7,
           "selector": "[role=dialog] [data-ds=terminal] [data-kind=tool] (open), the dialog hidden (close)",
           "long": {
             "count": 8,
-            "total": 1682,
-            "max": 792,
-            "blocking": 1282
+            "total": 1708,
+            "max": 817,
+            "blocking": 1308
           },
           "keys": {
             "count": 1,
-            "max": 315.2,
-            "median": 315.2
+            "max": 1034.7,
+            "median": 1034.7
           }
         }
       ],
@@ -4122,7 +4152,7 @@
       "windows": [
         {
           "name": "flow",
-          "seconds": 5.1,
+          "seconds": 5,
           "net": {
             "total": {
               "requests": 8,
@@ -4160,22 +4190,17 @@
               "bytes": 0
             },
             "apiPaths": {
-              "GET /projects/prj_demo/tasks": [
-                1,
-                0,
-                1
-              ],
-              "GET /projects/prj_demo/attention": [
-                1,
-                0,
-                1
-              ],
               "GET /projects/prj_demo/chat": [
                 2,
                 0,
                 2
               ],
               "GET /projects": [
+                1,
+                0,
+                1
+              ],
+              "GET /projects/prj_demo": [
                 1,
                 0,
                 1
@@ -4190,7 +4215,12 @@
                 0,
                 1
               ],
-              "GET /projects/prj_demo": [
+              "GET /projects/prj_demo/tasks": [
+                1,
+                0,
+                1
+              ],
+              "GET /projects/prj_demo/attention": [
                 1,
                 0,
                 1
@@ -4198,25 +4228,25 @@
             }
           },
           "cdp": {
-            "script": 394.6,
-            "layout": 31,
-            "style": 81,
-            "task": 1210.9,
+            "script": 360.4,
+            "layout": 32.8,
+            "style": 79.1,
+            "task": 1193,
             "nodes": 11635,
-            "heapMB": 39.7
+            "heapMB": 40.5
           },
           "typed": 40,
           "messages": 151,
           "long": {
-            "count": 1,
-            "total": 52,
-            "max": 52,
-            "blocking": 2
+            "count": 0,
+            "total": 0,
+            "max": 0,
+            "blocking": 0
           },
           "keys": {
             "count": 40,
-            "max": 63.8,
-            "median": 20.6
+            "max": 63,
+            "median": 23.1
           }
         }
       ],
@@ -4304,19 +4334,19 @@
             }
           },
           "cdp": {
-            "script": 2770.9,
-            "layout": 254.6,
-            "style": 443.1,
-            "task": 6275.9,
-            "nodes": 13136,
-            "heapMB": 34.9
+            "script": 2851.7,
+            "layout": 275.8,
+            "style": 421.9,
+            "task": 6361.3,
+            "nodes": 12991,
+            "heapMB": 27.3
           },
           "streamed": 200,
           "long": {
-            "count": 3,
-            "total": 219,
-            "max": 82,
-            "blocking": 69
+            "count": 2,
+            "total": 120,
+            "max": 63,
+            "blocking": 20
           }
         }
       ],
@@ -4399,19 +4429,19 @@
             }
           },
           "cdp": {
-            "script": 3913.2,
-            "layout": 333.5,
-            "style": 261.3,
-            "task": 7026.2,
-            "nodes": 12770,
-            "heapMB": 36.3
+            "script": 2412.8,
+            "layout": 328.1,
+            "style": 236.8,
+            "task": 4610,
+            "nodes": 12906,
+            "heapMB": 25
           },
           "streamed": 200,
           "long": {
-            "count": 2,
-            "total": 158,
-            "max": 100,
-            "blocking": 58
+            "count": 0,
+            "total": 0,
+            "max": 0,
+            "blocking": 0
           }
         }
       ],
@@ -4463,20 +4493,20 @@
             "apiPaths": {}
           },
           "cdp": {
-            "script": 1154.5,
-            "layout": 27.1,
-            "style": 69.9,
-            "task": 1392.5,
-            "nodes": 13980,
-            "heapMB": 34.8
+            "script": 1085,
+            "layout": 21.3,
+            "style": 40.5,
+            "task": 1321.3,
+            "nodes": 14388,
+            "heapMB": 30.7
           },
-          "content": 368.3,
+          "content": 320.3,
           "selector": "[data-ds=terminal] .mantine-ScrollArea-viewport [data-kind=tool]",
           "long": {
-            "count": 1,
-            "total": 152,
-            "max": 152,
-            "blocking": 102
+            "count": 2,
+            "total": 229,
+            "max": 175,
+            "blocking": 129
           }
         }
       ],
@@ -4491,7 +4521,7 @@
           "seconds": 2.8,
           "net": {
             "total": {
-              "requests": 5,
+              "requests": 4,
               "bytes": 9630
             },
             "cached": 0,
@@ -4512,9 +4542,9 @@
               "bytes": 0
             },
             "api": {
-              "requests": 5,
+              "requests": 4,
               "bytes": 9630,
-              "notModified": 2,
+              "notModified": 1,
               "raw": 50344
             },
             "ws": {
@@ -4531,12 +4561,7 @@
                 9630,
                 0
               ],
-              "GET /projects/prj_demo/tasks": [
-                1,
-                0,
-                1
-              ],
-              "GET /projects/prj_demo/attention": [
+              "GET /projects/prj_demo/chat": [
                 1,
                 0,
                 1
@@ -4544,27 +4569,27 @@
             }
           },
           "cdp": {
-            "script": 1186.8,
-            "layout": 136.4,
-            "style": 102.1,
-            "task": 1934.2,
+            "script": 1321.4,
+            "layout": 180.4,
+            "style": 190.8,
+            "task": 2155,
             "nodes": 16827,
-            "heapMB": 51.6
+            "heapMB": 50.1
           },
           "steps": {
             "pages": [
-              676.1,
-              631.9,
-              563.3
+              368.8,
+              632.1,
+              542.4
             ]
           },
-          "content": 1871.3,
+          "content": 1543.3,
           "selector": "50 more messages, three times",
           "long": {
-            "count": 5,
-            "total": 1478,
-            "max": 490,
-            "blocking": 1228
+            "count": 7,
+            "total": 1668,
+            "max": 500,
+            "blocking": 1318
           }
         }
       ],
@@ -4576,11 +4601,11 @@
       "windows": [
         {
           "name": "flow",
-          "seconds": 1.8,
+          "seconds": 2.4,
           "net": {
             "total": {
-              "requests": 5,
-              "bytes": 28775
+              "requests": 2,
+              "bytes": 20159
             },
             "cached": 0,
             "document": {
@@ -4600,10 +4625,10 @@
               "bytes": 0
             },
             "api": {
-              "requests": 5,
-              "bytes": 28775,
-              "notModified": 2,
-              "raw": 136086
+              "requests": 2,
+              "bytes": 20159,
+              "notModified": 0,
+              "raw": 95649
             },
             "ws": {
               "requests": 0,
@@ -4615,44 +4640,34 @@
             },
             "apiPaths": {
               "GET /agents/agt_*/trace/history?before": [
-                3,
-                28775,
+                2,
+                20159,
                 0
-              ],
-              "GET /projects/prj_demo/tasks": [
-                1,
-                0,
-                1
-              ],
-              "GET /projects/prj_demo/attention": [
-                1,
-                0,
-                1
               ]
             }
           },
           "cdp": {
-            "script": 425.1,
-            "layout": 58,
-            "style": 62.6,
-            "task": 907.3,
-            "nodes": 14161,
-            "heapMB": 27.6
+            "script": 1051.7,
+            "layout": 37.9,
+            "style": 50.6,
+            "task": 1541.2,
+            "nodes": 12770,
+            "heapMB": 32.9
           },
           "steps": {
             "pages": [
-              343.9,
-              209.1,
-              298.7
+              990.2,
+              230.6,
+              218.2
             ]
           },
-          "content": 851.7,
+          "content": 1439,
           "selector": "a history page, three times",
           "long": {
-            "count": 3,
-            "total": 329,
-            "max": 142,
-            "blocking": 179
+            "count": 2,
+            "total": 196,
+            "max": 109,
+            "blocking": 96
           }
         }
       ],
@@ -4664,11 +4679,11 @@
       "windows": [
         {
           "name": "flow",
-          "seconds": 3.2,
+          "seconds": 3.1,
           "net": {
             "total": {
               "requests": 2,
-              "bytes": 11987
+              "bytes": 11979
             },
             "cached": 0,
             "document": {
@@ -4689,7 +4704,7 @@
             },
             "api": {
               "requests": 2,
-              "bytes": 11987,
+              "bytes": 11979,
               "notModified": 0,
               "raw": 139142
             },
@@ -4704,29 +4719,29 @@
             "apiPaths": {
               "PATCH /projects/prj_demo/tasks/tsk_*": [
                 1,
-                230,
+                229,
                 0
               ],
               "GET /projects/prj_demo/tasks": [
                 1,
-                11757,
+                11750,
                 0
               ]
             }
           },
           "cdp": {
-            "script": 523.2,
-            "layout": 34.9,
-            "style": 134.4,
-            "task": 1550.6,
+            "script": 454.9,
+            "layout": 25.5,
+            "style": 153.8,
+            "task": 1462.1,
             "nodes": 11434,
-            "heapMB": 32.7
+            "heapMB": 29
           },
           "long": {
-            "count": 3,
-            "total": 273,
-            "max": 122,
-            "blocking": 123
+            "count": 2,
+            "total": 210,
+            "max": 110,
+            "blocking": 110
           }
         }
       ],
@@ -4738,11 +4753,11 @@
       "windows": [
         {
           "name": "flow",
-          "seconds": 4.7,
+          "seconds": 5.1,
           "net": {
             "total": {
-              "requests": 5,
-              "bytes": 0
+              "requests": 6,
+              "bytes": 9453
             },
             "cached": 0,
             "document": {
@@ -4762,10 +4777,10 @@
               "bytes": 0
             },
             "api": {
-              "requests": 5,
-              "bytes": 0,
+              "requests": 6,
+              "bytes": 9453,
               "notModified": 5,
-              "raw": 0
+              "raw": 45303
             },
             "ws": {
               "requests": 0,
@@ -4776,6 +4791,11 @@
               "bytes": 0
             },
             "apiPaths": {
+              "GET /agents/agt_*/trace/history?before": [
+                1,
+                9453,
+                0
+              ],
               "GET /projects/prj_demo/tasks": [
                 1,
                 0,
@@ -4804,30 +4824,30 @@
             }
           },
           "cdp": {
-            "script": 3723.5,
-            "layout": 68.7,
-            "style": 110.2,
-            "task": 4342.3,
-            "nodes": 43598,
-            "heapMB": 68.5
+            "script": 3621.2,
+            "layout": 211.9,
+            "style": 264.5,
+            "task": 4756.8,
+            "nodes": 15927,
+            "heapMB": 31.9
           },
           "steps": {
             "times": [
-              336.1,
-              233.6,
-              133.3,
-              315.4,
-              143.6,
-              307.8
+              406.5,
+              261.3,
+              215.7,
+              262,
+              222.8,
+              462.5
             ]
           },
-          "content": 245,
+          "content": 305.1,
           "selector": "each switch (mean)",
           "long": {
-            "count": 4,
-            "total": 760,
-            "max": 234,
-            "blocking": 560
+            "count": 13,
+            "total": 1722,
+            "max": 349,
+            "blocking": 1072
           }
         }
       ],
@@ -4877,12 +4897,12 @@
               "bytes": 0
             },
             "apiPaths": {
-              "GET /projects/prj_demo/tasks": [
+              "GET /projects/prj_demo/attention": [
                 12,
                 0,
                 12
               ],
-              "GET /projects/prj_demo/attention": [
+              "GET /projects/prj_demo/tasks": [
                 12,
                 0,
                 12
@@ -4905,12 +4925,12 @@
             }
           },
           "cdp": {
-            "script": 644.7,
+            "script": 604.8,
             "layout": 0.4,
             "style": 0,
-            "task": 847.4,
+            "task": 904.2,
             "nodes": 11169,
-            "heapMB": 21.3
+            "heapMB": 21.6
           },
           "idle": {
             "seconds": 60,
@@ -4938,8 +4958,8 @@
           "seconds": 60,
           "net": {
             "total": {
-              "requests": 72,
-              "bytes": 0
+              "requests": 73,
+              "bytes": 9450
             },
             "cached": 0,
             "document": {
@@ -4959,10 +4979,10 @@
               "bytes": 0
             },
             "api": {
-              "requests": 72,
-              "bytes": 0,
+              "requests": 73,
+              "bytes": 9450,
               "notModified": 72,
-              "raw": 0
+              "raw": 45303
             },
             "ws": {
               "requests": 0,
@@ -4973,6 +4993,11 @@
               "bytes": 0
             },
             "apiPaths": {
+              "GET /agents/agt_*/trace/history?before": [
+                1,
+                9450,
+                0
+              ],
               "GET /projects/prj_demo/chat": [
                 20,
                 0,
@@ -5016,25 +5041,25 @@
             }
           },
           "cdp": {
-            "script": 1317.9,
-            "layout": 60.4,
-            "style": 254.6,
-            "task": 2962.9,
+            "script": 1307.2,
+            "layout": 54.2,
+            "style": 244.4,
+            "task": 2745.7,
             "nodes": 4340,
-            "heapMB": 19.2
+            "heapMB": 20.1
           },
           "idle": {
             "seconds": 60,
-            "apiRequestsPerMin": 72,
-            "apiBytesPerMin": 0,
+            "apiRequestsPerMin": 73,
+            "apiBytesPerMin": 9450,
             "wsBytesPerMin": 0,
             "api304": 72
           },
           "long": {
             "count": 3,
-            "total": 258,
-            "max": 99,
-            "blocking": 108
+            "total": 255,
+            "max": 96,
+            "blocking": 105
           }
         }
       ],
