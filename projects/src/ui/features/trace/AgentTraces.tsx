@@ -1,7 +1,8 @@
 // The trace viewer's mounts, one per place an agent's work is watched: the manager's (a "Trace" tab beside
 // "Chat" on the Manager page), a task's worker's (the task drawer on the board), and a review job's
-// reviewer's (the Reviews page, per job). Each connects only while it is shown, and owns no data of the
-// page's: it is given the agent's id.
+// reviewer's (the Reviews page, per job). Each connects while it is mounted (the manager's uses the
+// Manager page's one connection, shared with the chat: SharedTrace), and owns no data of the page's: it is
+// given the agent's id.
 
 import type { Settings, Task } from "../../api/types";
 import { TraceView } from "./TraceView";

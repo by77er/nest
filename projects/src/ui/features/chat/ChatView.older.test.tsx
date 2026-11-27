@@ -30,6 +30,8 @@ describe("the chat's older messages", () => {
     renderApp("/projects/prj_one/manager", api);
     const log = await screen.findByRole("log", { name: "Conversation with the manager" });
     await within(log).findByText("Message 160");
+    // The latest page all drawn (its newest first, then the rest): the top is the top.
+    await within(log).findByText("Message 111");
     // At the top (jsdom has no layout: scrollTop is 0): five scroll events in one task, as a wheel gives.
     for (let i = 0; i < 5; i++) fireEvent.scroll(log);
     await within(log).findByText("Message 61");

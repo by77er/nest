@@ -343,18 +343,23 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     current = groupTurnsFrom(grouping, state.events, state.older);
     setGrouping(current);
   }
-  // Many turns at once into an empty log (mounting on a long trace, a backlog arriving): only the newest
-  // (DRAWN_FIRST lines), from the one `cut` names, until the transition below draws the rest. (A history page, or
-  // anything else added to turns already drawn, is drawn at once, as before.)
+  // Many turns at once into an empty log (mounting on a long trace, or the first connection's backlog, which
+  // can come over several frames): only the newest (DRAWN_FIRST items), from the turn `cut` names, the window
+  // moving with the backlog as it comes; once it's in, the rest in one transition. (A history page, a
+  // reconnect's events, or anything else added to turns already drawn, is drawn at once, as before.)
+  const receiving = state.status === "connecting";
   const [cut, setCut] = useState<string | null>(() => cutFor(current.groups));
   const [counted, setCounted] = useState(current.groups.length);
   if (counted !== current.groups.length) {
     setCounted(current.groups.length);
-    if (counted === 0 && cut === null) setCut(cutFor(current.groups));
+    if (receiving || (counted === 0 && cut === null)) {
+      const c = cutFor(current.groups);
+      if (c !== cut) setCut(c);
+    }
   }
   useEffect(() => {
-    if (cut !== null) startTransition(() => setCut(null));
-  }, [cut]);
+    if (cut !== null && !receiving) startTransition(() => setCut(null));
+  }, [cut, receiving]);
   const from = cut === null ? -1 : current.groups.findIndex((g) => g.key === cut);
   const groups = from > 0 ? current.groups.slice(from) : current.groups;
   const partial = from > 0;
@@ -378,11 +383,15 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   const load = useRef(loadOlder);
   load.current = loadOlder;
   // Not while the turns above are still being drawn: the top isn't the top yet.
-  const canLoad = typeof state.olderCursor === "string" && state.olderState === "idle" && !partial;
+  const canLoad = typeof state.olderCursor === "string" && state.olderState === "idle";
   const canLoadRef = useRef(canLoad);
   canLoadRef.current = canLoad;
+  // Whether the turns above the newest are still to be drawn, as committed (a render in progress, a
+  // transition's yielding to a scroll, doesn't count): the top isn't the top yet, so nothing older is asked.
+  const partialRef = useRef(partial);
 
   const older = () => {
+    if (partialRef.current) return;
     const v = viewport.current;
     heightBefore.current = v ? v.scrollHeight : null;
     held.current = v ? readerLine(v) : null;
@@ -465,7 +474,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       setAtBottom(near);
       if (near) setUnseen(0);
       // Near the top: the page before, if there is one.
-      if (v.scrollTop <= NEAR_TOP && !near && canLoadRef.current) older();
+      if (v.scrollTop <= NEAR_TOP && !near && canLoadRef.current && !partialRef.current) older();
     };
     v.addEventListener("scroll", onScroll, { passive: true });
     return () => {
@@ -509,11 +518,12 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     heightBefore.current = null;
     if (holding.current === 0) held.current = null;
     // Not enough yet to scroll (so no way to reach the top): the page before, too.
-    if (canLoadRef.current && v.clientHeight > 0 && v.scrollHeight <= v.clientHeight) older();
+    if (canLoadRef.current && !partialRef.current && v.clientHeight > 0 && v.scrollHeight <= v.clientHeight) older();
   }, [state.older]);
 
   // The turns above drawn (the transition): a reader following stays at the bottom.
   useLayoutEffect(() => {
+    partialRef.current = partial;
     const v = viewport.current;
     if (v && !partial && atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
   }, [partial]);

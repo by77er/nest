@@ -432,6 +432,11 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const composer = useRef<ComposerHandle>(null);
   const seen = useRef<Set<number> | null>(null);
   const anchor = useRef<number | null>(null);
+  // One page at a time: scroll events that come before the render showing "loading" read the handler as it
+  // was, so the flag the guard reads is a ref, set before the request and cleared once its page is drawn.
+  const loadingOlderRef = useRef(false);
+  // The log's first fill still being drawn above the newest messages (below): the top isn't the top yet.
+  const partialRef = useRef(false);
   // Nothing said yet and no turn running: nothing to follow (its welcome is read from the top).
   const emptyRef = useRef(true);
   // The last stream, kept until the turn's message lands, so the swap doesn't jump.
@@ -551,8 +556,10 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     return () => ro.disconnect();
   }, [chat.isPending, chat.isError]); // the log mounts once the chat has loaded
 
-  // Older messages keep the place you were reading: the distance from the bottom is restored.
+  // Older messages keep the place you were reading: the distance from the bottom is restored. And the
+  // next page may be asked for only now that this one is drawn (a scroll before would ask for it again).
   useLayoutEffect(() => {
+    loadingOlderRef.current = false;
     const el = log.current;
     if (el && anchor.current !== null) {
       el.scrollTop = el.scrollHeight - anchor.current;
@@ -560,11 +567,6 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     }
   }, [older]);
 
-  // One page at a time: scroll events that come before the render showing "loading" read the handler as it
-  // was, so the flag the guard reads is a ref, set before the request (README.md#performance).
-  const loadingOlderRef = useRef(false);
-  // The log's first fill still being drawn above the newest messages (below): the top isn't the top yet.
-  const partialRef = useRef(false);
   const loadOlder = useCallback(async () => {
     const first = messages.find((m) => m.seq > 0);
     if (!first || loadingOlderRef.current || !hasOlder) return;
@@ -573,13 +575,14 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     try {
       const page = await api.chat(projectId, first.seq);
       const el = log.current;
-      if (el) anchor.current = el.scrollHeight - el.scrollTop;
-      setOlder((o) => [...page, ...o]);
+      if (page.length === 0) loadingOlderRef.current = false; // nothing to draw: the [older] effect won't run
+      else if (el) anchor.current = el.scrollHeight - el.scrollTop;
+      setOlder((o) => (page.length ? [...page, ...o] : o));
       if (page.length < PAGE) setHasOlder(false);
     } catch {
       // Tried again on the next scroll.
-    } finally {
       loadingOlderRef.current = false;
+    } finally {
       setLoadingOlder(false);
     }
   }, [messages, hasOlder, projectId]);
@@ -676,7 +679,11 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   }, [cut]);
   const from = cut === null ? -1 : items.findIndex((it) => it.key === cut);
   const drawn = from > 0 ? items.slice(from) : items;
-  partialRef.current = from > 0;
+  // As committed: a transition's render in progress (yielding to a scroll) doesn't count.
+  const partial = from > 0;
+  useLayoutEffect(() => {
+    partialRef.current = partial;
+  }, [partial]);
 
   const item = (it: LogItem) =>
     it.kind === "day" ? (

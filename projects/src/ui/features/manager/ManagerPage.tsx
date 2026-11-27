@@ -21,9 +21,11 @@ export function ManagerPage() {
   const navigate = useNavigate({ from: "/projects/$projectId/manager" });
   const tab = view ?? "chat";
   // The trace, once opened, stays (hidden while Chat shows, as the task drawer's does): coming back to it
-  // draws nothing again, and the reader's place in it is kept. The chat is drawn anew each time.
-  const [traceOpened, setTraceOpened] = useState(tab === "trace");
-  if (tab === "trace" && !traceOpened) setTraceOpened(true);
+  // draws nothing again, and the reader's place in it is kept. The chat is drawn anew each time. Another
+  // project's Manager starts with its trace closed.
+  const [openedFor, setOpenedFor] = useState(tab === "trace" ? projectId : null);
+  if (tab === "trace" && openedFor !== projectId) setOpenedFor(projectId);
+  const traceOpened = openedFor === projectId;
   return (
     <ProjectFrame projectId={projectId}>
       {(p) => (

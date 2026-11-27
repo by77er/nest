@@ -97,11 +97,18 @@ describe("conditional GETs", () => {
     version = 2;
     expect(await api.waits("prj_c7")).toEqual({ v: 2 });
     expect(seen).toEqual([{ inm: null, own: null }, { inm: null, own: 'W/"v1"' }, { inm: null, own: 'W/"v1"' }]);
-    // With both, the standard ETag wins and goes back in If-None-Match.
-    const s = server(() => ({ body: { n: 1 }, etag: '"std"' }));
-    await api.waits("prj_c8");
-    await api.waits("prj_c8");
-    expect(s.seen.map((x) => x.ifNoneMatch)).toEqual([null, '"std"']);
+    // With both (as the Worker sends them), the standard ETag wins and goes back in If-None-Match.
+    const both: { inm: string | null; own: string | null }[] = [];
+    vi.stubGlobal("fetch", async (_: RequestInfo | URL, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      both.push({ inm: h.get("if-none-match"), own: h.get("x-if-none-match") });
+      return h.get("if-none-match") === '"std"'
+        ? new Response(null, { status: 304, headers: { etag: '"std"', "x-etag": '"own"' } })
+        : new Response(JSON.stringify({ n: 1 }), { headers: { "content-type": "application/json", etag: '"std"', "x-etag": '"own"' } });
+    });
+    const a = await api.waits("prj_c8");
+    expect(Object.is(await api.waits("prj_c8"), a)).toBe(true);
+    expect(both).toEqual([{ inm: null, own: null }, { inm: '"std"', own: null }]);
   });
 
   it("never answers a write from what it remembers, and the GET after it gets the new state", async () => {
