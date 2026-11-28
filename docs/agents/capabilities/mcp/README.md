@@ -25,7 +25,7 @@ prompt: The notes server.
 
 **Decided (2026-11-02):** a server that admits its callers by their [caller identity](../../../control-plane/api/clients/#caller-identity-for-mcp-servers) alone takes a capability with no `auth`, so it needs no dummy secret.
 - **What nest sends:** no `Authorization` header, on agents' sessions and on the connector's listing session alike. `Nest-Identity` is the only credential, so the server must verify it on every request, `tools/list` included ([remote-mcp](../../../interfaces/remote-mcp/)).
-- **A client's grant** has no secret to cover for it (`credentials`); `mcp_urls` still bounds where it points.
+- **A client's grant** has no secret to cover for it, and no server list ([tool credentials are an app's own](../../../control-plane/api/clients/#tool-credentials-are-an-apps-own)).
 - **A 401** is `unauthorized` (it refused the identity); there is no bearer to renew.
 
 ## The connector
