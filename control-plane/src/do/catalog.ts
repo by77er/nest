@@ -29,13 +29,13 @@ import { ErrorCodes } from "../protocol/model";
 const PREVIOUS_RELEASE_TEMPLATE_FIELDS = { escalate_to: "user", subscribe: [] } as const;
 const templateRow = (t: Template): string => JSON.stringify({ ...PREVIOUS_RELEASE_TEMPLATE_FIELDS, ...t });
 
+/** A fresh `{authorize}` incarnation: 16 random lowercase hex characters. */
+const newIncarnation = () => [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
 /**
  * A client acting on the catalog (docs/control-plane/api/clients/#the-clients-catalog): it sees the
  * operator's entries and its own namespace, and everything it writes or spawns is held to its grant.
  */
-/** A fresh `{authorize}` incarnation: 16 random lowercase hex characters. */
-const newIncarnation = () => [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
-
 export interface ClientScope {
   /** Its id, `cli_…` (named in refusals). */
   client: string;

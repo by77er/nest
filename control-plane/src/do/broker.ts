@@ -194,11 +194,6 @@ export class BrokerDO extends DurableObject<Env> {
     return { revoked: await this.oauth.revoke(capability, caller) };
   }
 
-  /**
-   * An API client starts authorizing an mcp capability of its own namespace (`{authorize}` auth,
-   * docs/control-plane/api/clients/#mcp-credentials): as `oauthStart`, its tokens kept under the record
-   * derived from the client and the entry, never one it names.
-   */
   /** The incarnation a client's `{authorize}` capability holds now in CatalogDO, or null (gone, or another form). */
   private async incarnationOf(capability: string): Promise<string | null> {
     let cap: unknown;
@@ -212,6 +207,11 @@ export class BrokerDO extends DurableObject<Env> {
     return isClientMcpAuth(auth) && "authorize" in auth ? (auth.incarnation ?? "0") : null;
   }
 
+  /**
+   * An API client starts authorizing an mcp capability of its own namespace (`{authorize}` auth,
+   * docs/control-plane/api/clients/#mcp-credentials): as `oauthStart`, its tokens kept under the record
+   * derived from the client and the entry, never one it names.
+   */
   async clientOAuthStart(input: { client: string; clientName: string; capability: string; entry: string; incarnation: string; url: string; scopes?: string[]; capScopes?: string[]; caller?: string }): Promise<StartAnswer> {
     const auth = { oauth: clientOAuthRef(input.client, input.entry, input.incarnation), ...(input.capScopes ? { scopes: input.capScopes } : {}) };
     return await this.oauth.start({

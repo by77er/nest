@@ -334,9 +334,9 @@ async function authServerMetadata(issuer: URL, allowLoopback: boolean): Promise<
 
 // --- Client identity -------------------------------------------------------------------------------------------
 
-/** The Worker's OAuth URLs: the redirect URI, and the client ID metadata document (which is the client id). */
 /**
- * nest's OAuth client identity for a flow: the operator's own, or, for an API client's capability, that
+ * The Worker's OAuth URLs (the redirect URI, and the client ID metadata document, which is the client id): nest's
+ * OAuth client identity for a flow: the operator's own, or, for an API client's capability, that
  * client's (`owner`, its id), with a callback and a metadata document of its own. So an authorization server
  * sees each app as a client of its own: consent given to one never lets another app's flow through unasked,
  * and a registration (keyed by its redirect URI) is never shared between them (docs/control-plane/api/clients/#mcp-credentials).
