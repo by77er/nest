@@ -220,7 +220,7 @@ interface PreviousReleaseFields {
 }
 
 /** AgentDO's alarm keys (each needs a handler in `alarm()`). */
-type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events" | "seg_trash" | "rules";
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events" | "seg_trash" | "rules" | "timer_notices";
 /**
  * A `sync` ask's window, `ask:<ask id>`: armed only by the previous release's `ask` tool, which left the
  * platform. One it armed still ends its waiting call here (`askWindowLapsed`); dropped next release.
@@ -440,7 +440,7 @@ export class AgentDO extends DurableObject<Env> {
     this.journal = new BrokeredJournal(this.sql);
     this.timerStore = new TimerStore(this.sql);
     // Timers a rolled-back release left without their deadline are armed again at once (the alarm does too).
-    if (this.timerStore.names().length) void ctx.blockConcurrencyWhile(() => this.rearmTimers());
+    if (this.timerStore.names().length || this.timerStore.notices().length) void ctx.blockConcurrencyWhile(() => this.rearmTimers());
     this.outbox = new ClientOutbox(this.sql);
     this.traceRing = new TraceRing(this.sql);
     // A trace client's keepalive, answered by the runtime without waking this object. The runner sends only JSON objects, never this.
@@ -2923,21 +2923,36 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /**
-   * Arm every timer that has no deadline (a release without the handler dropped it): late, never lost. First, in
-   * one synchronous step, repeats a release without them left behind (a rollback): one whose timer that release
-   * fired (its input `timer/<id>` is in the inbox) and deleted is restored on its cadence; one it cancelled or
-   * set again, or whose agent ended, is forgotten.
+   * Arm every timer that has no deadline (a release without the handler dropped it): late, never lost. First,
+   * repeats a release without them left behind (a rollback) are forgotten, in one synchronous step. Nothing that
+   * release leaves says what the agent did with the name afterwards (set it again, cancelled it), so none is
+   * restored: one whose timer that release fired as a one-shot (its input `timer/<id>` is in the inbox) is told to
+   * the agent instead, once, so it can set it again.
    */
   private async rearmTimers(): Promise<void> {
-    const now = Date.now();
     const live = this.exists() && !this.load().ended;
     for (const r of this.timerStore.orphanedRepeats()) {
-      if (live && !r.replaced && this.queue.messageFor(`timer/${r.id}`) !== undefined) this.timerStore.restore(r, nextFiring(r.at_ms, r.every_ms, now), now);
+      if (live && this.queue.messageFor(`timer/${r.id}`) !== undefined) this.timerStore.stopRepeat(r);
       else this.timerStore.forgetRepeat(r.name, r.id);
     }
+    // Told from the alarm (never from here, which may run inside the constructor's blockConcurrencyWhile, where
+    // waiting on another object could deadlock), armed in the same step as the notices were queued.
+    if (this.timerStore.notices().length && !this.deadlines.has("timer_notices")) await this.deadlines.set("timer_notices", Date.now());
     for (const t of this.timerStore.list()) {
       const key = `${TIMER_DEADLINE}${t.name}` as const;
       if (!this.deadlines.has(key)) await this.deadlines.set(key, t.at_ms);
+    }
+  }
+
+  /** Tell the agent of each repeat a rollback ended (`rearmTimers`), once each: posted, then forgotten. */
+  private async timerNotices(): Promise<void> {
+    const live = this.exists() && !this.load().ended;
+    for (const n of this.timerStore.notices()) {
+      if (live) {
+        await this.postInbox(TIMER_SENDER, `timer "${n.name}" stopped repeating (every ${everyText(n.every_ms)}) during a platform rollback, after firing once: set it again with every_s if you still want it.`,
+          false, `timer/${n.id}/stopped`);
+      }
+      this.timerStore.noticeDone(n.id);
     }
   }
 
@@ -3894,6 +3909,7 @@ export class AgentDO extends DurableObject<Env> {
           await this.deadlines.set("rules", Date.now() + RULES_RETRY_MS);
         }
       },
+      timer_notices: () => this.timerNotices(),
       client_events: async () => {
         if (await this.outbox.handOff(this.env)) await this.deadlines.set("client_events", Date.now());
       },

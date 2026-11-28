@@ -96,8 +96,10 @@ export class TimerStore {
     // Added with repeating timers, a table of its own that the previous release never touches: a timer repeats
     // while its row here has the timer's id. So the previous release's re-set of the name (a new id) reads as the
     // one-shot timer it set, and what it does to a repeating timer during a rollback leaves this row behind for
-    // `orphanedRepeats` to judge: fired (restored on its cadence), cancelled or set again (dropped).
+    // `orphanedRepeats` to judge: each is forgotten, and one that release fired, told to the agent.
     sql.exec("CREATE TABLE IF NOT EXISTS timer_repeats (name TEXT PRIMARY KEY, id TEXT NOT NULL, every_ms INTEGER NOT NULL, note TEXT NOT NULL, at_ms INTEGER NOT NULL)");
+    // Repeats a rollback ended, to tell the agent about (posted from the alarm, `timer_notices`).
+    sql.exec("CREATE TABLE IF NOT EXISTS timer_notices (id TEXT PRIMARY KEY, name TEXT NOT NULL, every_ms INTEGER NOT NULL)");
   }
 
   private static readonly SELECT = `SELECT t.name AS name, t.id AS id, t.at_ms AS at_ms, t.note AS note, t.set_ms AS set_ms, r.every_ms AS every_ms
@@ -169,20 +171,28 @@ export class TimerStore {
 
   /**
    * Repeats whose timer is gone or was set again: only a release that doesn't know them (a rollback) leaves one,
-   * since this one deletes a timer's repeat in the step that deletes or replaces the timer. `replaced`: the name
-   * holds another timer now.
+   * since this one deletes a timer's repeat in the step that deletes or replaces the timer.
    */
-  orphanedRepeats(): { name: string; id: string; every_ms: number; note: string; at_ms: number; replaced: boolean }[] {
-    return this.sql.exec<{ name: string; id: string; every_ms: number; note: string; at_ms: number; replaced: number }>(
-      `SELECT r.name AS name, r.id AS id, r.every_ms AS every_ms, r.note AS note, r.at_ms AS at_ms, t.name IS NOT NULL AS replaced
-       FROM timer_repeats r LEFT JOIN timers t ON t.name = r.name WHERE t.id IS NULL OR t.id != r.id`).toArray()
-      .map((r) => ({ ...r, replaced: !!r.replaced }));
+  orphanedRepeats(): { name: string; id: string; every_ms: number }[] {
+    return this.sql.exec<{ name: string; id: string; every_ms: number }>(
+      `SELECT r.name AS name, r.id AS id, r.every_ms AS every_ms
+       FROM timer_repeats r LEFT JOIN timers t ON t.name = r.name WHERE t.id IS NULL OR t.id != r.id`).toArray();
   }
 
-  /** Put a repeating timer back as it was (`orphanedRepeats`: the previous release fired it once and deleted it). */
-  restore(r: { name: string; id: string; every_ms: number; note: string }, at: number, now: number): void {
-    this.sql.exec("INSERT INTO timers (name, id, at_ms, note, set_ms) VALUES (?, ?, ?, ?, ?)", r.name, r.id, at, r.note, now);
-    this.sql.exec("UPDATE timer_repeats SET at_ms = ? WHERE name = ? AND id = ?", at, r.name, r.id);
+  /** Forget a repeat left behind and queue a notice of it for the agent, in one step. */
+  stopRepeat(r: { name: string; id: string; every_ms: number }): void {
+    this.forgetRepeat(r.name, r.id);
+    this.sql.exec("INSERT OR IGNORE INTO timer_notices (id, name, every_ms) VALUES (?, ?, ?)", r.id, r.name, r.every_ms);
+  }
+
+  /** Notices not yet posted. */
+  notices(): { id: string; name: string; every_ms: number }[] {
+    return this.sql.exec<{ id: string; name: string; every_ms: number }>("SELECT id, name, every_ms FROM timer_notices ORDER BY rowid").toArray();
+  }
+
+  /** A notice posted (or no longer wanted). */
+  noticeDone(id: string): void {
+    this.sql.exec("DELETE FROM timer_notices WHERE id = ?", id);
   }
 
   /** Forget a repeat left behind (its timer was cancelled or set again under a release that doesn't know it). */
