@@ -40,7 +40,8 @@
     "PROJECTS_AUD": "08e750a01b448aeea2f1d52dd521b01822359dd08ef898e610b53b46575ed580",
     // The nest API clients whose own agents /mcp/discord serves (README.md#linked-servers-discord), comma or space
     // separated: the Discord bot's client (by77er/helpers, app discord/). Not a secret. Empty: that server refuses
-    // everything. Only projects the owner links to a Discord server in Settings are visible to them. Here rather
+    // everything. Only projects the owner links to a Discord server in Settings are visible to them. Each listed
+    // client speaks for any Discord server id (its agents' `guild` label is its word): list only the one bot. Here rather
     // than the dashboard: `wrangler deploy` replaces the dashboard's vars with this file's.
     "LINKED_CLIENTS": "cli_01m8fsmzm324sx8vx94rz7rd8j"
   }

@@ -13,7 +13,7 @@ import { useId, useRef, useState } from "react";
 import { useProposals, useTriageProposal } from "../../api/queries";
 import type { Proposal } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
+import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, Token, weight } from "../../layout";
 import { preview } from "../triage/TriagePage";
 import { UntrustedBadge } from "./Untrusted";
 
@@ -49,7 +49,14 @@ function ProposalCard({ projectId, p }: { projectId: string; p: Proposal }) {
         </Text>
         <MetaRow>
           <UntrustedBadge what={`the proposed task “${p.title}”`} />
-          <MetaItem>{p.guild ? `From the Discord server ${p.guild} (agent ${p.run})` : `From the routine ${p.routine_name} (run ${p.run})`}</MetaItem>
+          {p.guild ? (
+            // The ids as ids (mono, each kept on one line), as Settings shows a server's.
+            <MetaItem>
+              From the Discord server <Token nowrap>{p.guild}</Token> · agent <Token nowrap>{p.run}</Token>
+            </MetaItem>
+          ) : (
+            <MetaItem>From the routine {p.routine_name} (run {p.run})</MetaItem>
+          )}
           <MetaItem title={exact(p.created_ms)}>{ago(p.created_ms)}</MetaItem>
         </MetaRow>
         {body && (

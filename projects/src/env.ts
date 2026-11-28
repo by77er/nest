@@ -35,7 +35,9 @@ export interface Env {
   GITHUB_ACCOUNTS?: string;
   /**
    * The API clients whose own agents `/mcp/discord` serves (comma or space separated client ids; the Discord bot's).
-   * Unset or empty: that server refuses everything. README.md#linked-servers-discord.
+   * Unset or empty: that server refuses everything. Each listed client is trusted to speak for any Discord server:
+   * links are keyed by the server's id alone, and an agent's `guild` label is its client's word (nest vouches for the
+   * client, not the server). So list only one bot, one you trust. README.md#linked-servers-discord.
    */
   LINKED_CLIENTS?: string;
 }

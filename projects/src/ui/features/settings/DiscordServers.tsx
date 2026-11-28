@@ -64,15 +64,16 @@ export function DiscordServers({ projectId }: { projectId: string }) {
               No server linked
             </Text>
           ) : (
-            // Rows of controls (an id, its Remove): a 44 px pitch on touch.
-            <Stack gap="sm" data-touch-pitch role="list" aria-label="Linked Discord servers">
+            // Rows of controls (an id, its Remove): a 44 px pitch on touch. Each id with its date right under it,
+            // closer to it than to the next row's.
+            <Stack gap="md" data-touch-pitch role="list" aria-label="Linked Discord servers">
               {list.map((l) => (
                 <Row key={l.guild} gap="sm" wrap="nowrap" role="listitem" data-link={l.guild}>
                   <Grow>
-                    <Row gap="sm">
+                    <Stack gap="2xs">
                       <Token size="sm" dimmed={false}>{l.guild}</Token>
                       <MetaItem title={exact(l.created_ms)}>Linked {ago(l.created_ms)}</MetaItem>
-                    </Row>
+                    </Stack>
                   </Grow>
                   <RowAction variant="subtle" color="danger" loading={unlink.isPending && unlink.variables === l.guild} onClick={() => confirmRemove(l.guild)} aria-label={`Remove the Discord server ${l.guild}`}>
                     Remove
@@ -81,23 +82,27 @@ export function DiscordServers({ projectId }: { projectId: string }) {
               ))}
             </Stack>
           )}
-          {links.data && (
+          {links.data && full ? (
+            // At the cap: said as a line of its own, not as a disabled field's hint (out of the tab order).
+            <Text fz="sm" c="dimmed" data-slot="links-full">
+              This project is linked to {links.data.max} servers, the most it can be: remove one to link another.
+            </Text>
+          ) : links.data && (
             <form onSubmit={submit} noValidate>
               <FieldGroup
                 actions={
-                  <Button type="submit" variant="default" loading={link.isPending} disabled={full}>
+                  <Button type="submit" variant="default" loading={link.isPending}>
                     Link server
                   </Button>
                 }
               >
                 <TextInput
                   label="Server ID"
-                  description={full ? `A project is linked to at most ${links.data.max} servers: remove one first.` : "In Discord, with Developer Mode on: right-click the server, then Copy Server ID."}
+                  description="In Discord, with Developer Mode on: right-click the server, then Copy Server ID."
                   inputMode="numeric"
                   autoComplete="off"
                   maxLength={25}
                   value={draft}
-                  disabled={full}
                   error={error}
                   onChange={(e) => {
                     setDraft(e.currentTarget.value);

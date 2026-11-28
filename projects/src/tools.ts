@@ -21,6 +21,11 @@ export const ROLE_OF: Record<Server, Role | "linked"> = { board: "manager", task
 
 /** How many of one Discord server's proposals may wait in a project's triage at once (README.md#linked-servers-discord). */
 export const MAX_LINKED_PROPOSALS = 10;
+/**
+ * How many proposals of every linked Discord server together may wait in a project's triage: below the project's
+ * MAX_UNTRIAGED_PROPOSALS (50), so routines keep room (README.md#linked-servers-discord).
+ */
+export const MAX_LINKED_PROPOSALS_ALL = 25;
 
 export interface ToolDef {
   name: string;
@@ -277,10 +282,10 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
   discord: [
     { name: "list_projects", description: "The projects linked to your Discord server: each one's id, name and GitHub repo.", inputSchema: obj({}), readOnly: true, idempotent: true },
     { name: "list_tasks", description: "A linked project's board: every task in board order with its state, assignee and PRs.", inputSchema: obj({ project: projectId }, ["project"]), readOnly: true, idempotent: true },
-    { name: "get_task", description: "One task of a linked project in full: its body, spec and history.", inputSchema: obj({ project: projectId, task: taskId }, ["project", "task"]), readOnly: true, idempotent: true },
+    { name: "get_task", description: "One task of a linked project: its body, spec and history (not the names of secrets its worker asked for, nor the owner's PR comments to it).", inputSchema: obj({ project: projectId, task: taskId }, ["project", "task"]), readOnly: true, idempotent: true },
     {
       name: "recent_activity",
-      description: "What happened on a linked project lately: task PRs merged, tasks done, reviews with their verdicts and summaries, and the owner's PR comments relayed to workers, newest first.",
+      description: "What happened on a linked project lately: task PRs merged, tasks done, and reviews with their verdicts and summaries, newest first.",
       inputSchema: obj({ project: projectId, days: { type: "integer", minimum: 1, maximum: 30, description: "How far back, in days (7 if not given)." } }, ["project"]),
       readOnly: true, idempotent: true,
     },

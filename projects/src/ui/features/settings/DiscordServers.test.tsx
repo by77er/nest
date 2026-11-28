@@ -63,12 +63,15 @@ describe("Discord servers in Settings", () => {
     expect(field).toHaveValue("4444");
   });
 
-  it("at the cap, the field says to remove one first and can't be sent", async () => {
+  it("at the cap, says so in a line of its own instead of the field, which comes back once one is removed", async () => {
     const api = new FakeApi();
     api.links = Array.from({ length: 20 }, (_, k) => ({ guild: String(1000 + k), created_ms: Date.UTC(2026, 10, 1) }));
-    const { panel } = await open(api);
-    expect(await within(panel).findByText("A project is linked to at most 20 servers: remove one first.")).toBeInTheDocument();
-    expect(within(panel).getByLabelText("Server ID")).toBeDisabled();
-    expect(within(panel).getByRole("button", { name: "Link server" })).toBeDisabled();
+    const { user, panel } = await open(api);
+    expect(await within(panel).findByText("This project is linked to 20 servers, the most it can be: remove one to link another.")).toBeInTheDocument();
+    expect(within(panel).queryByLabelText("Server ID")).toBeNull();
+    expect(within(panel).queryByRole("button", { name: "Link server" })).toBeNull();
+    await user.click(within(panel).getByRole("button", { name: "Remove the Discord server 1000" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Remove the Discord server 1000?" })).getByRole("button", { name: "Remove" }));
+    expect(await within(panel).findByLabelText("Server ID")).toBeEnabled();
   });
 });

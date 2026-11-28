@@ -22,7 +22,7 @@ import { GITHUB_EGRESS_HOSTS, GITHUB_INJECT_HOSTS, githubGrantMissing, githubGua
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { canBlock, canUnblock, dependencyError, pickForAssignment, type Spec, step, taskBranch, type TaskEvent, type TaskFacts, type TaskState, TERMINAL, waitingOn, WORKER_STATES } from "../tasks";
-import { MAX_LINKED_PROPOSALS, type Server, toolOf } from "../tools";
+import { MAX_LINKED_PROPOSALS, MAX_LINKED_PROPOSALS_ALL, type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
 import { asBinding, type ClientLayer, clientLayerFor, type GithubFeed, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
 import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type Wait, type WaitKind, waitKey, waitMessage, type WaitOutcome } from "../waits";
@@ -4349,8 +4349,10 @@ export class ProjectDO extends DurableObject<Env> {
     if (!p) return fail(404, "unknown proposal");
     if (p.state !== "untriaged") return fail(409, `the proposal is ${p.state as string}`);
     const prop = proposalOf(p);
+    // A linked server's: the body doesn't say which server, since every server linked to the project reads it
+    // (README.md#linked-servers-discord); the owner's history detail keeps the source.
     const from = prop.guild !== null
-      ? `Proposed from the Discord server ${prop.guild} (agent ${p.agent as string}).`
+      ? "Proposed from a linked Discord server."
       : `Proposed by the routine "${p.routine_name as string}" (run ${p.run as string}).`;
     const t = await this.createTask({ title: p.title as string, body: `${(p.body as string).trim()}\n\n${from}` });
     if (!t.ok) return t;
@@ -4680,10 +4682,16 @@ export class ProjectDO extends DurableObject<Env> {
       // The routine server's reads, as a run gets them.
       case "list_tasks":
         return ok({ tasks: this.taskSummaries().map(({ task, specced }) => ({ ...task, specced })) });
-      case "get_task":
-        return this.getTask(a.task as string);
-      case "recent_activity":
-        return ok(await this.recentActivity((a.days as number | undefined) ?? 7));
+      // A routine run's reads, trimmed: a linked server's agents aren't the owner's (linkedHistory).
+      case "get_task": {
+        const t = await this.getTask(a.task as string);
+        return t.ok ? ok({ ...t.value, history: linkedHistory(t.value.history) }) : t;
+      }
+      case "recent_activity": {
+        // Not the owner's PR comments relayed to workers.
+        const { pr_comments: _, ...rest } = await this.recentActivity((a.days as number | undefined) ?? 7);
+        return ok(rest);
+      }
       case "propose_task": {
         const title = (a.title as string).trim();
         if (!title) return fail(400, "a proposal needs a title");
@@ -4696,24 +4704,28 @@ export class ProjectDO extends DurableObject<Env> {
   /**
    * A linked Discord server's agent proposes a task (README.md#linked-servers-discord): into the triage queue, as a
    * routine run's proposal lands, tainted (anyone in the server can have written it), marked with its server and
-   * agent. At most MAX_LINKED_PROPOSALS of one server's wait at once, within the project's MAX_UNTRIAGED_PROPOSALS.
-   * A title the owner declined lately is refused as for a routine; the owner's reason is told only to the server
-   * whose proposal it was.
+   * agent. At most MAX_LINKED_PROPOSALS of one server's wait at once, and MAX_LINKED_PROPOSALS_ALL of every linked
+   * server's together, below the project's MAX_UNTRIAGED_PROPOSALS so routines keep room; past either of the last
+   * two the caller is told only that it can't propose now, not how full the queue is. Only this server's own
+   * declines refuse a title again (another's, or a routine's, say nothing to it), with the owner's reason.
    */
   private proposeLinked(caller: LinkedCaller, title: string, body: string): Result<unknown> {
     const proposer = linkedProposer(caller.guild);
     const key = titleKey(title);
-    const declined = this.sql.exec("SELECT title, reason, routine FROM proposals WHERE state = 'declined' AND triaged_ms >= ?", Date.now() - DECLINED_PROPOSALS_BLOCK_MS)
+    const declined = this.sql.exec("SELECT title, reason FROM proposals WHERE state = 'declined' AND routine = ? AND triaged_ms >= ?", proposer, Date.now() - DECLINED_PROPOSALS_BLOCK_MS)
       .toArray().find((r) => titleKey(r.title as string) === key);
     if (declined) {
-      const why = declined.routine === proposer ? (declined.reason as string | null)?.trim() : null;
-      return fail(409, `the owner declined a task like "${title}" lately${why ? ` (their reason: ${why})` : ""}; don't propose it again`);
+      const why = (declined.reason as string | null)?.trim();
+      return fail(409, `the owner declined "${declined.title as string}" from your server lately${why ? ` (their reason: ${why})` : ""}; don't propose it again`);
     }
     if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM proposals WHERE state = 'untriaged' AND routine = ?", proposer).one().n >= MAX_LINKED_PROPOSALS) {
       return fail(429, `your Discord server has ${MAX_LINKED_PROPOSALS} proposals waiting for the owner already: propose nothing more until they're triaged`);
     }
-    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM proposals WHERE state = 'untriaged'").one().n >= MAX_UNTRIAGED_PROPOSALS) {
-      return fail(429, `the owner has ${MAX_UNTRIAGED_PROPOSALS} proposals waiting already: propose nothing more for now`);
+    const all = this.sql.exec<{ linked: number; n: number }>(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(routine LIKE 'discord:%'), 0) AS linked FROM proposals WHERE state = 'untriaged'",
+    ).one();
+    if (all.linked >= MAX_LINKED_PROPOSALS_ALL || all.n >= MAX_UNTRIAGED_PROPOSALS) {
+      return fail(429, "this server can't propose more right now: try again once the owner has triaged what waits");
     }
     const id = `prp_${randomId()}`;
     this.sql.exec(
@@ -5991,6 +6003,21 @@ export function titleKey(title: string): string {
 
 /** The `routine` a linked Discord server's proposal is stored under (README.md#linked-servers-discord): no routine's id. */
 const linkedProposer = (guild: string) => `discord:${guild}`;
+
+/**
+ * Task history actions a linked server's agent never reads (README.md#linked-servers-discord): the names of
+ * secrets a worker asked for, and the owner's PR comments relayed to workers.
+ */
+const LINKED_HIDDEN_ACTIONS = new Set(["secret_requested", "pr_comment", "pr_comment_dropped"]);
+
+/**
+ * A task's history as a linked server's agent reads it: without LINKED_HIDDEN_ACTIONS, and an accepted proposal's
+ * detail (which server and agent proposed it, or which routine run) left out, so one linked server never learns
+ * another's ids.
+ */
+function linkedHistory(history: HistoryRow[]): HistoryRow[] {
+  return history.filter((h) => !LINKED_HIDDEN_ACTIONS.has(h.action)).map((h) => (h.action === "proposal_accepted" ? { ...h, detail: null } : h));
+}
 
 function proposalOf(r: Row): Proposal {
   const routine = r.routine as string;

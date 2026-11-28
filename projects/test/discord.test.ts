@@ -6,8 +6,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MIGRATIONS } from "../src/do/directory";
 import { migrate } from "../src/sql";
-import { MAX_LINKED_PROPOSALS, TOOLS } from "../src/tools";
+import { MAX_LINKED_PROPOSALS, MAX_LINKED_PROPOSALS_ALL, TOOLS } from "../src/tools";
 import { AccessTeam, agentClaims, APP, api, callTool, FakeNest, installFetch, linkedClaims, Signer } from "./fake-nest";
+import { MAX_UNTRIAGED_PROPOSALS } from "../src/routines";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -211,14 +212,35 @@ describe("/mcp/discord's reads", () => {
     expect(full).toMatchObject({ id: task.id, body: "what and why" });
     expect(full.history.map((h: { action: string }) => h.action)).toEqual(["created"]);
     const activity = ok(await callTool("discord", t, "recent_activity", { project: p.id, days: 3 }));
-    expect(Object.keys(activity).sort()).toEqual(["merged_prs", "pr_comments", "reviews", "since_ms", "tasks_done"]);
-    // The same answers as the routine server's reads (src/do/project.ts recentActivity, taskSummaries).
+    // The routine server's, without the owner's PR comments relayed to workers (src/do/project.ts recentActivity).
+    expect(Object.keys(activity).sort()).toEqual(["merged_prs", "reviews", "since_ms", "tasks_done"]);
     expect(activity.since_ms).toBeGreaterThan(Date.now() - 3 * 24 * 3600_000 - 60_000);
+  });
+
+  it("reads a task's history without the secrets its worker asked for or the owner's PR comments; the owner reads all of it", async () => {
+    const p = await newProject();
+    const g = newGuild();
+    await link(p.id, g);
+    const task = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "with a past" })).body;
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o: unknown, st: DurableObjectState) => {
+      const add = (action: string, detail: unknown) =>
+        st.storage.sql.exec("INSERT INTO history (task, at_ms, actor, action, detail, tainted) VALUES (?, ?, 'agt_w', ?, ?, 0)", task.id, Date.now(), action, JSON.stringify(detail));
+      add("progress", { text: "halfway" });
+      add("secret_requested", { kind: "env", name: "STRIPE_LIVE_KEY" });
+      add("pr_comment", { pr: 7, author: "owner", body: "the owner's private note", to: "agt_w" });
+      add("pr_comment_dropped", { pr: 7, body: "another note" });
+      add("blocked", { question: "which API?" });
+    });
+    const full = ok(await callTool("discord", await bot(g), "get_task", { project: p.id, task: task.id }));
+    expect(full.history.map((h: { action: string }) => h.action)).toEqual(["created", "progress", "blocked"]);
+    expect(JSON.stringify(full)).not.toMatch(/STRIPE_LIVE_KEY|private note|another note/);
+    const owner = (await api(token, "GET", `/api/projects/${p.id}/tasks/${task.id}`)).body;
+    expect(owner.history.map((h: { action: string }) => h.action)).toEqual(["created", "progress", "secret_requested", "pr_comment", "pr_comment_dropped", "blocked"]);
   });
 });
 
 describe("propose_task on /mcp/discord", () => {
-  it("lands in triage as a routine's proposal does, tainted, marked with its server and agent; accepted, it's a draft naming them", async () => {
+  it("lands in triage as a routine's proposal does, tainted, marked with its server and agent for the owner; accepted, it's a draft whose body names no server", async () => {
     const p = await newProject();
     const g = newGuild();
     await link(p.id, g);
@@ -233,7 +255,8 @@ describe("propose_task on /mcp/discord", () => {
     const accepted = await api(token, "POST", `/api/projects/${p.id}/proposals/${r.proposal}/accept`);
     expect(accepted.status).toBe(200);
     expect(accepted.body).toMatchObject({ state: "draft", title: "Dark mode", tainted: true });
-    expect(accepted.body.body).toBe(`Please.\n\nProposed from the Discord server ${g} (agent ${agent}).`);
+    // Every server linked to the project reads the board: the body names none.
+    expect(accepted.body.body).toBe("Please.\n\nProposed from a linked Discord server.");
     const full = (await api(token, "GET", `/api/projects/${p.id}/tasks/${accepted.body.id}`)).body;
     const h = full.history.find((x: { action: string }) => x.action === "proposal_accepted");
     expect(h).toMatchObject({ actor: "owner", tainted: true });
@@ -283,18 +306,81 @@ describe("propose_task on /mcp/discord", () => {
     ok(await callTool("discord", t, "propose_task", { project: p.id, title: "one more", body: "b" }));
   });
 
-  it("refuses a title the owner declined lately, telling the owner's reason only to the server whose proposal it was", async () => {
+  it("never shows one linked server another's id or agent, in a task accepted from its proposal", async () => {
     const p = await newProject();
-    const g = newGuild();
-    const other = newGuild();
-    await link(p.id, g);
-    await link(p.id, other);
-    const r = ok(await callTool("discord", await bot(g), "propose_task", { project: p.id, title: "Rewrite it in Rust", body: "b" }));
-    await api(token, "POST", `/api/projects/${p.id}/proposals/${r.proposal}/decline`, { reason: "not now" });
-    expect(toolError(await callTool("discord", await bot(g), "propose_task", { project: p.id, title: "rewrite it in rust!", body: "b" }))).toMatch(/declined .*\(their reason: not now\)/);
-    const theirs = toolError(await callTool("discord", await bot(other), "propose_task", { project: p.id, title: "Rewrite it in Rust", body: "b" }));
-    expect(theirs).toMatch(/declined/);
-    expect(theirs).not.toMatch(/not now/);
+    const a = newGuild();
+    const b = newGuild();
+    await link(p.id, a);
+    await link(p.id, b);
+    const agentA = `agt_bot${rand()}`;
+    const r = ok(await callTool("discord", await bot(a, agentA), "propose_task", { project: p.id, title: "From A", body: "b" }));
+    const accepted = (await api(token, "POST", `/api/projects/${p.id}/proposals/${r.proposal}/accept`)).body;
+    const tb = await bot(b);
+    const reads = [
+      ok(await callTool("discord", tb, "get_task", { project: p.id, task: accepted.id })),
+      ok(await callTool("discord", tb, "list_tasks", { project: p.id })),
+      ok(await callTool("discord", tb, "recent_activity", { project: p.id })),
+    ];
+    for (const read of reads) {
+      expect(JSON.stringify(read)).not.toContain(a);
+      expect(JSON.stringify(read)).not.toContain(agentA);
+    }
+    expect(reads[0].history.find((h: { action: string }) => h.action === "proposal_accepted")).toMatchObject({ actor: "owner", detail: null });
+    // The owner still sees where it came from.
+    const owner = (await api(token, "GET", `/api/projects/${p.id}/tasks/${accepted.id}`)).body;
+    expect(JSON.parse(owner.history.find((h: { action: string }) => h.action === "proposal_accepted").detail)).toMatchObject({ source: `discord:${a}/${agentA}` });
+  });
+
+  it("refuses a title the owner declined lately only to the server whose proposal it was, with their reason", async () => {
+    const p = await newProject();
+    const a = newGuild();
+    const b = newGuild();
+    await link(p.id, a);
+    await link(p.id, b);
+    const decline = async (proposal: string, reason: string) =>
+      expect((await api(token, "POST", `/api/projects/${p.id}/proposals/${proposal}/decline`, { reason })).status).toBe(200);
+    // A's declined: A is refused it again, B isn't.
+    await decline(ok(await callTool("discord", await bot(a), "propose_task", { project: p.id, title: "Rewrite it in Rust", body: "b" })).proposal, "not now");
+    expect(toolError(await callTool("discord", await bot(a), "propose_task", { project: p.id, title: "rewrite it in rust!", body: "b" }))).toMatch(/declined .*\(their reason: not now\)/);
+    ok(await callTool("discord", await bot(b), "propose_task", { project: p.id, title: "Rewrite it in Rust", body: "b" }));
+    // B's declined: B is refused it again, A isn't, and A never hears B's reason.
+    await decline(ok(await callTool("discord", await bot(b), "propose_task", { project: p.id, title: "Dark mode", body: "b" })).proposal, "B's reason");
+    expect(toolError(await callTool("discord", await bot(b), "propose_task", { project: p.id, title: "dark  mode", body: "b" }))).toMatch(/declined .*B's reason/);
+    ok(await callTool("discord", await bot(a), "propose_task", { project: p.id, title: "Dark mode", body: "b" }));
+    // A routine's decline says nothing to a linked server either.
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec(
+        "INSERT INTO proposals (id, routine, routine_name, run, agent, title, body, state, tainted, created_ms, reason, triaged_ms) VALUES ('prp_rtn', 'rtn_x', 'R', 'run_x', 'agt_r', 'Faster CI', 'b', 'declined', 1, ?, 'the routine''s', ?)",
+        Date.now(), Date.now(),
+      );
+    });
+    ok(await callTool("discord", await bot(a), "propose_task", { project: p.id, title: "Faster CI", body: "b" }));
+  });
+
+  it(`holds every linked server's proposals together to ${MAX_LINKED_PROPOSALS_ALL} in a project, saying no more than that it can't now; routines keep room`, async () => {
+    expect(MAX_LINKED_PROPOSALS_ALL).toBeLessThan(MAX_UNTRIAGED_PROPOSALS);
+    const p = await newProject();
+    const guilds = [newGuild(), newGuild(), newGuild()];
+    for (const g of guilds) await link(p.id, g);
+    let n = 0;
+    for (const g of guilds) {
+      const t = await bot(g);
+      for (let k = 0; k < MAX_LINKED_PROPOSALS && n < MAX_LINKED_PROPOSALS_ALL; k++, n++) ok(await callTool("discord", t, "propose_task", { project: p.id, title: `idea ${n}`, body: "b" }));
+    }
+    const refused = toolError(await callTool("discord", await bot(guilds[2]!), "propose_task", { project: p.id, title: "one more", body: "b" }));
+    expect(refused).toMatch(/can't propose more right now/);
+    expect(refused).not.toMatch(/[0-9]/);
+    // A routine run still proposes.
+    const rtn = await api(token, "POST", `/api/projects/${p.id}/routines`, {
+      name: "R", kind: "custom", prompt: "Look around.", enabled: true, triggers: { timer: null, tasks_done: null, prs_merged: null },
+      cooldown_min: 0, max_minutes: 30, max_turns: 3, proposals: "triage",
+    });
+    expect(rtn.status, JSON.stringify(rtn.body)).toBe(201);
+    await api(token, "POST", `/api/projects/${p.id}/routines/${rtn.body.id}/run`);
+    const run = (await api(token, "GET", `/api/projects/${p.id}/routines/${rtn.body.id}`)).body.live_run;
+    const rt = await nest.sign(agentClaims("routine", run.agent, { project: p.id, role: "routine", routine: run.routine, run: run.id }, { tainted: true }));
+    expect(ok(await callTool("routine", rt, "propose_task", { title: "a routine's", body: "b" }))).toMatchObject({ where: "triage" });
+    expect((await api(token, "GET", `/api/projects/${p.id}/proposals`)).body).toHaveLength(MAX_LINKED_PROPOSALS_ALL + 1);
   });
 
   it("needs a title", async () => {
