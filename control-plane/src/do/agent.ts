@@ -2922,8 +2922,19 @@ export class AgentDO extends DurableObject<Env> {
     if (!(await this.cancelTimer(name, by))) throw new NestError(ErrorCodes.NOT_FOUND, `no timer ${name}`, 404);
   }
 
-  /** Arm every timer that has no deadline (a release without the handler dropped it): late, never lost. */
+  /**
+   * Arm every timer that has no deadline (a release without the handler dropped it): late, never lost. First, in
+   * one synchronous step, repeats a release without them left behind (a rollback): one whose timer that release
+   * fired (its input `timer/<id>` is in the inbox) and deleted is restored on its cadence; one it cancelled or
+   * set again, or whose agent ended, is forgotten.
+   */
   private async rearmTimers(): Promise<void> {
+    const now = Date.now();
+    const live = this.exists() && !this.load().ended;
+    for (const r of this.timerStore.orphanedRepeats()) {
+      if (live && !r.replaced && this.queue.messageFor(`timer/${r.id}`) !== undefined) this.timerStore.restore(r, nextFiring(r.at_ms, r.every_ms, now), now);
+      else this.timerStore.forgetRepeat(r.name, r.id);
+    }
     for (const t of this.timerStore.list()) {
       const key = `${TIMER_DEADLINE}${t.name}` as const;
       if (!this.deadlines.has(key)) await this.deadlines.set(key, t.at_ms);
@@ -2960,9 +2971,11 @@ export class AgentDO extends DurableObject<Env> {
     }
     const every = row.every_ms;
     const firing = every === undefined ? `timer/${row.id}` : `timer/${row.id}/${row.at_ms}`;
-    // A repeating timer whose last firing still waits as a queued turn (no brain could run it: no capacity,
-    // a failing start) isn't posted again: it moves on, so an outage costs one turn, not one per interval.
-    const waiting = every !== undefined && this.queue.queuedWithPrefix(`inbox/timer/${row.id}/`);
+    // A repeating timer with an earlier firing not yet taken in (a queued turn no brain could run: no capacity,
+    // a failing start; or a message pushed into a running turn and never confirmed) isn't posted again: it moves
+    // on, so an outage costs one turn, not one per interval. This firing's own post (an alarm retried after it)
+    // isn't one: it goes again, deduplicated by its request id, and its trace and event are emitted.
+    const waiting = every !== undefined && this.queue.pendingFiring(`timer/${row.id}/`, firing);
     if (!waiting) await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note, every), false, firing);
     // Re-read: only this timer moves on or goes (one set again or cancelled during the post is left as it is).
     let next: number | undefined;
@@ -2970,7 +2983,7 @@ export class AgentDO extends DurableObject<Env> {
       if (!this.timerStore.delete(name, row.id)) return;
     } else {
       next = nextFiring(row.at_ms, every, Date.now());
-      if (!this.timerStore.advance(name, row.id, next)) return;
+      if (!this.timerStore.advance(name, row.id, row.at_ms, next)) return;
     }
     const armed = next !== undefined ? this.deadlines.set(`${TIMER_DEADLINE}${name}`, next) : null;
     const after = this.load();

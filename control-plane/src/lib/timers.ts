@@ -93,16 +93,15 @@ interface TimerRow extends Timer {
 export class TimerStore {
   constructor(private readonly sql: SqlStorage) {
     sql.exec("CREATE TABLE IF NOT EXISTS timers (name TEXT PRIMARY KEY, id TEXT NOT NULL, at_ms INTEGER NOT NULL, note TEXT NOT NULL, set_ms INTEGER NOT NULL)");
-    // Added with repeating timers (expand only): a repeating timer's interval, and the id it was set with. A
-    // row is repeating only while `every_id` is its `id`: the previous release's re-set of a name changes `id`
-    // (its upsert doesn't know these columns), so what it set reads as the one-shot timer it meant, never as
-    // the repeating one it replaced. Rows from before read as one-shot (both null).
-    const cols = sql.exec<{ name: string }>("PRAGMA table_info(timers)").toArray().map((c) => c.name);
-    if (!cols.includes("every_ms")) sql.exec("ALTER TABLE timers ADD COLUMN every_ms INTEGER");
-    if (!cols.includes("every_id")) sql.exec("ALTER TABLE timers ADD COLUMN every_id TEXT");
+    // Added with repeating timers, a table of its own that the previous release never touches: a timer repeats
+    // while its row here has the timer's id. So the previous release's re-set of the name (a new id) reads as the
+    // one-shot timer it set, and what it does to a repeating timer during a rollback leaves this row behind for
+    // `orphanedRepeats` to judge: fired (restored on its cadence), cancelled or set again (dropped).
+    sql.exec("CREATE TABLE IF NOT EXISTS timer_repeats (name TEXT PRIMARY KEY, id TEXT NOT NULL, every_ms INTEGER NOT NULL, note TEXT NOT NULL, at_ms INTEGER NOT NULL)");
   }
 
-  private static readonly COLS = "name, id, at_ms, note, set_ms, CASE WHEN every_id = id THEN every_ms END AS every_ms";
+  private static readonly SELECT = `SELECT t.name AS name, t.id AS id, t.at_ms AS at_ms, t.note AS note, t.set_ms AS set_ms, r.every_ms AS every_ms
+    FROM timers t LEFT JOIN timer_repeats r ON r.name = t.name AND r.id = t.id`;
 
   private static view(r: { name: string; at_ms: number; note: string; set_ms: number; every_ms: number | null }): Timer {
     return { name: r.name, at_ms: r.at_ms, note: r.note, set_ms: r.set_ms, ...(r.every_ms !== null ? { every_ms: r.every_ms } : {}) };
@@ -110,13 +109,13 @@ export class TimerStore {
 
   get(name: string): TimerRow | undefined {
     const r = this.sql.exec<{ name: string; id: string; at_ms: number; note: string; set_ms: number; every_ms: number | null }>(
-      `SELECT ${TimerStore.COLS} FROM timers WHERE name = ?`, name).toArray()[0];
+      `${TimerStore.SELECT} WHERE t.name = ?`, name).toArray()[0];
     return r && { ...TimerStore.view(r), id: r.id };
   }
 
   list(): Timer[] {
     return this.sql.exec<{ name: string; at_ms: number; note: string; set_ms: number; every_ms: number | null }>(
-      `SELECT ${TimerStore.COLS} FROM timers ORDER BY at_ms, name`).toArray().map(TimerStore.view);
+      `${TimerStore.SELECT} ORDER BY t.at_ms, t.name`).toArray().map(TimerStore.view);
   }
 
   /**
@@ -127,31 +126,67 @@ export class TimerStore {
     const have = this.get(t.name);
     if (!have && this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM timers").one().n >= TIMERS_MAX) return "full";
     if (t.every_ms !== undefined) {
-      const others = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM timers WHERE every_id = id AND every_ms IS NOT NULL AND name != ?", t.name).one().n;
+      const others = this.sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM timers t JOIN timer_repeats r ON r.name = t.name AND r.id = t.id WHERE t.name != ?", t.name).one().n;
       if (others >= TIMERS_REPEATING_MAX) return "repeating";
     }
-    const every = t.every_ms ?? null;
-    this.sql.exec(`INSERT INTO timers (name, id, at_ms, note, set_ms, every_ms, every_id) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(name) DO UPDATE SET id = excluded.id, at_ms = excluded.at_ms, note = excluded.note, set_ms = excluded.set_ms,
-        every_ms = excluded.every_ms, every_id = excluded.every_id`,
-    t.name, id, t.at_ms, t.note, t.set_ms, every, every === null ? null : id);
+    this.sql.exec(`INSERT INTO timers (name, id, at_ms, note, set_ms) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET id = excluded.id, at_ms = excluded.at_ms, note = excluded.note, set_ms = excluded.set_ms`,
+    t.name, id, t.at_ms, t.note, t.set_ms);
+    if (t.every_ms === undefined) this.sql.exec("DELETE FROM timer_repeats WHERE name = ?", t.name);
+    else {
+      this.sql.exec(`INSERT INTO timer_repeats (name, id, every_ms, note, at_ms) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET id = excluded.id, every_ms = excluded.every_ms, note = excluded.note, at_ms = excluded.at_ms`,
+      t.name, id, t.every_ms, t.note, t.at_ms);
+    }
     return { ...t, id };
   }
 
-  /** Move a repeating timer `id` to its next firing (not one set again meanwhile). Whether it moved. */
-  advance(name: string, id: string, at: number): boolean {
-    return this.sql.exec("UPDATE timers SET at_ms = ? WHERE name = ? AND id = ?", at, name, id).rowsWritten > 0;
+  /**
+   * Move a repeating timer `id` from the firing due `from` to its next, `at`: not one set again meanwhile, nor one
+   * another run of the same firing (two alarms at once) already moved. Whether it moved.
+   */
+  advance(name: string, id: string, from: number, at: number): boolean {
+    if (this.sql.exec("UPDATE timers SET at_ms = ? WHERE name = ? AND id = ? AND at_ms = ?", at, name, id, from).rowsWritten === 0) return false;
+    this.sql.exec("UPDATE timer_repeats SET at_ms = ? WHERE name = ? AND id = ?", at, name, id);
+    return true;
   }
 
   /** Delete `name` (only the timer `id` when given: a fired one, not one set again meanwhile). Whether a row went. */
   delete(name: string, id?: string): boolean {
-    return (id === undefined
+    const gone = (id === undefined
       ? this.sql.exec("DELETE FROM timers WHERE name = ?", name)
       : this.sql.exec("DELETE FROM timers WHERE name = ? AND id = ?", name, id)).rowsWritten > 0;
+    if (id === undefined) this.sql.exec("DELETE FROM timer_repeats WHERE name = ?", name);
+    else this.sql.exec("DELETE FROM timer_repeats WHERE name = ? AND id = ?", name, id);
+    return gone;
   }
 
-  /** Every timer's name (to clear them all at an end). */
+  /** Every timer's name, repeats left behind included (to clear them all at an end). */
   names(): string[] {
-    return this.sql.exec<{ name: string }>("SELECT name FROM timers").toArray().map((r) => r.name);
+    return this.sql.exec<{ name: string }>("SELECT name FROM timers UNION SELECT name FROM timer_repeats").toArray().map((r) => r.name);
+  }
+
+  /**
+   * Repeats whose timer is gone or was set again: only a release that doesn't know them (a rollback) leaves one,
+   * since this one deletes a timer's repeat in the step that deletes or replaces the timer. `replaced`: the name
+   * holds another timer now.
+   */
+  orphanedRepeats(): { name: string; id: string; every_ms: number; note: string; at_ms: number; replaced: boolean }[] {
+    return this.sql.exec<{ name: string; id: string; every_ms: number; note: string; at_ms: number; replaced: number }>(
+      `SELECT r.name AS name, r.id AS id, r.every_ms AS every_ms, r.note AS note, r.at_ms AS at_ms, t.name IS NOT NULL AS replaced
+       FROM timer_repeats r LEFT JOIN timers t ON t.name = r.name WHERE t.id IS NULL OR t.id != r.id`).toArray()
+      .map((r) => ({ ...r, replaced: !!r.replaced }));
+  }
+
+  /** Put a repeating timer back as it was (`orphanedRepeats`: the previous release fired it once and deleted it). */
+  restore(r: { name: string; id: string; every_ms: number; note: string }, at: number, now: number): void {
+    this.sql.exec("INSERT INTO timers (name, id, at_ms, note, set_ms) VALUES (?, ?, ?, ?, ?)", r.name, r.id, at, r.note, now);
+    this.sql.exec("UPDATE timer_repeats SET at_ms = ? WHERE name = ? AND id = ?", at, r.name, r.id);
+  }
+
+  /** Forget a repeat left behind (its timer was cancelled or set again under a release that doesn't know it). */
+  forgetRepeat(name: string, id: string): void {
+    this.sql.exec("DELETE FROM timer_repeats WHERE name = ? AND id = ?", name, id);
   }
 }

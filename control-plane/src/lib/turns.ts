@@ -126,9 +126,18 @@ export class TurnQueue {
     return this.sql.exec<{ turn: string }>(`SELECT turn FROM turns WHERE status = '${TURN.queued}' ORDER BY ord LIMIT 1`).toArray()[0]?.turn;
   }
 
-  /** Whether a queued turn's request id starts with `prefix` (a repeating timer's last firing still waiting). */
-  queuedWithPrefix(prefix: string): boolean {
-    return this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' AND substr(request_id, 1, ?) = ? LIMIT 1`, prefix.length, prefix).toArray().length > 0;
+  /**
+   * Whether input posted under a request id starting with `prefix` (a repeating timer's firings, `timer/<id>/`)
+   * hasn't been taken in yet, other than `own`'s: a message mirrored into a running turn and not confirmed, or a
+   * queued turn (`inbox/<request id>`, or one requeued from unconfirmed messages, `<request id>/requeued`).
+   */
+  pendingFiring(prefix: string, own: string): boolean {
+    const mirrored = this.sql.exec(`SELECT 1 FROM inbox WHERE status = '${INBOX.delivered}' AND substr(request_id, 1, ?) = ? AND request_id != ? LIMIT 1`,
+      prefix.length, prefix, own).toArray().length > 0;
+    if (mirrored) return true;
+    const turn = `inbox/${prefix}`;
+    return this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' AND (substr(request_id, 1, ?) = ? OR substr(request_id, 1, ?) = ?)
+      AND request_id NOT IN (?, ?) LIMIT 1`, turn.length, turn, prefix.length, prefix, `inbox/${own}`, `${own}/requeued`).toArray().length > 0;
   }
 
   queuedCount(): number {

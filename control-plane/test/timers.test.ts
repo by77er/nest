@@ -43,10 +43,10 @@ async function call(ws: Ws, name: string, args: unknown) {
   return (await ws.next("tool_result", (m) => m.call === id)).outcome;
 }
 
-/** Make timer `name` due now and run the agent's alarm. */
-async function fire(agent: string, name: string) {
+/** Make timer `name` due now (or at `at`) and run the agent's alarm. */
+async function fire(agent: string, name: string, at = Date.now() - 1) {
   await runInDurableObject(agentStub(agent), (_: AgentDO, st) => {
-    st.storage.sql.exec("UPDATE timers SET at_ms = ? WHERE name = ?", Date.now() - 1, name);
+    st.storage.sql.exec("UPDATE timers SET at_ms = ? WHERE name = ?", at, name);
     st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = ?", `timer:${name}`);
   });
   await runDue(agentStub(agent));
@@ -398,8 +398,12 @@ describe("repeating timers, hardened", () => {
   it("while its last firing still waits as a queued turn (no brain runs it), a repeating timer moves on without queueing more", async () => {
     const s = await setup({ start: false });
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).setTimer({ name: "tick", at_ms: Date.now() + 60_000, note: "", set_ms: Date.now(), every_ms: 600_000 }, "k-tick"));
-    for (let i = 0; i < 4; i++) await fire(s.agent, "tick");
+    // Four firings, each due at its own time (the clock stands still between them here, so `fire` would make
+    // them one firing retried).
+    for (let i = 0; i < 4; i++) await fire(s.agent, "tick", Date.now() - 1 - i);
     expect((await timerTurns(s.agent)).length).toBe(1);
+    // The skipped firings are in neither the trace nor the owner's events: they never happened for the agent.
+    expect((await traceTypes(s.agent)).filter((t) => t === "timer_fired:tick")).toHaveLength(1);
     const [t] = await agentStub(s.agent).timers();
     expect(t!.at_ms - Date.now()).toBeGreaterThan(590_000);
     // Once that turn is gone (run, or dropped), the next firing is posted again.
@@ -420,11 +424,33 @@ describe("repeating timers, hardened", () => {
       };
       await expect(i.timerFired("once")).rejects.toThrow("reset");
       i.timerStore.advance = advance;
-      // The queued turn is taken away first, so this would post again were it not deduplicated by request id.
+      // Its turn is taken (as a brain would), so nothing waits: the retry posts again, and only its request id
+      // keeps it from making a second turn.
+      i.queue.claimNext();
       await i.timerFired("once");
     });
     expect((await agentStub(s.agent).turns()).filter((t) => t.input.text?.startsWith("Message from timer")).length).toBe(1);
+    // The retry is the firing that completed: its trace entry is there, once.
+    expect((await traceTypes(s.agent)).filter((t) => t === "timer_fired:once")).toEqual(["timer_fired:once"]);
     expect((await agentStub(s.agent).timers())[0]!.at_ms - Date.now()).toBeGreaterThan(590_000);
+  });
+
+  it("an alarm retried while its own firing's turn is still queued completes that firing: posted once, traced once", async () => {
+    const s = await setup({ start: false });
+    await runInDurableObject(agentStub(s.agent), async (inst: AgentDO) => {
+      const i = inst as any;
+      await i.setTimer({ name: "own", at_ms: Date.now() + 60_000, note: "", set_ms: Date.now(), every_ms: 600_000 }, "k-own");
+      i.timerStore.sql.exec("UPDATE timers SET at_ms = ? WHERE name = 'own'", Date.now() - 1);
+      const advance = i.timerStore.advance.bind(i.timerStore);
+      i.timerStore.advance = () => {
+        throw new Error("reset between the post and the move");
+      };
+      await expect(i.timerFired("own")).rejects.toThrow("reset");
+      i.timerStore.advance = advance;
+      await i.timerFired("own");
+    });
+    expect((await agentStub(s.agent).turns()).filter((t) => t.input.text?.startsWith("Message from timer")).length).toBe(1);
+    expect((await traceTypes(s.agent)).filter((t) => t === "timer_fired:own")).toEqual(["timer_fired:own"]);
   });
 
   it("an agent ended while a repeating firing is posted keeps no timer and no deadline", async () => {
@@ -447,6 +473,64 @@ describe("repeating timers, hardened", () => {
     });
     expect(await agentStub(s.agent).timers()).toEqual([]);
     expect(await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'timer:rep'").toArray().length)).toBe(0);
+  });
+
+  it("while a firing pushed into a running turn isn't confirmed, later ones aren't pushed", async () => {
+    const s = await setup();
+    await call(s.ws, "timer_set", { name: "beat", every_s: 300 });
+    await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "a long turn" } }, 201);
+    const run = await s.ws.next("run_turn");
+    s.ws.send({ type: "ack", up_to: run.seq });
+    for (let i = 0; i < 3; i++) await fire(s.agent, "beat", Date.now() - 1 - i);
+    expect((await s.ws.next("inbox")).message.text).toContain('timer "beat" fired');
+    expect(await s.ws.none("inbox", 300)).toBe(true);
+    expect((await agentStub(s.agent).timers())[0]!.at_ms - Date.now()).toBeGreaterThan(290_000);
+  });
+
+  it("after a rollback: a repeating timer the previous release fired and deleted comes back on its cadence; one it cancelled or set again doesn't", async () => {
+    const s = await setup({ start: false });
+    // Not yet due here, so this release's alarm doesn't fire them first: the previous release does, below.
+    const at = Date.now() + 60_000;
+    await runInDurableObject(agentStub(s.agent), async (inst: AgentDO, st) => {
+      const i = inst as any;
+      for (const name of ["fired", "cancelled", "reset"]) await i.setTimer({ name, at_ms: at, note: name, set_ms: at, every_ms: 600_000 }, `k-${name}`);
+      // The previous release, exactly: it fires a due timer as one-shot (`timer/<id>`) and deletes its row...
+      await i.postInbox("timer", 'timer "fired" fired: fired', false, "timer/k-fired");
+      st.storage.sql.exec("DELETE FROM timers WHERE name = ? AND id = ?", "fired", "k-fired");
+      // ...cancels one (its row only)...
+      st.storage.sql.exec("DELETE FROM timers WHERE name = ?", "cancelled");
+      // ...and sets one again with its upsert, which knows no repeats.
+      st.storage.sql.exec(`INSERT INTO timers (name, id, at_ms, note, set_ms) VALUES ('reset', 'k-old', ?, 'once', ?)
+        ON CONFLICT(name) DO UPDATE SET id = excluded.id, at_ms = excluded.at_ms, note = excluded.note, set_ms = excluded.set_ms`, Date.now() + 60_000, Date.now());
+      // The roll-forward: a fresh object over the same storage.
+      new AgentDO(st, env);
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const timers = await agentStub(s.agent).timers();
+    expect(timers.map((t) => t.name).sort()).toEqual(["fired", "reset"]);
+    const fired = timers.find((t) => t.name === "fired")!;
+    expect(fired).toMatchObject({ every_ms: 600_000, note: "fired" });
+    expect(fired.at_ms).toBe(at + 600_000);
+    expect(timers.find((t) => t.name === "reset")).not.toHaveProperty("every_ms");
+    const left = await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) => st.storage.sql.exec<{ name: string }>("SELECT name FROM timer_repeats ORDER BY name").toArray().map((r) => r.name));
+    expect(left).toEqual(["fired"]);
+  });
+
+  it("an ended agent's repeats left behind are forgotten, never restored", async () => {
+    const s = await setup({ start: false });
+    await runInDurableObject(agentStub(s.agent), async (inst: AgentDO, st) => {
+      const i = inst as any;
+      await i.setTimer({ name: "r", at_ms: Date.now() - 1, note: "", set_ms: Date.now(), every_ms: 600_000 }, "k-r");
+      await i.postInbox("timer", 'timer "r" fired: ', false, "timer/k-r");
+      st.storage.sql.exec("DELETE FROM timers");
+    });
+    await adminJson(`/v1/agents/${s.agent}/stop`, { body: { end: true } });
+    await runInDurableObject(agentStub(s.agent), async (_: AgentDO, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO timer_repeats (name, id, every_ms, note, at_ms) VALUES ('r', 'k-r', 600000, '', ?)", Date.now());
+      new AgentDO(st, env);
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(await agentStub(s.agent).timers()).toEqual([]);
   });
 
   it("caps an agent's repeating timers; one-shot ones and a repeating one set again still go", async () => {
