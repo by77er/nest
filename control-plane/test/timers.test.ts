@@ -609,6 +609,64 @@ describe("repeating timers, hardened", () => {
     }
   });
 
+  it("a one-shot timer still wakes a stopped agent, once, and that lifts the stop", async () => {
+    const s = await setup({ start: false });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).setTimer({ name: "nine", at_ms: Date.now() + 60_000, note: "standup", set_ms: Date.now() }, "k-nine"));
+    await adminJson(`/v1/agents/${s.agent}/stop`, { body: {} });
+    expect(await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => !!(inst as any).load().stop_quiet)).toBe(true);
+    await fire(s.agent, "nine");
+    expect((await timerTurns(s.agent)).length).toBe(1);
+    expect(await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => !!(inst as any).load().stop_quiet)).toBe(false);
+    expect(await agentStub(s.agent).timers()).toEqual([]);
+  });
+
+  it("an alarm retried while its own firing waits requeued (pushed, never confirmed, the turn ended) completes it: traced once", async () => {
+    const s = await setup({ start: false });
+    const at = Date.now() - 1;
+    await runInDurableObject(agentStub(s.agent), async (inst: AgentDO) => {
+      const i = inst as any;
+      await i.setTimer({ name: "rq2", at_ms: Date.now() + 60_000, note: "", set_ms: Date.now(), every_ms: 600_000 }, "k-rq2");
+      i.timerStore.sql.exec("UPDATE timers SET at_ms = ? WHERE name = 'rq2'", at);
+      // This firing's own message, requeued by the turn it was pushed into (`requeuedTurn`).
+      i.queue.enqueue({ kind: "inbox", text: 'Message from timer: timer "rq2" fired' }, `timer/k-rq2/${at}/requeued`);
+      await i.timerFired("rq2");
+    });
+    expect((await traceTypes(s.agent)).filter((t) => t === "timer_fired:rq2")).toEqual(["timer_fired:rq2"]);
+    expect((await agentStub(s.agent).timers())[0]!.at_ms - Date.now()).toBeGreaterThan(590_000);
+  });
+
+  it("an alarm retried after its post completes that firing even if a stop came in between: traced once", async () => {
+    const s = await setup({ start: false });
+    await runInDurableObject(agentStub(s.agent), async (inst: AgentDO) => {
+      const i = inst as any;
+      await i.setTimer({ name: "st", at_ms: Date.now() + 60_000, note: "", set_ms: Date.now(), every_ms: 600_000 }, "k-st");
+      i.timerStore.sql.exec("UPDATE timers SET at_ms = ? WHERE name = 'st'", Date.now() - 1);
+      const advance = i.timerStore.advance.bind(i.timerStore);
+      i.timerStore.advance = () => {
+        throw new Error("reset between the post and the move");
+      };
+      await expect(i.timerFired("st")).rejects.toThrow("reset");
+      i.timerStore.advance = advance;
+    });
+    await adminJson(`/v1/agents/${s.agent}/stop`, { body: {} });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).timerFired("st"));
+    expect((await traceTypes(s.agent)).filter((t) => t === "timer_fired:st")).toEqual(["timer_fired:st"]);
+    expect((await agentStub(s.agent).timers())[0]!.at_ms - Date.now()).toBeGreaterThan(590_000);
+  });
+
+  it("moves a firing on only from the time it was due: a second run of the same firing finds it moved", async () => {
+    const s = await setup({ start: false });
+    await runInDurableObject(agentStub(s.agent), async (inst: AgentDO) => {
+      const i = inst as any;
+      await i.setTimer({ name: "mv", at_ms: Date.now() + 60_000, note: "", set_ms: Date.now(), every_ms: 600_000 }, "k-mv");
+      const due = i.timerStore.get("mv").at_ms as number;
+      expect(i.timerStore.advance("mv", "k-mv", due, due + 600_000)).toBe(true);
+      // The same firing again (a concurrent run that read `due`): nothing moves.
+      expect(i.timerStore.advance("mv", "k-mv", due, due + 1_200_000)).toBe(false);
+      expect(i.timerStore.get("mv").at_ms).toBe(due + 600_000);
+    });
+  });
+
   it("a firing in a turn requeued from unconfirmed messages counts as waiting", async () => {
     const s = await setup({ start: false });
     await runInDurableObject(agentStub(s.agent), async (inst: AgentDO) => {

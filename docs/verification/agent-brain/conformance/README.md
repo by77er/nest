@@ -460,7 +460,7 @@ Tests: `control-plane/test/restart-launch.test.ts`, "no turn starts while a rest
 
 | Action | Code | Conforms | Note |
 |---|---|---|---|
-| A repeating firing while a stop holds | agent.ts:2999 `timerFired` (`quietSinceStop`) | yes (S-neutral) | Moves the timer on without `postInbox`, so no `inputArrived`: `stop_quiet` stays, and no wake. Test: "while an operator's stop holds, a repeating timer moves on". |
+| A repeating firing while a stop holds | agent.ts:3000 `timerFired` (`quietSinceStop`) | yes (S-neutral) | Moves the timer on without `postInbox`, so no `inputArrived`: `stop_quiet` stays, and no wake. Test: "while an operator's stop holds, a repeating timer moves on". |
 | A repeating firing while an earlier one waits | turns.ts `pendingFiring`, agent.ts `timerFired` | yes (S-neutral) | No post: no input, no wake. |
-| The rollback notice | agent.ts:2948 `timerNotices` → `deliver(…, external = false)` (line 2956) | yes (F1/F2 class) | A platform note: it never clears `stop_quiet`; it queues a turn that a stop leaves waiting. Test: "the rollback notice is a platform note". |
+| The rollback notice | agent.ts:2948 `timerNotices` → `deliver(…, external = false)` (line 2957) | yes (F1/F2 class) | A platform note: it never clears `stop_quiet`; it queues a turn that a stop leaves waiting. Test: "the rollback notice is a platform note". |
 | A one-shot firing | agent.ts `timerFired` → `postInbox` → `inputArrived` | yes (unchanged) | A wake source after a stop, like any input (#134). |

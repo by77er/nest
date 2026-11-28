@@ -2946,8 +2946,9 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Tell the agent of each repeat a rollback ended (`rearmTimers`), once each: posted, then forgotten. */
   private async timerNotices(): Promise<void> {
-    const live = this.exists() && !this.load().ended;
     for (const n of this.timerStore.notices()) {
+      // Read each time: the agent may end during an earlier notice's delivery.
+      const live = this.exists() && !this.load().ended;
       // A platform note, not input: it doesn't lift an operator's stop (it waits for real input then), as a
       // system note doesn't. Once, by its request id.
       const rid = `timer/${n.id}/stopped`;
@@ -2997,7 +2998,8 @@ export class AgentDO extends DurableObject<Env> {
     // While an operator's stop holds, a repeating timer moves on without waking the agent: the stop holds
     // whatever its timers say (a one-shot timer still wakes it, once, as any input does).
     const stopped = every !== undefined && quietSinceStop(info);
-    const skip = waiting || stopped;
+    // A firing already posted (an alarm retried after its post) completes as posted, whatever came since.
+    const skip = (waiting || stopped) && !this.queue.messageFor(firing);
     if (!skip) await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note, every), false, firing);
     // Re-read: only this timer moves on or goes (one set again or cancelled during the post is left as it is).
     let next: number | undefined;
