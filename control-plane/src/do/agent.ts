@@ -2948,9 +2948,12 @@ export class AgentDO extends DurableObject<Env> {
   private async timerNotices(): Promise<void> {
     const live = this.exists() && !this.load().ended;
     for (const n of this.timerStore.notices()) {
-      if (live) {
-        await this.postInbox(TIMER_SENDER, `timer "${n.name}" stopped repeating (every ${everyText(n.every_ms)}) during a platform rollback, after firing once: set it again with every_s if you still want it.`,
-          false, `timer/${n.id}/stopped`);
+      // A platform note, not input: it doesn't lift an operator's stop (it waits for real input then), as a
+      // system note doesn't. Once, by its request id.
+      const rid = `timer/${n.id}/stopped`;
+      if (live && !this.queue.messageFor(rid)) {
+        await this.deliver(TIMER_SENDER, `timer "${n.name}" stopped repeating (every ${everyText(n.every_ms)}) during a platform rollback, after firing once: set it again with every_s if you still want it.`,
+          false, rid, false, false);
       }
       this.timerStore.noticeDone(n.id);
     }
@@ -2991,7 +2994,11 @@ export class AgentDO extends DurableObject<Env> {
     // on, so an outage costs one turn, not one per interval. This firing's own post (an alarm retried after it)
     // isn't one: it goes again, deduplicated by its request id, and its trace and event are emitted.
     const waiting = every !== undefined && this.queue.pendingFiring(`timer/${row.id}/`, firing);
-    if (!waiting) await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note, every), false, firing);
+    // While an operator's stop holds, a repeating timer moves on without waking the agent: the stop holds
+    // whatever its timers say (a one-shot timer still wakes it, once, as any input does).
+    const stopped = every !== undefined && quietSinceStop(info);
+    const skip = waiting || stopped;
+    if (!skip) await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note, every), false, firing);
     // Re-read: only this timer moves on or goes (one set again or cancelled during the post is left as it is).
     let next: number | undefined;
     if (every === undefined) {
@@ -3002,7 +3009,7 @@ export class AgentDO extends DurableObject<Env> {
     }
     const armed = next !== undefined ? this.deadlines.set(`${TIMER_DEADLINE}${name}`, next) : null;
     const after = this.load();
-    if (!waiting) {
+    if (!skip) {
       this.traceEmit({ type: "timer_fired", name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
       this.emit(after, `${after.agent}/${firing}`, { type: "agent.timer_fired", agent: after.agent, timer: name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
     }

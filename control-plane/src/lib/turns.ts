@@ -132,12 +132,14 @@ export class TurnQueue {
    * queued turn (`inbox/<request id>`, or one requeued from unconfirmed messages, `<request id>/requeued`).
    */
   pendingFiring(prefix: string, own: string): boolean {
-    const mirrored = this.sql.exec(`SELECT 1 FROM inbox WHERE status = '${INBOX.delivered}' AND substr(request_id, 1, ?) = ? AND request_id != ? LIMIT 1`,
-      prefix.length, prefix, own).toArray().length > 0;
+    // Prefix matches as ranges over request_id, so its index answers them.
+    const upTo = (p: string) => `${p}\uffff`;
+    const mirrored = this.sql.exec(`SELECT 1 FROM inbox WHERE request_id >= ? AND request_id < ? AND request_id != ? AND status = '${INBOX.delivered}' LIMIT 1`,
+      prefix, upTo(prefix), own).toArray().length > 0;
     if (mirrored) return true;
     const turn = `inbox/${prefix}`;
-    return this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' AND (substr(request_id, 1, ?) = ? OR substr(request_id, 1, ?) = ?)
-      AND request_id NOT IN (?, ?) LIMIT 1`, turn.length, turn, prefix.length, prefix, `inbox/${own}`, `${own}/requeued`).toArray().length > 0;
+    return this.sql.exec(`SELECT 1 FROM turns WHERE ((request_id >= ? AND request_id < ?) OR (request_id >= ? AND request_id < ?))
+      AND request_id NOT IN (?, ?) AND status = '${TURN.queued}' LIMIT 1`, turn, upTo(turn), prefix, upTo(prefix), `inbox/${own}`, `${own}/requeued`).toArray().length > 0;
   }
 
   queuedCount(): number {

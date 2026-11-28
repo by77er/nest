@@ -97,7 +97,7 @@ export class TimerStore {
     // while its row here has the timer's id. So the previous release's re-set of the name (a new id) reads as the
     // one-shot timer it set, and what it does to a repeating timer during a rollback leaves this row behind for
     // `orphanedRepeats` to judge: each is forgotten, and one that release fired, told to the agent.
-    sql.exec("CREATE TABLE IF NOT EXISTS timer_repeats (name TEXT PRIMARY KEY, id TEXT NOT NULL, every_ms INTEGER NOT NULL, note TEXT NOT NULL, at_ms INTEGER NOT NULL)");
+    sql.exec("CREATE TABLE IF NOT EXISTS timer_repeats (name TEXT PRIMARY KEY, id TEXT NOT NULL, every_ms INTEGER NOT NULL)");
     // Repeats a rollback ended, to tell the agent about (posted from the alarm, `timer_notices`).
     sql.exec("CREATE TABLE IF NOT EXISTS timer_notices (id TEXT PRIMARY KEY, name TEXT NOT NULL, every_ms INTEGER NOT NULL)");
   }
@@ -137,9 +137,8 @@ export class TimerStore {
     t.name, id, t.at_ms, t.note, t.set_ms);
     if (t.every_ms === undefined) this.sql.exec("DELETE FROM timer_repeats WHERE name = ?", t.name);
     else {
-      this.sql.exec(`INSERT INTO timer_repeats (name, id, every_ms, note, at_ms) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(name) DO UPDATE SET id = excluded.id, every_ms = excluded.every_ms, note = excluded.note, at_ms = excluded.at_ms`,
-      t.name, id, t.every_ms, t.note, t.at_ms);
+      this.sql.exec(`INSERT INTO timer_repeats (name, id, every_ms) VALUES (?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET id = excluded.id, every_ms = excluded.every_ms`, t.name, id, t.every_ms);
     }
     return { ...t, id };
   }
@@ -149,9 +148,7 @@ export class TimerStore {
    * another run of the same firing (two alarms at once) already moved. Whether it moved.
    */
   advance(name: string, id: string, from: number, at: number): boolean {
-    if (this.sql.exec("UPDATE timers SET at_ms = ? WHERE name = ? AND id = ? AND at_ms = ?", at, name, id, from).rowsWritten === 0) return false;
-    this.sql.exec("UPDATE timer_repeats SET at_ms = ? WHERE name = ? AND id = ?", at, name, id);
-    return true;
+    return this.sql.exec("UPDATE timers SET at_ms = ? WHERE name = ? AND id = ? AND at_ms = ?", at, name, id, from).rowsWritten > 0;
   }
 
   /** Delete `name` (only the timer `id` when given: a fired one, not one set again meanwhile). Whether a row went. */

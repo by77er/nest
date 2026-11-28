@@ -379,7 +379,7 @@ Tests: `test/credentials.test.ts`. Mutations run: the old fallback, no principal
 
 By reading, no model run; the inventory's [§2.4](../#24-a-turns-life-agentdo-turnsstatus) gained `dropped`. The merges since the #82 map change the brain's environment as follows; none adds a start that bypasses the intent, so each is S-neutral:
 
-- **Timers (#134):** `timerFired` → `postInbox` → `inputArrived` clears `stop_quiet` → `wake` (`wakeDecision`, the intent). A new wake source after a stop, like any input. A repeating timer (2026-11-28) is one at each of its firings, so a stop doesn't hold against it: the operator or owner cancels it (`DELETE /v1/agents/<id>/timers/<name>`). A firing while an earlier one hasn't been taken in (a queued turn, or a mirrored message not confirmed) is skipped (`pendingFiring`), so a brain that can't start gets one such input, not one per interval.
+- **Timers (#134):** `timerFired` → `postInbox` → `inputArrived` clears `stop_quiet` → `wake` (`wakeDecision`, the intent). A new wake source after a stop, like any input. A repeating timer (2026-11-28) is a wake source only while no stop holds: see the section below.
 - **Asks as turns (#92-#94):** `answerAsk` enqueues an `ask_answer` turn through `enqueueTurn`, which wakes through the same path.
 - **`emit` and `traceEmit` in `update` (#103, #116):** no new awaits.
 - **Spawn grants (#166):** `conferGrants` and `resolveGrant` add awaits before a child's `children` row; outside the model (no brain state).
@@ -455,3 +455,12 @@ Tests: `control-plane/test/restart-launch.test.ts`, "no turn starts while a rest
 - with another start pending (an operator's `start` kept beside a live brain), a turn runs: only a restart holds turns.
 - failures while the brain is condemned leave the restart pending, and its start follows the brain's exit;
 - a restart first recorded counts from zero over a stale count; asked again while pending, the count stays.
+
+## repeating timers (claude/discord-spawnable-agents-rsabfm, author's map, 2026-11-28)
+
+| Action | Code | Conforms | Note |
+|---|---|---|---|
+| A repeating firing while a stop holds | agent.ts:2999 `timerFired` (`quietSinceStop`) | yes (S-neutral) | Moves the timer on without `postInbox`, so no `inputArrived`: `stop_quiet` stays, and no wake. Test: "while an operator's stop holds, a repeating timer moves on". |
+| A repeating firing while an earlier one waits | turns.ts `pendingFiring`, agent.ts `timerFired` | yes (S-neutral) | No post: no input, no wake. |
+| The rollback notice | agent.ts:2948 `timerNotices` → `deliver(…, external = false)` (line 2956) | yes (F1/F2 class) | A platform note: it never clears `stop_quiet`; it queues a turn that a stop leaves waiting. Test: "the rollback notice is a platform note". |
+| A one-shot firing | agent.ts `timerFired` → `postInbox` → `inputArrived` | yes (unchanged) | A wake source after a stop, like any input (#134). |
