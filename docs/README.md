@@ -125,6 +125,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 |---|---|
 | Rust on the host side (nestd, nest-proxy, guest agent, UFFD/ublk, CLI); TypeScript for the control plane | this file |
 | Workers Paid ($5/mo) | [control-plane/](control-plane/) |
+| Tool credentials are an app's own: a client's capabilities use its own secrets or OAuth, or none, never the operator's; the operator lends only the model credential, and an app's MCP servers need no list (2026-11-28) | [control-plane/api/clients/](control-plane/api/clients/#tool-credentials-are-an-apps-own) |
 | Hosts authenticate with signed instance identity documents; guests can't reach IMDS | [compute/provisioning/](compute/provisioning/) |
 | No agent roles. Where a brain runs and where its sandbox runs are unrelated: brains run on brain hosts (later, inside AgentDO) and reach a sandbox only through the gateway; an agent without hands needs no sandbox. The brain backend is pluggable (`claude-code`, and `api-loop` inside the control plane later). | [agents/](agents/) |
 | Captains, task boards and review pipelines are patterns (templates plus conventions) that agents and external apps build over MCP and the public API, not kernel code | [orchestration/](orchestration/) |

@@ -811,7 +811,7 @@ describe("caller identity (Nest-Identity, docs/control-plane/api/clients/#caller
     const s = await setup({ trusted: true });
     const name = `idc-${rand()}`;
     const c = await adminJson("/v1/admin/clients", {
-      body: { name, grant: { cells: [s.cell], credentials: ["claude_oauth_token", `cap:${s.cap}`], mcp_urls: [`https://mcp.test/${s.id}/`], max_agents: 1 } },
+      body: { name, grant: { cells: [s.cell], credentials: ["claude_oauth_token"], max_agents: 1, secrets: { max_count: 1, max_bytes: 128 } } },
     }, 201);
     const asClient = async (method: string, path: string, body: unknown) => {
       const res = await SELF.fetch(`${BASE}${path}`, {
@@ -821,14 +821,17 @@ describe("caller identity (Nest-Identity, docs/control-plane/api/clients/#caller
       expect(res.status, text).toBeLessThan(300);
       return JSON.parse(text);
     };
-    // Its own template, listing the operator's capability (within its grant: the URL and the credential).
+    // Its own capability on the same server, with the server's token as its own secret (an app's tools use its own
+    // credentials), and its own template listing it.
+    await asClient("PUT", "/v1/clients/self/secrets/k", { value: `tok-${s.id}` });
+    await asClient("PUT", `/v1/catalog/capabilities/${name}/srv`, { mcp: { url: `https://mcp.test/${s.id}/mcp`, auth: { secret: "k" }, trusted: true, tools: ["echo"] } });
     await asClient("PUT", `/v1/catalog/templates/${name}/t`, {
-      capabilities: ["nest", s.cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token",
+      capabilities: ["nest", `${name}/srv`], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token",
     });
     const a = await asClient("POST", "/v1/agents", { template: `${name}/t`, cell: s.cell, labels: { task: "t-17" } });
     await nextCommands(s.host.ws, (x) => x.type === "agent_start" && x.agent === a.agent);
     const ws = await runner(a.agent, s.host.host, s.host.host_token, 1, `rin_${rand()}`);
-    call(ws, "cal_ic1", s.t("echo"), { text: "x" });
+    call(ws, "cal_ic1", `${name}-srv_echo`, { text: "x" });
     expect((await result(ws, "cal_ic1")).status).toBe("ok");
     const mine = (await identities(s, "tools/call")).filter((x) => x.claims.sub === a.agent);
     expect(mine).toHaveLength(1);
@@ -848,7 +851,7 @@ describe("caller identity (Nest-Identity, docs/control-plane/api/clients/#caller
     const name = `na-${rand()}`;
     // Only the model credential: nothing covers a bearer, and none is needed.
     const c = await adminJson("/v1/admin/clients", {
-      body: { name, grant: { cells: [cell], credentials: ["claude_oauth_token"], mcp_urls: [`https://mcp.test/${id}/`], max_agents: 1 } },
+      body: { name, grant: { cells: [cell], credentials: ["claude_oauth_token"], max_agents: 1 } },
     }, 201);
     const asClient = async (method: string, path: string, body: unknown) => {
       const res = await SELF.fetch(`${BASE}${path}`, { method, headers: { authorization: `Bearer ${c.token}`, "content-type": "application/json" }, body: JSON.stringify(body) });

@@ -21,13 +21,24 @@
 - **A client** is a principal, `cli_<id>`, with a name (`[a-z][a-z0-9-]{1,30}`, unique) and a bearer token (`nest_cli_<id>_<secret>`). Only the token's hash is stored. The operator creates, rotates and deletes clients (`POST /v1/admin/clients {name, grant}`, which shows the token once; `POST …/<id>/rotate`; `DELETE …/<id>`). One Durable Object per client, ClientDO, holds its record, grant, webhook and event outbox.
 - **A grant** is the client's ceiling. Anything it doesn't name is refused:
   - `cells`: where its agents and sandboxes may run.
-  - `credentials`: the model credentials its agents may run on (e.g. `claude_oauth_token`).
-  - `mcp_urls`: the MCP server URLs its capabilities may name (exact, or a prefix ending in `/`).
+  - `credentials`: the model credentials its agents may run on (`claude_oauth_token`, or `claude_oauth_token:<name>`). Nothing else: a tool credential is never lent ([below](#tool-credentials-are-an-apps-own)); a grant naming one is refused (400).
+  - `mcp_urls`: ignored since 2026-11-28 ([below](#tool-credentials-are-an-apps-own)). Still taken and stored for one release, since the previous release bounds a client's capabilities by it; the next release drops it.
   - `secrets`: `{max_count, max_bytes}`, how many [secrets](#secrets) it may store and how big each may be (default `{0, 4096}`: none).
   - `inject_hosts`: the hosts its secrets may be [injected](#injection) into: exact names, or `*.` and a name of two or more labels (`*.example.com`, never `*.com`), lowercase. No address in any numeric form a resolver accepts (`1.2.3.4`, `127.0.0.0x1`, `0x7f.0x1`): a top-level label must start with a letter. nest has no public-suffix list, so a wildcard like `*.co.uk` is refused only by the operator not granting it: the operator's grant is the gate. Default none.
   - `egress_hosts`: the hosts its own [egress rules](#egress) may allow, named as `inject_hosts` are. Default none.
   - A grant stored before `secrets`, `inject_hosts` or `egress_hosts` reads as none of each.
   - `max_agents`, `max_sandboxes`: live (not ended or destroyed) at once, across everything it owns. A create over one is refused with `429 at_capacity`, `retryable: true`, the message starting with the limit (`max_agents: …`): there is room once fewer than the maximum are live (more than one end, if the grant was lowered below the live count). A maximum of 0 is `403 forbidden`, as for anything else outside the grant.
+### Tool credentials are an app's own
+
+**Decided 2026-11-28 (the owner's):** every app is a downstream consumer. Its tools use its own credentials (its [secrets](#secrets), its [OAuth](#mcp-credentials)) or none (its [caller identity](#caller-identity-for-mcp-servers)), never one the operator stored. The only credential the operator lends an app is the model credential its agents run on.
+- **What a client can't name:** an operator's tool credential (`cap:<name>`, `{oauth: cap:…}` with its `client`) in a capability of its namespace, written or at spawn, nor in its template through one of the operator's capabilities that has one (403), nor in its grant's `credentials` (400). Grants stored before list none in production; one that did would grant nothing now. Any operator MCP capability, credential or not, is refused too ([below](#tool-credentials-are-an-apps-own)).
+- **Any https server:** with nothing of the operator's to protect, a client's capabilities may name any MCP server `checkMcpUrl` takes (https; loopback only in local development). `mcp_urls` bounded where an operator's lent credential could go, so it's ignored, and goes in the next release. So a client can make the control plane send `initialize`, `tools/list` (while in use) and OAuth discovery requests to any https host, nest's own origin and IP literals included, carrying only its own credential and a `Nest-Identity` token for that URL; the requests leave from Cloudflare's edge, never the cell's network.
+- **Why:** lending tool credentials asked the operator to keep a per-service list for every app (`mcp_urls`) and gave the kernel two kinds of credential to tell apart at each step. Nothing used it: the two apps lend nothing but `claude_oauth_token`. An app that needs a service brings its own key or sign-in.
+- **The operator's MCP capabilities are the operator's,** credential or not: a client's template, or a spawn into its subtree, listing one is refused (403). Its connector, admission budget and its server's trust are shared with the operator's agents, and `mcp_urls` no longer stands between a client and its URL. A client's tools are its own capabilities. (The operator's capabilities with no MCP server, such as `nest`, `hands`, `timers`, stay open to clients.)
+- **The operator's own capabilities** keep `cap:` credentials for the operator's own agents (smoke checks such as `mcp-check`).
+- **Agents spawned before** keep what their spec held: a client agent spawned with an operator's tool credential or an operator MCP capability (none in production, 2026-11-28) keeps it until it ends, since calls aren't checked against the grant again.
+- **Rollback** ([rollout](../../../../dev/rollout/2026-11-28-app-only-tool-credentials.md)): the previous release bounds client capabilities by `mcp_urls` again, so an app's connection to a server not listed is refused at spawn until the roll-forward. List the servers an app relies on in its grant for this release, as before.
+
 ### No GitHub authority
 
 **Decided 2026-11-12 (the owner's: no Git semantics in the kernel), built 2026-11-15:** a grant names no GitHub repo, token or permission. An app that works on GitHub holds its own App and hands its sandboxes tokens as [secrets](#secrets).
@@ -55,7 +66,7 @@ The checks:
 
 | Method | Path | Check |
 | --- | --- | --- |
-| `POST` | `/v1/agents` | Within the grant (`cells`, `credentials`, `mcp_urls`, `max_agents`, …): the [catalog](#the-clients-catalog) expands its template with it. A `sandbox` or `owner` agent it names is subtree (404). `overrides` only narrow; `launch` and `rules` are the operator's (400). `grants` are confined to the subtree; an agent id in one is subtree (404) ([grants to its agents](#grants-to-its-agents)). |
+| `POST` | `/v1/agents` | Within the grant (`cells`, `credentials`, `max_agents`, …; no operator tool credential): the [catalog](#the-clients-catalog) expands its template with it. A `sandbox` or `owner` agent it names is subtree (404). `overrides` only narrow; `launch` and `rules` are the operator's (400). `grants` are confined to the subtree; an agent id in one is subtree (404) ([grants to its agents](#grants-to-its-agents)). |
 | `GET` | `/v1/agents` | Its own registry only (ClientDO), whatever `?client=` says. |
 | `GET` | `/v1/agents/<agent>` | Subtree. |
 | `GET` | `/v1/agents/<agent>/turns` | Subtree. |
@@ -87,9 +98,9 @@ The checks:
 | `PUT` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. Within the grant, when written and again at spawn. Its `launch.model` and `launch.effort` are [plain tokens](../../durable-objects/catalog/) (400). |
 | `DELETE` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
 | `GET` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
-| `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (`mcp_urls`, `credentials`, brokered actions). Its `rules` reach the live agents of its subtree that list it ([live rules](../../durable-objects/catalog/#live-rules)); a refused write reaches none. |
+| `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (no operator tool credential, no brokered action). Its `rules` reach the live agents of its subtree that list it ([live rules](../../durable-objects/catalog/#live-rules)); a refused write reaches none. |
 | `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. The live agents that read its rules have none of them from then on. An `{authorize}` capability's OAuth tokens are revoked with it ([mcp credentials](#mcp-credentials)). |
-| `POST` | `/v1/catalog/capabilities/<ns>/<entry>/oauth` | Namespace. Its `auth` must be `{authorize}` (409), its URL still within `mcp_urls` (403) ([mcp credentials](#mcp-credentials)). |
+| `POST` | `/v1/catalog/capabilities/<ns>/<entry>/oauth` | Namespace. Its `auth` must be `{authorize}` (409) ([mcp credentials](#mcp-credentials)). |
 | `GET` | `/v1/catalog/capabilities/<ns>/<entry>/oauth` | Namespace, as `POST`. |
 | `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>/oauth` | Namespace. By the record alone: it works after the capability is deleted. |
 | `GET` | `/v1/clients/self` | Self. |
@@ -119,7 +130,7 @@ The checks:
 - **Neither names a record.** Expansion derives it from the namespace's client and the entry: `client-secret:<cli>:<name>` (where the secret already lives) and `client-oauth:<cli>:<entry>:<incarnation>`. So no client can reach another's record or the operator's, whatever it writes, and a spec whose record isn't its capability's own client's is outside every grant.
 - **Only the client's own subtree uses it.** A template listing such a capability expands only for an agent joining that client's subtree (the client's own spawns, its agents' spawns, and an operator's spawn naming an owner in its subtree). Any other spawn of it, the operator's own included, is refused (400). So a person's consent to an app never serves anyone else's agents.
 - **An incarnation per `{authorize}` capability:** CatalogDO sets a random `incarnation` when the capability is written (whatever the writer sent) and keeps it while the URL and form stay. A capability made again under the entry gets a new one, so it never inherits an earlier authorization, not even one a flow still in flight completed for the old one.
-- **No grant field:** `mcp_urls` still bounds where the bearer may go, checked at the write, at each spawn and at each OAuth start. A `{secret}` bearer counts in `secrets` like any secret.
+- **No grant field:** the credential is the client's own, so it goes wherever the client points it ([tool credentials](#tool-credentials-are-an-apps-own)). A `{secret}` bearer counts in `secrets` like any secret.
 - **Authorizing,** the client's own routes (namespace auth: the client, or the operator):
   1. `POST /v1/catalog/capabilities/<ns>/<entry>/oauth {scopes?}` answers `{authorize_url, expires_ms, capability, resource, issuer, client, scopes}`, as the operator's start does.
   2. The app sends a person to `authorize_url`. Whoever approves binds their account to the capability, so the app shows the URL only to someone allowed to connect it.
@@ -172,7 +183,7 @@ POST /v1/agents
 
 - **A client writes templates and capabilities in its own namespace,** `<client-name>/<entry>` (`PUT /v1/catalog/templates/<client-name>/<entry>`, and the same for capabilities). It reads its own entries and the operator's; it never writes outside its namespace.
 - **Its capabilities' rules are read live** by the agents of its subtree, after their spawner's narrowing ([live rules](../../durable-objects/catalog/#live-rules)). Rules decide only whether a call the agent's spec already gives waits for an approval, which the client answers for its own subtree, so the grant doesn't limit them; an operator's agent spawned from the client's template outside the client's subtree keeps them as at spawn.
-- **Expansion applies the grant:** an mcp capability whose URL isn't in `mcp_urls`, a credential outside `credentials`, or anything [no grant covers](#no-github-authority) is refused when written and again at spawn.
+- **Expansion applies the grant:** a model credential outside `credentials`, an operator's tool credential ([tool credentials](#tool-credentials-are-an-apps-own)), or anything [no grant covers](#no-github-authority) is refused when written and again at spawn.
 
 ## Caller identity for MCP servers
 
@@ -183,7 +194,7 @@ POST /v1/agents
   - `sub`: the agent;
   - `owner`, `client` (or absent), `labels`, `epoch`, `tainted`, `iat`, `exp`;
   - `iss`: the Worker's public base URL.
-- **The connector's listing session** carries one with `sub: "nest:connector"`, and `client` when the capability is in a client's namespace: such a capability has a connector of its own ([the connector](../../../agents/capabilities/mcp/#the-connector), 2026-11-02). An operator's capability's listing names no client, even when a client's agent uses it: its list is shared.
+- **The connector's listing session** carries one with `sub: "nest:connector"`, and `client` when the capability is in a client's namespace: such a capability has a connector of its own ([the connector](../../../agents/capabilities/mcp/#the-connector), 2026-11-02). An operator's capability's listing names no client (a client's agent can't use one; one spawned before it couldn't keeps it, [above](#tool-credentials-are-an-apps-own)).
 - **The public keys** are at `GET /.well-known/jwks.json`, unauthenticated, with each key's `kid`. BrokerDO holds the private keys and rotates them, publishing the next key a day before it signs.
 - **Cost:** AgentDO and the connector cache a token per claim set (audience, epoch, taint, labels) for its first 4 minutes, so a call usually costs no BrokerDO round trip.
 - **What it's for:** a server knows which agent is calling and what labels its creator gave it, so it can scope each agent (a worker sees only its task) without trusting the bearer token alone, or with no bearer at all ([no bearer](../../../agents/capabilities/mcp/#no-bearer)). This builds the deferred [OIDC token](../../../security/identity/) for MCP servers.

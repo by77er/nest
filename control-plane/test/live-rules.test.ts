@@ -569,8 +569,8 @@ describe("a client's capability rules", () => {
     await runDue(agentStub(operators));
     expect(await rulesOf(operators)).toEqual([NEST_ALLOW]);
 
-    // A write outside the grant (an mcp server it may not name) is refused, and changes no agent's rules.
-    const bad = capability([{ pattern: "Bash", decision: "allow" }], { mcp: { url: "https://evil.example.com/mcp" } });
+    // A write outside the grant (an operator's credential, which no client's tools use) is refused, and changes no agent's rules.
+    const bad = capability([{ pattern: "Bash", decision: "allow" }], { mcp: { url: "https://evil.example.com/mcp", auth: "cap:board" } });
     const res = await as(c.token, `/v1/catalog/capabilities/${cap}`, { method: "PUT", body: bad });
     expect(res.status).toBe(403);
     expect(await res.text()).toContain("outside");

@@ -27,7 +27,7 @@ A header on every request (`initialize`, `notifications/initialized`, `tools/lis
 
 ## No bearer
 
-A capability may name no `auth` ([decision](../../agents/capabilities/mcp/#no-bearer)). Then nest sends no `Authorization` header on any request, agents' or the connector's, and `Nest-Identity` is the only credential. **Such a server must verify `Nest-Identity` on every request, `tools/list` and `initialize` included,** and refuse (401) one that doesn't verify: anyone can send a request without a bearer. To admit only its own client's agents, it checks `client` (and `labels` or `sub` for finer scope); the connector's listing identity carries `client` for a client's capability, and none for the operator's.
+A capability may name no `auth` ([decision](../../agents/capabilities/mcp/#no-bearer)). Then nest sends no `Authorization` header on any request, agents' or the connector's, and `Nest-Identity` is the only credential. **Such a server must verify `Nest-Identity` on every request, `tools/list` and `initialize` included,** and refuse (401) one that doesn't verify: anyone can send a request without a bearer. To admit only its own client's agents, it checks `client` (and `labels` or `sub` for finer scope); the connector's listing identity carries `client` for a client's capability, and none for the operator's. **Any client may point a capability at any https URL** (2026-11-28, [tool credentials are an app's own](../../control-plane/api/clients/#tool-credentials-are-an-apps-own)), so nest will sign a token for your URL with another client's `client`: an operator's server refuses a token that carries `client`, and an app's server refuses any `client` but its own.
 
 ## OAuth
 

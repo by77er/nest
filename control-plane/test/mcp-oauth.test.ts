@@ -843,7 +843,7 @@ describe("an API client's own mcp credentials", () => {
     return (text ? JSON.parse(text) : {}) as T;
   };
 
-  /** A client whose grant reaches `servers` (mcp_urls), with a cell of its own. */
+  /** A client with a cell of its own; `servers` go in its mcp_urls, which nothing reads now (the previous release does). */
   async function newClient(servers: string[]) {
     const cell = uniqueCell();
     const name = `oc-${rand()}`;
@@ -911,7 +911,7 @@ describe("an API client's own mcp credentials", () => {
     const withClient = (oc: string, client: string) => spec({ auth: "client-oauth:cli_A:cal:abcd1234", client, oauth: { client: oc, scopes: null } });
     expect(specOutsideGrant(withClient("client-secret:cli_A:google", "cli_A"), grant).filter((x) => x.includes("google"))).toEqual([]);
     expect(specOutsideGrant(withClient("client-secret:cli_B:google", "cli_A"), grant)).toContain("credential of cli_B in a capability of cli_A (x)");
-    expect(specOutsideGrant(withClient("cap:google", "cli_A"), grant)).toContain("credential cap:google (x)");
+    expect(specOutsideGrant(withClient("cap:google", "cli_A"), grant).some((x) => x.startsWith("credential cap:google (x): a client's tools use its own"))).toBe(true);
   });
 
   it("are refused in the operator's namespace, and their schema takes only a name or authorize: true", async () => {
@@ -1250,14 +1250,14 @@ describe("an API client's own mcp credentials", () => {
     expect(await entryRow(c, "move")).toBeUndefined();
   });
 
-  it("refuses a start once the grant no longer reaches the server, and lets the operator act on a client's routes", async () => {
+  it("starts whatever the grant's mcp_urls say (an app's own credential goes where it points it), and lets the operator act on a client's routes", async () => {
     const f = new FakeAuth(rand(), { cimd: true });
     fakes.set(f.id, f);
-    const c = await newClient([f.server]);
+    const c = await newClient([]);
     await putCap(c, "narrow", f, { authorize: true });
     expect((await adminJson(`/v1/catalog/capabilities/${c.name}/narrow/oauth`)).status).toBe("unauthorized");
-    await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token"], mcp_urls: [], max_agents: 5, max_sandboxes: 5, secrets: { max_count: 3, max_bytes: 128 } } } });
-    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/narrow/oauth`, { method: "POST" }, 403)).error.message).toContain("mcp_urls");
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/narrow/oauth`, { method: "POST" })).authorize_url).toContain(f.issuer);
+    expect((await adminJson(`/v1/catalog/capabilities/${c.name}/narrow/oauth`, { method: "POST" })).authorize_url).toContain(f.issuer);
   });
 
   it("{secret}: an expired secret is no bearer", async () => {
