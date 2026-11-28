@@ -599,6 +599,10 @@ const RICH = [
       "/links": { links: variant === "links-empty" ? [] : variant === "links-full" ? Array.from({ length: 20 }, (_, k) => ({ guild: String(1093847561234567890n + BigInt(k * 7919)), created_ms: now - (20 - k) * DAY })) : [{ guild: "1093847561234567890", created_ms: now - 5 * DAY }, { guild: "884213097645120512", created_ms: now - 2 * 3_600_000 }], max: 20 } };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
+    // Linking a Discord server (README.md#linked-servers-discord): taken, or refused at the cap (`links-refused`); removing one.
+    const linkTo = /^\/links\/([0-9]+)$/.exec(q);
+    if (linkTo && method === "PUT") return variant === "links-refused" ? [409, { error: "a project is linked to at most 20 Discord servers: remove one first" }] : [200, { guild: linkTo[1], created_ms: now }];
+    if (linkTo && method === "DELETE") return [200, { removed: linkTo[1] }];
     // "Needs you"'s own items without the asks (`?local=1`, README.md#asks).
     if (q === "/attention" && search.get("local") === "1") return [200, attention.filter((x) => x.kind !== "ask" && x.kind !== "asks_unavailable")];
     if (q in routes) return [200, routes[q]];

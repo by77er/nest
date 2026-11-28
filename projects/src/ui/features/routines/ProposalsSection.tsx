@@ -49,13 +49,21 @@ function ProposalCard({ projectId, p }: { projectId: string; p: Proposal }) {
         </Text>
         <MetaRow>
           <UntrustedBadge what={`the proposed task “${p.title}”`} />
+          {/* Ids as ids (mono, each on one line), as Settings shows a server's; a server's agent a fact of its own, so a
+              narrow card breaks between them, not inside one. */}
           {p.guild ? (
-            // The ids as ids (mono, each kept on one line), as Settings shows a server's.
-            <MetaItem>
-              From the Discord server <Token nowrap>{p.guild}</Token> · agent <Token nowrap>{p.run}</Token>
-            </MetaItem>
+            <>
+              <MetaItem>
+                From the Discord server <Token nowrap>{p.guild}</Token>
+              </MetaItem>
+              <MetaItem>
+                agent <Token nowrap>{p.run}</Token>
+              </MetaItem>
+            </>
           ) : (
-            <MetaItem>From the routine {p.routine_name} (run {p.run})</MetaItem>
+            <MetaItem>
+              From the routine {p.routine_name} (run <Token nowrap>{p.run}</Token>)
+            </MetaItem>
           )}
           <MetaItem title={exact(p.created_ms)}>{ago(p.created_ms)}</MetaItem>
         </MetaRow>

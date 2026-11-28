@@ -4680,12 +4680,12 @@ export class ProjectDO extends DurableObject<Env> {
   private async linkedTool(caller: LinkedCaller, tool: string, a: Record<string, unknown>): Promise<Result<unknown>> {
     switch (tool) {
       // The routine server's reads, as a run gets them.
+      // A routine run's reads, trimmed: a linked server's agents aren't the owner's (linkedHistory, LINKED_START_ERROR).
       case "list_tasks":
-        return ok({ tasks: this.taskSummaries().map(({ task, specced }) => ({ ...task, specced })) });
-      // A routine run's reads, trimmed: a linked server's agents aren't the owner's (linkedHistory).
+        return ok({ tasks: this.taskSummaries().map(({ task, specced }) => ({ ...task, start_error: linkedStartError(task.start_error), specced })) });
       case "get_task": {
         const t = await this.getTask(a.task as string);
-        return t.ok ? ok({ ...t.value, history: linkedHistory(t.value.history) }) : t;
+        return t.ok ? ok({ ...t.value, start_error: linkedStartError(t.value.start_error), history: linkedHistory(t.value.history) }) : t;
       }
       case "recent_activity": {
         // Not the owner's PR comments relayed to workers.
@@ -6010,13 +6010,31 @@ const linkedProposer = (guild: string) => `discord:${guild}`;
  */
 const LINKED_HIDDEN_ACTIONS = new Set(["secret_requested", "pr_comment", "pr_comment_dropped"]);
 
+/** Why a task's worker couldn't start, as a linked server's agent reads it: never nest's own words. */
+const LINKED_START_ERROR = "the task couldn't start";
+const linkedStartError = (e: string | null): string | null => (e === null ? null : LINKED_START_ERROR);
+
 /**
- * A task's history as a linked server's agent reads it: without LINKED_HIDDEN_ACTIONS, and an accepted proposal's
+ * A task's history as a linked server's agent reads it: without LINKED_HIDDEN_ACTIONS; an accepted proposal's
  * detail (which server and agent proposed it, or which routine run) left out, so one linked server never learns
- * another's ids.
+ * another's ids; a worker restarted for a PR comment (`revise`) with only the PR's number, not the comment's link
+ * or author; and a failed start (`start_failed`) as LINKED_START_ERROR, not nest's error.
  */
 function linkedHistory(history: HistoryRow[]): HistoryRow[] {
-  return history.filter((h) => !LINKED_HIDDEN_ACTIONS.has(h.action)).map((h) => (h.action === "proposal_accepted" ? { ...h, detail: null } : h));
+  return history.filter((h) => !LINKED_HIDDEN_ACTIONS.has(h.action)).map((h) => {
+    if (h.action === "proposal_accepted") return { ...h, detail: null };
+    if (h.action === "start_failed") return { ...h, detail: LINKED_START_ERROR };
+    if (h.action === "revise") {
+      let pr: unknown = null;
+      try {
+        pr = h.detail === null ? null : (JSON.parse(h.detail) as { pr?: unknown }).pr ?? null;
+      } catch {
+        // Not JSON: nothing of it is shown.
+      }
+      return { ...h, detail: typeof pr === "number" ? JSON.stringify({ pr }) : null };
+    }
+    return h;
+  });
 }
 
 function proposalOf(r: Row): Proposal {

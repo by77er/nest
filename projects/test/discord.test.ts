@@ -217,7 +217,7 @@ describe("/mcp/discord's reads", () => {
     expect(activity.since_ms).toBeGreaterThan(Date.now() - 3 * 24 * 3600_000 - 60_000);
   });
 
-  it("reads a task's history without the secrets its worker asked for or the owner's PR comments; the owner reads all of it", async () => {
+  it("reads a task's history without the secrets its worker asked for, the owner's PR comments or nest's start errors; the owner reads all of it", async () => {
     const p = await newProject();
     const g = newGuild();
     await link(p.id, g);
@@ -230,12 +230,23 @@ describe("/mcp/discord's reads", () => {
       add("pr_comment", { pr: 7, author: "owner", body: "the owner's private note", to: "agt_w" });
       add("pr_comment_dropped", { pr: 7, body: "another note" });
       add("blocked", { question: "which API?" });
+      add("revise", { pr: 7, url: "https://github.com/o/r/pull/7#issuecomment-1", author: "the-owner-login" });
+      add("start_failed", "nest 403 forbidden: egress host internal.example is outside the grant");
+      st.storage.sql.exec("UPDATE tasks SET start_error = 'nest 503: internal (retrying)' WHERE id = ?", task.id);
     });
-    const full = ok(await callTool("discord", await bot(g), "get_task", { project: p.id, task: task.id }));
-    expect(full.history.map((h: { action: string }) => h.action)).toEqual(["created", "progress", "blocked"]);
-    expect(JSON.stringify(full)).not.toMatch(/STRIPE_LIVE_KEY|private note|another note/);
+    const t = await bot(g);
+    const full = ok(await callTool("discord", t, "get_task", { project: p.id, task: task.id }));
+    expect(full.history.map((h: { action: string }) => h.action)).toEqual(["created", "progress", "blocked", "revise", "start_failed"]);
+    expect(JSON.stringify(full)).not.toMatch(/STRIPE_LIVE_KEY|private note|another note|issuecomment|the-owner-login|internal|forbidden/);
+    // A restart for a PR comment says which PR; a failed start, only that it failed.
+    expect(JSON.parse(full.history.find((h: { action: string }) => h.action === "revise").detail)).toEqual({ pr: 7 });
+    expect(full.history.find((h: { action: string }) => h.action === "start_failed").detail).toBe("the task couldn't start");
+    expect(full.start_error).toBe("the task couldn't start");
+    const listed = ok(await callTool("discord", t, "list_tasks", { project: p.id })).tasks.find((x: { id: string }) => x.id === task.id);
+    expect(listed.start_error).toBe("the task couldn't start");
     const owner = (await api(token, "GET", `/api/projects/${p.id}/tasks/${task.id}`)).body;
-    expect(owner.history.map((h: { action: string }) => h.action)).toEqual(["created", "progress", "secret_requested", "pr_comment", "pr_comment_dropped", "blocked"]);
+    expect(owner.history.map((h: { action: string }) => h.action)).toEqual(["created", "progress", "secret_requested", "pr_comment", "pr_comment_dropped", "blocked", "revise", "start_failed"]);
+    expect(owner.start_error).toBe("nest 503: internal (retrying)");
   });
 });
 

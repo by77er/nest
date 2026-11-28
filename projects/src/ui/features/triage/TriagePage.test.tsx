@@ -180,7 +180,9 @@ describe("the Triage page", () => {
     expect(issues.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     const card = list.querySelector("[data-proposal=prp_one]") as HTMLElement;
     expect(card).toHaveTextContent("From the routine Spontaneous review");
-    expect(list.querySelector("[data-proposal=prp_two]")).toHaveTextContent(`From the Discord server ${guild} · agent agt_bot`);
+    const theirs = list.querySelector("[data-proposal=prp_two]") as HTMLElement;
+    expect(theirs).toHaveTextContent(`From the Discord server ${guild}`);
+    expect(theirs).toHaveTextContent("agent agt_bot");
     await user.click(within(card).getByRole("button", { name: "Accept “Fix the race” as a draft" }));
     await waitFor(() => expect(api.writes).toContainEqual({ method: "POST", path: "/api/projects/prj_one/proposals/prp_one/accept", body: undefined }));
     await user.click(await screen.findByRole("button", { name: "Decline “Drop the old flag”" }));

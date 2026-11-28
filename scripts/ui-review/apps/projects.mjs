@@ -1013,8 +1013,12 @@ const app = {
     { name: "settings-links-empty", section: "project", path: "/projects/prj_demo/settings", fixture: "links-empty" },
     // A malformed server id, said at the field and not sent.
     { name: "settings-links-invalid", section: "project", path: "/projects/prj_demo/settings", after: async (p) => { const f = p.getByLabel("Server ID"); await f.scrollIntoViewIfNeeded(); await f.fill("0123"); await p.getByRole("button", { name: "Link server" }).click(); await p.getByText(/digits only/).waitFor(); } },
-    // At the cap (20): the list in full, the field disabled, saying to remove one first.
+    // At the cap (20): the list in full, and a line saying so where the field was.
     { name: "settings-links-full", section: "project", path: "/projects/prj_demo/settings", fixture: "links-full" },
+    // Removing a server: its confirmation, the safe choice focused.
+    { name: "settings-links-remove", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const b = p.getByRole("button", { name: "Remove the Discord server 884213097645120512" }); await b.scrollIntoViewIfNeeded(); await b.click(); await p.getByRole("dialog", { name: "Remove the Discord server 884213097645120512?" }).waitFor(); } },
+    // The Worker refusing a link (409, the cap reached elsewhere): said at the field in the page's words.
+    { name: "settings-links-refused", section: "project", path: "/projects/prj_demo/settings", fixture: "links-refused", httpErrors: true, after: async (p) => { const f = p.getByLabel("Server ID"); await f.scrollIntoViewIfNeeded(); await f.fill("4444"); await p.getByRole("button", { name: "Link server" }).click(); await p.getByText(/as many servers as it can be/).waitFor(); } },
     // Whose issues come into triage: anyone's (README.md#triage).
     { name: "settings-issues-anyone", section: "project", path: "/projects/prj_demo/settings", fixture: "issues-anyone" },
     // No one's issues come in yet (an org's repo, no comments user): said, with what to do.
