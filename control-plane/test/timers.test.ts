@@ -7,7 +7,7 @@ import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { AgentDO } from "../src/do/agent";
 import { ClientOutbox } from "../src/lib/client-events";
-import { TIMERS_MAX } from "../src/lib/timers";
+import { everyText, nextFiring, TimerStore, TIMERS_MAX } from "../src/lib/timers";
 import { adminJson, BASE, connectHost, nextCommands, runDue, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -247,5 +247,148 @@ describe("timers", () => {
       ClientOutbox.prototype.add = real;
     }
     expect(added).toContainEqual({ type: "agent.timer_fired", agent: c.agent, timer: "hook", note: "ping" });
+  });
+
+  it("a repeating timer fires at each interval, keeping its cadence, until it's cancelled", async () => {
+    const s = await setup();
+    const set = await call(s.ws, "timer_set", { name: "daily", every_s: 86_400, note: "post the digest" });
+    expect(set.content[0].text).toContain("then every 1 day until you cancel it");
+    const [t] = await agentStub(s.agent).timers();
+    expect(t).toMatchObject({ name: "daily", every_ms: 86_400_000, note: "post the digest" });
+    // Without after_s or at_ms, its first firing is one interval from now.
+    expect(t!.at_ms - Date.now()).toBeGreaterThan(86_390_000);
+    expect((await call(s.ws, "timer_list", {})).content[0].text).toContain("then every 1 day (post the digest)");
+
+    await fire(s.agent, "daily");
+    const run = await s.ws.next("run_turn");
+    expect(run.input.text).toBe('Message from timer: timer "daily" fired (repeats every 1 day; timer_cancel stops it): post the digest');
+    s.ws.send({ type: "ack", up_to: run.seq });
+    // Still there, a day on, and armed for it.
+    const [after] = await agentStub(s.agent).timers();
+    expect(after!.at_ms - Date.now()).toBeGreaterThan(86_390_000);
+    const deadline = await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) => st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'timer:daily'").one().at);
+    expect(deadline).toBe(after!.at_ms);
+    // Each firing is its own input (not deduplicated as the first): mid-turn, it joins the running turn.
+    await fire(s.agent, "daily");
+    expect((await s.ws.next("inbox")).message).toMatchObject({ from: "timer", text: 'timer "daily" fired (repeats every 1 day; timer_cancel stops it): post the digest' });
+    expect(await traceTypes(s.agent)).toEqual(["timer_set:daily", "timer_fired:daily", "timer_fired:daily"]);
+
+    expect((await call(s.ws, "timer_cancel", { name: "daily" })).content[0].text).toBe("Timer daily cancelled.");
+    await runDue(agentStub(s.agent));
+    expect(await s.ws.none("inbox", 300)).toBe(true);
+    expect(await agentStub(s.agent).timers()).toEqual([]);
+  });
+
+  it("a repeating timer that fires late skips the firings it missed, keeping its cadence", async () => {
+    const s = await setup();
+    await call(s.ws, "timer_set", { name: "hourly", every_s: 3600, after_s: 60 });
+    // Due two and a half hours ago (an outage): one firing now, the next on the cadence, not three at once.
+    const was = Date.now() - 9_000_000;
+    await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) => {
+      st.storage.sql.exec("UPDATE timers SET at_ms = ? WHERE name = 'hourly'", was);
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'timer:hourly'");
+    });
+    await runDue(agentStub(s.agent));
+    await s.ws.next("run_turn");
+    expect(await s.ws.none("inbox", 300)).toBe(true);
+    const [t] = await agentStub(s.agent).timers();
+    expect(t!.at_ms).toBe(was + 3 * 3_600_000);
+  });
+
+  it("bounds a repeating timer's interval to 5 minutes through 30 days, and its first firing as any timer's", async () => {
+    const s = await setup();
+    const err = async (args: unknown) => (await call(s.ws, "timer_set", args)).error?.message as string | undefined;
+    expect(await err({ name: "r", every_s: 60 })).toContain("5 minutes");
+    expect(await err({ name: "r", every_s: 31 * 86_400 })).toContain("30 days");
+    expect(await err({ name: "r", every_s: 3600, after_s: 5 })).toContain("at least 10 s");
+    expect(await err({ name: "r", every_s: 3600, after_s: 60, at_ms: Date.now() + 60_000 })).toContain("exactly one");
+    expect((await call(s.ws, "timer_set", { name: "r", every_s: 300, at_ms: Date.now() + 120_000 })).status).toBe("ok");
+    // Set again without every_s: one-shot from then on.
+    await call(s.ws, "timer_set", { name: "r", after_s: 60 });
+    expect((await agentStub(s.agent).timers())[0]).not.toHaveProperty("every_ms");
+  });
+
+  it("a repeating timer cancelled, or set again, while its firing is being posted stays as that left it", async () => {
+    for (const during of ["cancel", "set"] as const) {
+      const s = await setup();
+      await call(s.ws, "timer_set", { name: "rep", every_s: 3600, note: "old" });
+      await runInDurableObject(agentStub(s.agent), async (inst: AgentDO) => {
+        const i = inst as any;
+        const post = i.postInbox.bind(inst);
+        i.postInbox = async (...args: unknown[]) => {
+          if (during === "cancel") await i.cancelTimer("rep", "test");
+          else await i.setTimer({ name: "rep", at_ms: Date.now() + 7_200_000, note: "new", set_ms: Date.now() }, "k-new");
+          return post(...args);
+        };
+        i.timerStore.sql.exec("UPDATE timers SET at_ms = ? WHERE name = 'rep'", Date.now() - 1);
+        try {
+          await i.timerFired("rep");
+        } finally {
+          delete i.postInbox;
+        }
+      });
+      const timers = await agentStub(s.agent).timers();
+      const deadline = await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) => st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'timer:rep'").toArray()[0]?.at);
+      if (during === "cancel") {
+        expect(timers).toEqual([]);
+        expect(deadline).toBeUndefined();
+      } else {
+        expect(timers).toEqual([expect.objectContaining({ name: "rep", note: "new" })]);
+        expect(timers[0]).not.toHaveProperty("every_ms");
+        // The new timer's time (two hours), not the old one's next firing (one hour).
+        expect(timers[0]!.at_ms - Date.now()).toBeGreaterThan(7_000_000);
+        expect(deadline).toBe(timers[0]!.at_ms);
+      }
+    }
+  });
+
+  it("a client's agent's repeating firing is a webhook event naming the next one", async () => {
+    const c = await setup();
+    await runInDurableObject(agentStub(c.agent), (inst: AgentDO) => (inst as any).update((i: any) => { i.client = "cli_timertest"; }));
+    await call(c.ws, "timer_set", { name: "tick", every_s: 600, note: "check" });
+    const added: any[] = [];
+    const real = ClientOutbox.prototype.add;
+    ClientOutbox.prototype.add = function (this: ClientOutbox, ...args: Parameters<typeof real>) {
+      added.push(args[2]);
+      return real.apply(this, args);
+    };
+    try {
+      await fire(c.agent, "tick");
+      await c.ws.next("run_turn");
+    } finally {
+      ClientOutbox.prototype.add = real;
+    }
+    const [t] = await agentStub(c.agent).timers();
+    expect(added).toContainEqual({ type: "agent.timer_fired", agent: c.agent, timer: "tick", note: "check", next_ms: t!.at_ms });
+  });
+
+  it("reads a timers table of the previous release: a column added, its rows one-shot", async () => {
+    const s = await setup({ start: false });
+    const seen = await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) => {
+      st.storage.sql.exec("DROP TABLE timers");
+      st.storage.sql.exec("CREATE TABLE timers (name TEXT PRIMARY KEY, id TEXT NOT NULL, at_ms INTEGER NOT NULL, note TEXT NOT NULL, set_ms INTEGER NOT NULL)");
+      st.storage.sql.exec("INSERT INTO timers (name, id, at_ms, note, set_ms) VALUES ('old', 'k-old', 123, 'n', 100)");
+      const store = new TimerStore(st.storage.sql);
+      return { got: store.get("old"), list: store.list() };
+    });
+    expect(seen.got).toEqual({ name: "old", id: "k-old", at_ms: 123, note: "n", set_ms: 100 });
+    expect(seen.list).toEqual([{ name: "old", at_ms: 123, note: "n", set_ms: 100 }]);
+  });
+});
+
+describe("repeating timers' arithmetic", () => {
+  it("keeps the cadence, and skips what it missed", () => {
+    expect(nextFiring(1000, 300, 1001)).toBe(1300);
+    expect(nextFiring(1000, 300, 1300)).toBe(1600);
+    expect(nextFiring(1000, 300, 2050)).toBe(2200);
+    expect(nextFiring(1000, 300, 999)).toBe(1300);
+  });
+
+  it("says an interval as a person would", () => {
+    expect(everyText(300_000)).toBe("5 minutes");
+    expect(everyText(3_600_000)).toBe("1 hour");
+    expect(everyText(5_400_000)).toBe("90 minutes");
+    expect(everyText(604_800_000)).toBe("7 days");
+    expect(everyText(301_000)).toBe("301 seconds");
   });
 });

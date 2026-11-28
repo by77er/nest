@@ -11,7 +11,7 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import { SYSTEM_SENDER } from "../lib/senders";
-import { type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX } from "../lib/timers";
+import { everyText, nextFiring, type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX } from "../lib/timers";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
 import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall, visible } from "../lib/sinks";
@@ -2895,7 +2895,7 @@ export class AgentDO extends DurableObject<Env> {
     const row = this.timerStore.set(t, id);
     if (!row) throw new NestError(ErrorCodes.FORBIDDEN, `at most ${TIMERS_MAX} timers: cancel one first (timer_list)`, 409);
     const armed = this.deadlines.set(`${TIMER_DEADLINE}${t.name}`, t.at_ms);
-    this.traceEmit({ type: "timer_set", name: t.name, at_ms: t.at_ms, note: t.note });
+    this.traceEmit({ type: "timer_set", name: t.name, at_ms: t.at_ms, note: t.note, ...(t.every_ms !== undefined ? { every_ms: t.every_ms } : {}) });
     await armed;
     return t;
   }
@@ -2939,9 +2939,10 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * A timer's deadline came: its input goes to the agent as an inbox message does (mid-turn, into the
-   * running turn; otherwise a turn of its own, which wakes a brain), keyed by the timer's id so a retried
-   * alarm posts it once, and only then is its row deleted. One cancelled or ended is dropped; one set
-   * again for later (its row's time ahead) is armed for that time.
+   * running turn; otherwise a turn of its own, which wakes a brain), keyed by the timer's id (and, for a
+   * repeating one, this firing's time) so a retried alarm posts it once. Only then is a one-shot timer's row
+   * deleted, or a repeating one moved to its next firing and armed for it, in one synchronous step. One
+   * cancelled or ended is dropped; one set again for later (its row's time ahead) is armed for that time.
    */
   private async timerFired(name: string): Promise<void> {
     if (!this.exists()) return;
@@ -2956,12 +2957,22 @@ export class AgentDO extends DurableObject<Env> {
       this.timerStore.delete(name, row.id);
       return;
     }
-    await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note), false, `timer/${row.id}`);
-    // Re-read: only this timer goes (one set again during the post keeps its row and deadline).
-    if (!this.timerStore.delete(name, row.id)) return;
+    const every = row.every_ms;
+    const firing = every === undefined ? `timer/${row.id}` : `timer/${row.id}/${row.at_ms}`;
+    await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note, every), false, firing);
+    // Re-read: only this timer moves on or goes (one set again or cancelled during the post is left as it is).
+    let next: number | undefined;
+    if (every === undefined) {
+      if (!this.timerStore.delete(name, row.id)) return;
+    } else {
+      next = nextFiring(row.at_ms, every, Date.now());
+      if (!this.timerStore.advance(name, row.id, next)) return;
+    }
+    const armed = next !== undefined ? this.deadlines.set(`${TIMER_DEADLINE}${name}`, next) : null;
     const after = this.load();
-    this.traceEmit({ type: "timer_fired", name, note: row.note });
-    this.emit(after, `${after.agent}/timer/${row.id}`, { type: "agent.timer_fired", agent: after.agent, timer: name, note: row.note });
+    this.traceEmit({ type: "timer_fired", name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
+    this.emit(after, `${after.agent}/${firing}`, { type: "agent.timer_fired", agent: after.agent, timer: name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
+    await armed;
   }
 
   async turns(): Promise<{ turn: string; status: TurnStatus; input: TurnInput }[]> {
@@ -3385,9 +3396,10 @@ export class AgentDO extends DurableObject<Env> {
         const due = timerDue(p.data, Date.now());
         if (!due.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, due.error);
         await live();
-        const t = await this.setTimer({ name: p.data.name, at_ms: due.at_ms, note: p.data.note ?? "", set_ms: Date.now() }, key);
+        const t = await this.setTimer({ name: p.data.name, at_ms: due.at_ms, note: p.data.note ?? "", set_ms: Date.now(), ...(due.every_ms !== undefined ? { every_ms: due.every_ms } : {}) }, key);
+        const repeats = t.every_ms !== undefined ? `, then every ${everyText(t.every_ms)} until you cancel it (timer_cancel)` : "";
         return { status: "ok", content: [
-          { type: "text", text: `Timer ${t.name} fires at ${new Date(t.at_ms).toISOString()} (in ${Math.round((t.at_ms - Date.now()) / 1000)} s), as an inbox message. End your turn to wait for it; an inbox message may wake you first.` },
+          { type: "text", text: `Timer ${t.name} fires at ${new Date(t.at_ms).toISOString()} (in ${Math.round((t.at_ms - Date.now()) / 1000)} s)${repeats}, as an inbox message. End your turn to wait for it; an inbox message may wake you first.` },
           { type: "json", value: t },
         ] };
       }
@@ -3401,7 +3413,7 @@ export class AgentDO extends DurableObject<Env> {
       case "timer_list": {
         const timers = this.timerStore.list();
         return { status: "ok", content: [
-          { type: "text", text: timers.length ? timers.map((t) => `${t.name}: ${new Date(t.at_ms).toISOString()}${t.note ? ` (${t.note})` : ""}`).join("\n") : "No timers." },
+          { type: "text", text: timers.length ? timers.map((t) => `${t.name}: ${new Date(t.at_ms).toISOString()}${t.every_ms !== undefined ? `, then every ${everyText(t.every_ms)}` : ""}${t.note ? ` (${t.note})` : ""}`).join("\n") : "No timers." },
           { type: "json", value: { timers } },
         ] };
       }

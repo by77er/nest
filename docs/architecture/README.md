@@ -69,7 +69,7 @@ The contract is in [interfaces/gateway/](../interfaces/gateway/). Any runner can
 
 ## A turn, end to end
 
-1. **Something happens.** I or an API client send a turn or an inbox message, an owner agent's spawn gives the first task, an integration posts to the agent's inbox, an ask is answered, a timer fires, or (designed) a repeating `wake_at` comes due. It enters the agent's AgentDO queue.
+1. **Something happens.** I or an API client send a turn or an inbox message, an owner agent's spawn gives the first task, an integration posts to the agent's inbox, an ask is answered, or a timer fires (once, or at each of its intervals). It enters the agent's AgentDO queue.
 2. **Placing the brain.** AgentDO queues the turn and, if no brain is running, picks a runner by backend and capacity: for `claude-code`, a brain host with room, preferring the one that ran the agent last. FleetDO sends `agent_start`, and the runner rebuilds the session from R2 and starts Claude Code, resumed or fresh (see [continuity](../agents/#continuity)).
 3. **Reaching the hands.** If the agent has hands, AgentDO makes sure the sandbox is running (a suspended or unplaced one is placed and restored from its head; an archived one by the [activator](../control-plane/activator/), designed), attaches the agent through SandboxDO, and gives the runner the sandbox host's hostname, the binding and the guest's version. The runner renews or re-resolves through AgentDO when a binding ages or a connection is refused.
 4. **The turn.** AgentDO sends the turn's input to the runner; messages that arrive mid-turn join it through the inbox mirror.
