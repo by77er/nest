@@ -1,6 +1,7 @@
 // A project's settings: what can be changed (Workers, Auto-merge, CI workflows) in one row, saved together by the
 // Save right under it; then what's read-only (the project's name and repo, and the way to its Secrets
-// page) in a row of its own. Each Panel is as tall as its content.
+// page), and the Discord servers it is linked to (README.md#linked-servers-discord), in a row of their own. Each
+// Panel is as tall as its content.
 
 import { Anchor, Button, Text } from "@mantine/core";
 import { IconBrandGithub, IconKey } from "@tabler/icons-react";
@@ -8,6 +9,7 @@ import { useParams } from "@tanstack/react-router";
 import { AnchorLink } from "../../common/links";
 import { icon, MetaItem, Panel, Row, Section, SectionGrid, Stack } from "../../layout";
 import { ProjectFrame } from "../project/ProjectFrame";
+import { DiscordServers } from "./DiscordServers";
 import { SettingsForm } from "./SettingsForm";
 
 export function SettingsPage() {
@@ -51,6 +53,7 @@ export function SettingsPage() {
                   </Stack>
                 </Section>
               </Panel>
+              <DiscordServers projectId={projectId} />
             </SectionGrid>
           </Stack>
         </Section>

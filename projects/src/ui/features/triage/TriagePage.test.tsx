@@ -17,7 +17,7 @@ const issue = (o: Partial<Issue> = {}): Issue => ({
 });
 
 const proposal = (o: Partial<Proposal> = {}): Proposal => ({
-  id: "prp_one", routine: "rtn_a", routine_name: "Spontaneous review", run: "run_a", title: "Fix the race", body: "In src/a.ts.", state: "untriaged", task: null, reason: null,
+  id: "prp_one", routine: "rtn_a", routine_name: "Spontaneous review", run: "run_a", guild: null, source: "routine:rtn_a/run_a", title: "Fix the race", body: "In src/a.ts.", state: "untriaged", task: null, reason: null,
   created_ms: now - 7_200_000, ...o,
 });
 
@@ -169,7 +169,9 @@ describe("the Triage page", () => {
     first.unmount();
     const api = new FakeApi();
     api.issues = [issue()];
-    api.proposals = [proposal(), proposal({ id: "prp_two", title: "Drop the old flag" })];
+    // The second a linked Discord server's (README.md#linked-servers-discord), stored in the routines' shape.
+    const guild = "1093847561234567890";
+    api.proposals = [proposal(), proposal({ id: "prp_two", title: "Drop the old flag", routine: `discord:${guild}`, routine_name: `Discord server ${guild}`, run: "agt_bot", guild, source: `discord:${guild}/agt_bot` })];
     const { user } = renderApp("/projects/prj_one/triage", api);
     const list = await screen.findByRole("list", { name: "Proposed tasks" });
     expect(within(list).getAllByRole("listitem")).toHaveLength(2);
@@ -178,6 +180,7 @@ describe("the Triage page", () => {
     expect(issues.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     const card = list.querySelector("[data-proposal=prp_one]") as HTMLElement;
     expect(card).toHaveTextContent("From the routine Spontaneous review");
+    expect(list.querySelector("[data-proposal=prp_two]")).toHaveTextContent(`From the Discord server ${guild} (agent agt_bot)`);
     await user.click(within(card).getByRole("button", { name: "Accept “Fix the race” as a draft" }));
     await waitFor(() => expect(api.writes).toContainEqual({ method: "POST", path: "/api/projects/prj_one/proposals/prp_one/accept", body: undefined }));
     await user.click(await screen.findByRole("button", { name: "Decline “Drop the old flag”" }));

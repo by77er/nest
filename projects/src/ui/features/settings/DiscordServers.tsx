@@ -1,0 +1,114 @@
+// The Discord servers a project is linked to (README.md#linked-servers-discord), in Settings: the Discord bot's
+// agents in a linked server read the project's board and propose tasks into triage, nothing else. Linking happens
+// only here (behind Access), so nobody in Discord can widen what an agent sees. Each server by its id with when it
+// was linked and Remove (confirmed, at its row's right); the add field below the list, its Link at its right.
+
+import { Button, Text, TextInput } from "@mantine/core";
+import { modals } from "@mantine/modals";
+import { type FormEvent, useState } from "react";
+import { GUILD } from "../../../requests";
+import { ApiError } from "../../api/client";
+import { useLink, useLinks, useUnlink } from "../../api/queries";
+import { ago, exact } from "../../common/time";
+import { ErrorState, FieldGroup, Grow, LoadingState, MetaItem, Panel, Row, RowAction, Section, Stack, Token } from "../../layout";
+
+/** What's wrong with a typed server id, or null: the Worker's rule (`GUILD`), said in words. */
+export function guildProblem(v: string): string | null {
+  if (v === "") return "Enter the server's ID";
+  return GUILD.test(v) ? null : "A server ID is its number: digits only, without a leading zero";
+}
+
+export function DiscordServers({ projectId }: { projectId: string }) {
+  const links = useLinks(projectId);
+  const link = useLink(projectId);
+  const unlink = useUnlink(projectId);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const list = links.data?.links ?? [];
+  const full = links.data !== undefined && list.length >= links.data.max;
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    const guild = draft.trim();
+    const problem = guildProblem(guild);
+    if (problem) return setError(problem);
+    setError(null);
+    link.mutate(guild, {
+      onSuccess: () => setDraft(""),
+      onError: (err) => setError(err instanceof ApiError ? err.message : "The server wasn't linked: try again"),
+    });
+  };
+  const confirmRemove = (guild: string) =>
+    modals.openConfirmModal({
+      title: `Remove the Discord server ${guild}?`,
+      children: <Text fz="md">Its agents stop seeing this project from their next call. Tasks they proposed stay in triage.</Text>,
+      labels: { confirm: "Remove", cancel: "Keep it" },
+      confirmProps: { color: "danger" },
+      cancelProps: { variant: "default", "data-autofocus": true },
+      onConfirm: () => unlink.mutate(guild),
+    });
+
+  return (
+    <Panel data-slot="discord">
+      <Section title="Discord servers" order={4} count={links.data ? list.length : undefined} region={false}>
+        <Stack gap="lg">
+          <Text fz="sm" c="dimmed">
+            The Discord bot's agents in a linked server can read this project's board and propose tasks to your triage queue. Nothing else: they can't assign, start or change work.
+          </Text>
+          {links.isPending ? (
+            <LoadingState label="Loading the linked servers" />
+          ) : links.isError ? (
+            <ErrorState title="The linked servers couldn't be loaded" error={links.error} onRetry={() => void links.refetch()} />
+          ) : list.length === 0 ? (
+            <Text fz="sm" c="dimmed">
+              No server linked
+            </Text>
+          ) : (
+            // Rows of controls (an id, its Remove): a 44 px pitch on touch.
+            <Stack gap="sm" data-touch-pitch role="list" aria-label="Linked Discord servers">
+              {list.map((l) => (
+                <Row key={l.guild} gap="sm" wrap="nowrap" role="listitem" data-link={l.guild}>
+                  <Grow>
+                    <Row gap="sm">
+                      <Token size="sm" dimmed={false}>{l.guild}</Token>
+                      <MetaItem title={exact(l.created_ms)}>Linked {ago(l.created_ms)}</MetaItem>
+                    </Row>
+                  </Grow>
+                  <RowAction variant="subtle" color="danger" loading={unlink.isPending && unlink.variables === l.guild} onClick={() => confirmRemove(l.guild)} aria-label={`Remove the Discord server ${l.guild}`}>
+                    Remove
+                  </RowAction>
+                </Row>
+              ))}
+            </Stack>
+          )}
+          {links.data && (
+            <form onSubmit={submit} noValidate>
+              <FieldGroup
+                actions={
+                  <Button type="submit" variant="default" loading={link.isPending} disabled={full}>
+                    Link server
+                  </Button>
+                }
+              >
+                <TextInput
+                  label="Server ID"
+                  description={full ? `A project is linked to at most ${links.data.max} servers: remove one first.` : "In Discord, with Developer Mode on: right-click the server, then Copy Server ID."}
+                  inputMode="numeric"
+                  autoComplete="off"
+                  maxLength={25}
+                  value={draft}
+                  disabled={full}
+                  error={error}
+                  onChange={(e) => {
+                    setDraft(e.currentTarget.value);
+                    if (error) setError(null);
+                  }}
+                />
+              </FieldGroup>
+            </form>
+          )}
+        </Stack>
+      </Section>
+    </Panel>
+  );
+}

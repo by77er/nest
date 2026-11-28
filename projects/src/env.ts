@@ -33,6 +33,11 @@ export interface Env {
    * separated; ids only, nothing turns the check off). README.md#repo-authority.
    */
   GITHUB_ACCOUNTS?: string;
+  /**
+   * The API clients whose own agents `/mcp/discord` serves (comma or space separated client ids; the Discord bot's).
+   * Unset or empty: that server refuses everything. README.md#linked-servers-discord.
+   */
+  LINKED_CLIENTS?: string;
 }
 
 export const directory = (env: Env) => env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));

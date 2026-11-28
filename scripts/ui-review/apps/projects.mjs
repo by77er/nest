@@ -1009,6 +1009,12 @@ const app = {
     { name: "triage-decline", section: "project", path: "/projects/prj_demo/triage", full: false, after: (p) => p.getByRole("button", { name: "Decline issue #44" }).click() },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings", checkName: "workflows", check: (p) => p.evaluate(workflowsAgree) },
     { name: "settings-comments-set", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-set" },
+    // Settings' Discord servers with none linked yet (README.md#linked-servers-discord): the field alone.
+    { name: "settings-links-empty", section: "project", path: "/projects/prj_demo/settings", fixture: "links-empty" },
+    // A malformed server id, said at the field and not sent.
+    { name: "settings-links-invalid", section: "project", path: "/projects/prj_demo/settings", after: async (p) => { const f = p.getByLabel("Server ID"); await f.scrollIntoViewIfNeeded(); await f.fill("0123"); await p.getByRole("button", { name: "Link server" }).click(); await p.getByText(/digits only/).waitFor(); } },
+    // At the cap (20): the list in full, the field disabled, saying to remove one first.
+    { name: "settings-links-full", section: "project", path: "/projects/prj_demo/settings", fixture: "links-full" },
     // Whose issues come into triage: anyone's (README.md#triage).
     { name: "settings-issues-anyone", section: "project", path: "/projects/prj_demo/settings", fixture: "issues-anyone" },
     // No one's issues come in yet (an org's repo, no comments user): said, with what to do.

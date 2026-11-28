@@ -14,7 +14,7 @@ import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, GitHubError, githubFor, ownInstallation, PERMISSIONS, requireReviewCheck } from "../github";
 import { reviewPassed, toCreate, type Verdict, verdictPassed } from "../reviewers";
-import type { AgentCaller } from "../identity";
+import type { AgentCaller, LinkedCaller } from "../identity";
 import { type AgentView, backoff, clientIdOf, HOSTS_WAIT, NestError, nestFrom, type Nest, type SandboxExtras, type SpawnOverrides, stopRefused } from "../nest";
 import { envName, MAX_BINDINGS, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
 import { AppTokens } from "../github-app";
@@ -22,7 +22,7 @@ import { GITHUB_EGRESS_HOSTS, GITHUB_INJECT_HOSTS, githubGrantMissing, githubGua
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { canBlock, canUnblock, dependencyError, pickForAssignment, type Spec, step, taskBranch, type TaskEvent, type TaskFacts, type TaskState, TERMINAL, waitingOn, WORKER_STATES } from "../tasks";
-import { type Server, toolOf } from "../tools";
+import { MAX_LINKED_PROPOSALS, type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
 import { asBinding, type ClientLayer, clientLayerFor, type GithubFeed, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
 import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type Wait, type WaitKind, waitKey, waitMessage, type WaitOutcome } from "../waits";
@@ -341,12 +341,21 @@ export interface RoutineRun {
   ended_ms: number | null;
 }
 
-/** A task a routine run proposed, waiting in triage for the owner (README.md#routines). Its text is an agent's that read anyone's: data. */
+/**
+ * A task a routine run proposed, or a linked Discord server's agent (README.md#linked-servers-discord), waiting in
+ * triage for the owner (README.md#routines). Its text is an agent's that read anyone's: data. A linked server's is
+ * stored in the same row, so a release that knows no linked servers shows and accepts it as a routine's:
+ * `routine` is `discord:<guild>` (a routine's id is `rtn_…`), `routine_name` "Discord server <guild>", `run` the agent.
+ */
 export interface Proposal {
   id: string;
   routine: string;
   routine_name: string;
   run: string;
+  /** The Discord server it came from, or null for a routine's. */
+  guild: string | null;
+  /** Who proposed it: `discord:<guild>/<agent>` for a linked server's agent, `routine:<routine>/<run>` for a routine run's. */
+  source: string;
   title: string;
   body: string;
   state: "untriaged" | "accepted" | "declined";
@@ -4339,11 +4348,15 @@ export class ProjectDO extends DurableObject<Env> {
     const p = this.sql.exec("SELECT * FROM proposals WHERE id = ?", id).toArray()[0];
     if (!p) return fail(404, "unknown proposal");
     if (p.state !== "untriaged") return fail(409, `the proposal is ${p.state as string}`);
-    const t = await this.createTask({ title: p.title as string, body: `${(p.body as string).trim()}\n\nProposed by the routine "${p.routine_name as string}" (run ${p.run as string}).` });
+    const prop = proposalOf(p);
+    const from = prop.guild !== null
+      ? `Proposed from the Discord server ${prop.guild} (agent ${p.agent as string}).`
+      : `Proposed by the routine "${p.routine_name as string}" (run ${p.run as string}).`;
+    const t = await this.createTask({ title: p.title as string, body: `${(p.body as string).trim()}\n\n${from}` });
     if (!t.ok) return t;
     this.sql.exec("UPDATE proposals SET state = 'accepted', task = ?, triaged_ms = ? WHERE id = ?", t.value.id, Date.now(), id);
     this.sql.exec("INSERT INTO history (task, at_ms, actor, action, detail, tainted) VALUES (?, ?, 'owner', 'proposal_accepted', ?, 1)",
-      t.value.id, Date.now(), JSON.stringify({ proposal: id, routine: p.routine, run: p.run, agent: p.agent }));
+      t.value.id, Date.now(), JSON.stringify({ proposal: id, routine: p.routine, run: p.run, agent: p.agent, source: prop.source }));
     return ok(this.toTask(this.taskRow(t.value.id)!));
   }
 
@@ -4634,6 +4647,80 @@ export class ProjectDO extends DurableObject<Env> {
       }
     }
     return this.memoryTool(caller, tool, a, run) ?? fail(400, `unknown tool ${tool}`);
+  }
+
+  /**
+   * One `tools/call` of a linked client's agent on /mcp/discord (README.md#linked-servers-discord), for this project:
+   * the Worker found it linked to the caller's guild. It reads the board as a routine run does and proposes tasks
+   * into triage; nothing else. A write with a call key of the caller's own is answered once, as `mcpCall`'s.
+   */
+  async linkedCall(caller: LinkedCaller, tool: string, args: Record<string, unknown>, callKey: string | null): Promise<{ result: string | null; error: string | null }> {
+    const def = toolOf("discord", tool);
+    if (!def || tool === "list_projects") return { result: null, error: `unknown tool ${tool}` };
+    const bad = invalid(def.inputSchema, args);
+    if (bad) return { result: null, error: bad };
+    const s = this.settings();
+    if (!s || args.project !== s.id) return { result: null, error: "unknown project" };
+    const key = !def.readOnly && callKey && callKey.startsWith(`${caller.agent}/`) ? callKey : null;
+    if (key) {
+      const prior = this.sql.exec<{ result: string }>("SELECT result FROM mcp_calls WHERE key = ?", key).toArray()[0];
+      if (prior) return JSON.parse(prior.result) as { result: string | null; error: string | null };
+    }
+    const r = await this.linkedTool(caller, tool, args);
+    const out = r.ok ? { result: JSON.stringify(r.value), error: null } : { result: null, error: r.error };
+    if (key) {
+      this.sql.exec("INSERT OR REPLACE INTO mcp_calls (key, result, at_ms) VALUES (?, ?, ?)", key, JSON.stringify(out), Date.now());
+      this.sql.exec("DELETE FROM mcp_calls WHERE at_ms < ?", Date.now() - CALLS_KEEP_MS);
+    }
+    return out;
+  }
+
+  private async linkedTool(caller: LinkedCaller, tool: string, a: Record<string, unknown>): Promise<Result<unknown>> {
+    switch (tool) {
+      // The routine server's reads, as a run gets them.
+      case "list_tasks":
+        return ok({ tasks: this.taskSummaries().map(({ task, specced }) => ({ ...task, specced })) });
+      case "get_task":
+        return this.getTask(a.task as string);
+      case "recent_activity":
+        return ok(await this.recentActivity((a.days as number | undefined) ?? 7));
+      case "propose_task": {
+        const title = (a.title as string).trim();
+        if (!title) return fail(400, "a proposal needs a title");
+        return this.proposeLinked(caller, title, a.body as string);
+      }
+    }
+    return fail(400, `unknown tool ${tool}`);
+  }
+
+  /**
+   * A linked Discord server's agent proposes a task (README.md#linked-servers-discord): into the triage queue, as a
+   * routine run's proposal lands, tainted (anyone in the server can have written it), marked with its server and
+   * agent. At most MAX_LINKED_PROPOSALS of one server's wait at once, within the project's MAX_UNTRIAGED_PROPOSALS.
+   * A title the owner declined lately is refused as for a routine; the owner's reason is told only to the server
+   * whose proposal it was.
+   */
+  private proposeLinked(caller: LinkedCaller, title: string, body: string): Result<unknown> {
+    const proposer = linkedProposer(caller.guild);
+    const key = titleKey(title);
+    const declined = this.sql.exec("SELECT title, reason, routine FROM proposals WHERE state = 'declined' AND triaged_ms >= ?", Date.now() - DECLINED_PROPOSALS_BLOCK_MS)
+      .toArray().find((r) => titleKey(r.title as string) === key);
+    if (declined) {
+      const why = declined.routine === proposer ? (declined.reason as string | null)?.trim() : null;
+      return fail(409, `the owner declined a task like "${title}" lately${why ? ` (their reason: ${why})` : ""}; don't propose it again`);
+    }
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM proposals WHERE state = 'untriaged' AND routine = ?", proposer).one().n >= MAX_LINKED_PROPOSALS) {
+      return fail(429, `your Discord server has ${MAX_LINKED_PROPOSALS} proposals waiting for the owner already: propose nothing more until they're triaged`);
+    }
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM proposals WHERE state = 'untriaged'").one().n >= MAX_UNTRIAGED_PROPOSALS) {
+      return fail(429, `the owner has ${MAX_UNTRIAGED_PROPOSALS} proposals waiting already: propose nothing more for now`);
+    }
+    const id = `prp_${randomId()}`;
+    this.sql.exec(
+      "INSERT INTO proposals (id, routine, routine_name, run, agent, title, body, state, tainted, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 'untriaged', 1, ?)",
+      id, proposer, `Discord server ${caller.guild}`, caller.agent, caller.agent, title, body, Date.now(),
+    );
+    return ok({ proposal: id, where: "triage" });
   }
 
   // --- work owed to nest -----------------------------------------------------------------------------
@@ -5902,9 +5989,15 @@ export function titleKey(title: string): string {
   return title.toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
+/** The `routine` a linked Discord server's proposal is stored under (README.md#linked-servers-discord): no routine's id. */
+const linkedProposer = (guild: string) => `discord:${guild}`;
+
 function proposalOf(r: Row): Proposal {
+  const routine = r.routine as string;
+  const guild = routine.startsWith("discord:") ? routine.slice("discord:".length) : null;
   return {
-    id: r.id as string, routine: r.routine as string, routine_name: r.routine_name as string, run: r.run as string, title: r.title as string,
+    id: r.id as string, routine, routine_name: r.routine_name as string, run: r.run as string, guild,
+    source: guild !== null ? `discord:${guild}/${r.agent as string}` : `routine:${routine}/${r.run as string}`, title: r.title as string,
     body: r.body as string, state: r.state as Proposal["state"], task: (r.task as string | null) ?? null, reason: (r.reason as string | null) ?? null,
     created_ms: r.created_ms as number,
   };

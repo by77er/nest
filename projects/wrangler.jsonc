@@ -37,7 +37,12 @@
     "ACCESS_TEAM_DOMAIN": "https://bitcrush.cloudflareaccess.com",
     // The app's Access application's audience tag: the app's own stack's output `projects_aud`
     // (deploy/, `inframe output --stack projects`; applied 2026-11-02). Not a secret.
-    "PROJECTS_AUD": "08e750a01b448aeea2f1d52dd521b01822359dd08ef898e610b53b46575ed580"
+    "PROJECTS_AUD": "08e750a01b448aeea2f1d52dd521b01822359dd08ef898e610b53b46575ed580",
+    // The nest API clients whose own agents /mcp/discord serves (README.md#linked-servers-discord), comma or space
+    // separated: the Discord bot's client (by77er/helpers, app discord/). Not a secret. Empty: that server refuses
+    // everything. Only projects the owner links to a Discord server in Settings are visible to them. Here rather
+    // than the dashboard: `wrangler deploy` replaces the dashboard's vars with this file's.
+    "LINKED_CLIENTS": "cli_01m8fsmzm324sx8vx94rz7rd8j"
   }
   // Secrets (wrangler secret put / .dev.vars), never in this file. deploy-projects.yml puts each from
   // the `production` environment's `PROJECTS_<name>` secret when it is set:

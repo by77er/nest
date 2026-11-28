@@ -6,7 +6,12 @@ import type { ProjectRow } from "../../do/directory";
 export type { Ask, ChatMessage, HistoryRow, Task, TaskSummary } from "../../do/project";
 /** A project's settings as the API answers them: ProjectDO's, with ReviewDO's `untrusted_reviews` (README.md#the-review-gate; `hold` when absent). */
 export type Settings = ProjectSettings & { untrusted_reviews?: "hold" | "review" };
-export type { ProjectRow, RepoBinding, SyncState } from "../../do/directory";
+export type { Link, ProjectRow, RepoBinding, SyncState } from "../../do/directory";
+/** `GET /api/projects/:id/links`: the Discord servers it is linked to (README.md#linked-servers-discord), and how many it may be. */
+export interface LinksAnswer {
+  links: import("../../do/directory").Link[];
+  max: number;
+}
 /**
  * `POST /api/admin/bindings/<project>` (and `…/bind`): the binding as read again, and what happened to a
  * rename; or, when GitHub's repo for the name isn't the bound one, both, and nothing written.

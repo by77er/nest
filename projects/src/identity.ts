@@ -3,6 +3,7 @@
 // It is the only credential the servers accept (README.md#the-mcp-server-agents-see-only-their-own-work).
 // WebCrypto only: no JWT library.
 
+import { GUILD } from "./requests";
 import { ROLE_OF, type Role, type Server } from "./tools";
 
 /** An agent this app created, calling a server for its role. */
@@ -13,11 +14,23 @@ export interface AgentCaller {
   labels: Record<string, string>;
   tainted: boolean;
 }
+/**
+ * An agent of a linked client (`LINKED_CLIENTS`, the Discord bot), calling `/mcp/discord`
+ * (README.md#linked-servers-discord): created by that client itself, so its `guild` label is the client's own
+ * statement. It reaches only the projects the owner linked to that guild.
+ */
+export interface LinkedCaller {
+  kind: "linked";
+  agent: string;
+  client: string;
+  guild: string;
+  tainted: boolean;
+}
 /** nest's connector listing the server's tools for every agent on it: it may list, never call. */
 export interface ConnectorCaller {
   kind: "connector";
 }
-export type Caller = AgentCaller | ConnectorCaller;
+export type Caller = AgentCaller | LinkedCaller | ConnectorCaller;
 
 export type Verdict = { ok: true; caller: Caller } | { ok: false; status: 401 | 403; reason: string };
 
@@ -28,8 +41,15 @@ export interface IdentityConfig {
   audience: string;
   /** The server called, which fixes the role the caller must have. */
   server: Server;
-  /** The app's own client id: the token's `client` and `owner` must both be it. */
+  /** The app's own client id: on every server but `discord`, the token's `client` and `owner` must both be it. */
   client: string;
+  /** On `discord` only: the clients whose agents it serves (`LINKED_CLIENTS`); none, and it refuses everything. */
+  linked?: readonly string[];
+}
+
+/** `LINKED_CLIENTS` as a list: client ids separated by commas or spaces; anything else in it names no client. */
+export function linkedClients(v: string | undefined): string[] {
+  return (v ?? "").split(/[\s,]+/).filter((c) => /^cli_[A-Za-z0-9]+$/.test(c));
 }
 
 /** How long fetched keys are used before fetching again (nest serves them with max-age=300). */
@@ -124,7 +144,10 @@ export async function verifyIdentity(token: string | null, config: IdentityConfi
   if (typeof claims.exp !== "number" || claims.exp <= nowS) return refuse(401, "expired");
   if (claims.iat !== undefined && (typeof claims.iat !== "number" || claims.iat > nowS + SKEW_S)) return refuse(401, "issued in the future");
 
-  if (claims.sub === "nest:connector") return { ok: true, caller: { kind: "connector" } };
+  if (config.server === "discord") return linkedCaller(claims, config);
+  // nest's connector lists the app's own capabilities with the app's client id: another client may point a
+  // capability of its own at this URL (docs/interfaces/remote-mcp/#no-bearer), and is refused here too.
+  if (claims.sub === "nest:connector") return claims.client === config.client ? { ok: true, caller: { kind: "connector" } } : refuse(403, "not the app's connector");
   if (typeof claims.sub !== "string" || !/^agt_[A-Za-z0-9]+$/.test(claims.sub)) return refuse(403, "not an agent");
   // Only agents the app created itself: a spawned agent's labels are its spawner's choice (owner agt_…).
   if (claims.client !== config.client) return refuse(403, "another client's agent");
@@ -133,6 +156,7 @@ export async function verifyIdentity(token: string | null, config: IdentityConfi
   if (typeof labels !== "object" || labels === null || Array.isArray(labels)) return refuse(403, "no labels");
   const l = labels as Record<string, unknown>;
   const role = ROLE_OF[config.server];
+  if (role === "linked") return refuse(403, "not a linked server"); // `discord` was answered above
   if (l.role !== role) return refuse(403, `not a ${role}`);
   if (typeof l.project !== "string") return refuse(403, "no project");
   if (role === "worker" && typeof l.task !== "string") return refuse(403, "no task");
@@ -140,4 +164,26 @@ export async function verifyIdentity(token: string | null, config: IdentityConfi
   if (role === "routine" && (typeof l.routine !== "string" || typeof l.run !== "string")) return refuse(403, "no routine and run");
   const strings = Object.fromEntries(Object.entries(l).filter((e): e is [string, string] => typeof e[1] === "string"));
   return { ok: true, caller: { kind: "agent", agent: claims.sub, role, labels: strings, tainted: claims.tainted === true } };
+}
+
+/**
+ * `/mcp/discord`'s caller (README.md#linked-servers-discord), once the token is valid for it: an agent that a
+ * client listed in `LINKED_CLIENTS` created itself (`client` and `owner` both that id), never the app's own, with
+ * a `guild` label; or that client's connector, listing. With no linked client, nothing.
+ */
+function linkedCaller(claims: Record<string, unknown>, config: IdentityConfig): Verdict {
+  const linked = (config.linked ?? []).filter((c) => c !== config.client);
+  if (linked.length === 0) return refuse(403, "no linked client");
+  const ofLinked = typeof claims.client === "string" && linked.includes(claims.client);
+  // The linked client's own capability's listing names that client.
+  if (claims.sub === "nest:connector") return ofLinked ? { ok: true, caller: { kind: "connector" } } : refuse(403, "not a linked client's connector");
+  if (typeof claims.sub !== "string" || !/^agt_[A-Za-z0-9]+$/.test(claims.sub)) return refuse(403, "not an agent");
+  if (!ofLinked) return refuse(403, "not a linked client's agent");
+  // Its labels are its creator's statement only when that is the client itself, not an agent it spawned.
+  if (claims.owner !== claims.client) return refuse(403, "not created by the linked client");
+  const labels = claims.labels;
+  if (typeof labels !== "object" || labels === null || Array.isArray(labels)) return refuse(403, "no labels");
+  const guild = (labels as Record<string, unknown>).guild;
+  if (typeof guild !== "string" || !GUILD.test(guild)) return refuse(403, "no guild");
+  return { ok: true, caller: { kind: "linked", agent: claims.sub, client: claims.client as string, guild, tainted: claims.tainted === true } };
 }

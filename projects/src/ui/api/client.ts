@@ -2,7 +2,7 @@
 // with every call and the page holds no credential of its own.
 
 import type { CreateReviewerBody, Reviewer, UpdateReviewerBody } from "./types";
-import type { AcceptIssueBody, AddDependencyBody, AnswerBody, Ask, AttachableRepos, AttachPrBody, Attention, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateRoutineBody, CreateTaskBody, DeclineIssueBody, DeclineProposalBody, Issue, Job, ListedProject, ManagerStatus, NetworkBody, NetworkView, Note, OpenPr, OutboxState, Project, ProjectRow, Proposal, PutSecretBody, RepoBinding, RereadBinding, Routine, RoutineRun, RoutinesAnswer, SecretsAnswer, SecretView, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, TaskSummary, UpdateRoutineBody, UpdateTaskBody, Waits } from "./types";
+import type { AcceptIssueBody, AddDependencyBody, AnswerBody, Ask, AttachableRepos, AttachPrBody, Attention, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateRoutineBody, CreateTaskBody, DeclineIssueBody, DeclineProposalBody, Issue, Job, Link, LinksAnswer, ListedProject, ManagerStatus, NetworkBody, NetworkView, Note, OpenPr, OutboxState, Project, ProjectRow, Proposal, PutSecretBody, RepoBinding, RereadBinding, Routine, RoutineRun, RoutinesAnswer, SecretsAnswer, SecretView, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, TaskSummary, UpdateRoutineBody, UpdateTaskBody, Waits } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
 export class ApiError extends Error {
@@ -153,6 +153,9 @@ export const api = {
   declineProposal: (id: string, p: string, b: DeclineProposalBody) => call<{ declined: string }>("POST", `${prj(id)}/proposals/${encodeURIComponent(p)}/decline`, b),
   memory: (id: string) => call<Note[]>("GET", `${prj(id)}/memory`),
   deleteNote: (id: string, key: string) => call<{ deleted: string }>("DELETE", `${prj(id)}/memory/${encodeURIComponent(key)}`),
+  links: (id: string) => call<LinksAnswer>("GET", `${prj(id)}/links`),
+  link: (id: string, guild: string) => call<Link>("PUT", `${prj(id)}/links/${encodeURIComponent(guild)}`),
+  unlink: (id: string, guild: string) => call<{ removed: string }>("DELETE", `${prj(id)}/links/${encodeURIComponent(guild)}`),
 
   syncState: () => call<SyncState | null>("GET", "/admin/sync-state"),
   sync: () => call<SyncResult>("POST", "/admin/sync"),

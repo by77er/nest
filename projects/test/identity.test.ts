@@ -4,7 +4,8 @@
 // gets 401/403 and no data. A key pair made here plays nest's signing key.
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { REFETCH_MIN_MS, resetIdentityKeys } from "../src/identity";
-import { agentClaims, APP, b64urlJson, connectorClaims, FakeNest, installFetch, mcp, Signer } from "./fake-nest";
+import { TOOLS } from "../src/tools";
+import { agentClaims, APP, b64urlJson, CLIENT, connectorClaims, FakeNest, installFetch, LINKED, linkedClaims, mcp, Signer, withEnv } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -97,6 +98,14 @@ describe("Nest-Identity on the MCP servers", () => {
     expect((await list("task", t)).status).toBe(401);
   });
 
+  it("refuses a connector listing for another client, or for none (docs/interfaces/remote-mcp/#no-bearer)", async () => {
+    for (const client of [LINKED, "cli_other", null]) {
+      const t = await nest.sign(connectorClaims("board", client));
+      expect((await list("board", t)).status, String(client)).toBe(403);
+      expect((await mcp("board", t, "initialize", { protocolVersion: "2025-11-25" })).status, String(client)).toBe(403);
+    }
+  });
+
   it("refuses everything when nest's keys can't be fetched", async () => {
     const keep = fake.jwks;
     fake.jwks = undefined as never;
@@ -136,5 +145,84 @@ describe("Nest-Identity on the MCP servers", () => {
       now.mockRestore();
       fake.jwks = { keys: [await nest.jwk()] };
     }
+  });
+});
+
+// /mcp/discord serves only agents a client in LINKED_CLIENTS created itself (vitest.config.ts: cli_bot), each with
+// a `guild` label; the app's own servers serve none of them (README.md#linked-servers-discord).
+describe("Nest-Identity on /mcp/discord", () => {
+  const guild = "1093847561234567890";
+  const linked = () => linkedClaims("agt_bot1", guild);
+  const discordTools = TOOLS.discord.map((t) => t.name);
+
+  it("admits the linked client's own agent with a guild, and lists only the linked tools", async () => {
+    const r = await list("discord", await nest.sign(linked()));
+    expect(r.status).toBe(200);
+    const listed = JSON.parse(r.body).result.tools as { name: string; annotations: { readOnlyHint: boolean } }[];
+    expect(listed.map((t) => t.name)).toEqual(discordTools);
+    expect([...discordTools].sort()).toEqual(["get_task", "list_projects", "list_tasks", "propose_task", "recent_activity"]);
+    // Every read says so to the caller's client; the one write doesn't.
+    expect(listed.filter((t) => !t.annotations.readOnlyHint).map((t) => t.name)).toEqual(["propose_task"]);
+  });
+
+  const refused: [string, () => Promise<string>][] = [
+    ["the app's own agent, guild and all", () => nest.sign(agentClaims("board", "agt_m", { project: "prj_none", role: "manager", guild }, { aud: `${APP}/mcp/discord` }))],
+    ["an agent of a client not listed", () => nest.sign(linkedClaims("agt_x", guild, { client: "cli_other", owner: "cli_other" }))],
+    ["a linked client's agent spawned by an agent (its labels are its spawner's)", () => nest.sign(linkedClaims("agt_x", guild, { owner: "agt_spawner" }))],
+    ["a linked client's agent with the operator as owner", () => nest.sign(linkedClaims("agt_x", guild, { owner: "user" }))],
+    ["no guild label", () => nest.sign(linkedClaims("agt_x", undefined))],
+    ["a guild that isn't a server id", () => nest.sign(linkedClaims("agt_x", "0123"))],
+    ["no labels", () => nest.sign(linkedClaims("agt_x", guild, { labels: undefined }))],
+    ["the stray word of LINKED_CLIENTS as a client", () => nest.sign(linkedClaims("agt_x", guild, { client: "not-a-client", owner: "not-a-client" }))],
+    ["a sub that isn't an agent", () => nest.sign(linkedClaims("user", guild))],
+    ["the app's connector", () => nest.sign(connectorClaims("discord"))],
+    ["a connector naming no client", () => nest.sign(connectorClaims("discord", null))],
+  ];
+  it.each(refused)("refuses %s with 403 and no data", async (_name, token) => {
+    const t = await token();
+    for (const method of ["initialize", "tools/list", "tools/call"]) {
+      const res = await mcp("discord", t, method, method === "tools/call" ? { name: "list_projects", arguments: {} } : {});
+      expect(res.status, method).toBe(403);
+      expect(await res.text(), method).toBe("");
+    }
+  });
+
+  it("still needs a valid token for its URL", async () => {
+    expect((await list("discord", null)).status).toBe(401);
+    expect((await list("discord", await nest.sign({ ...linked(), aud: `${APP}/mcp/board` }))).status).toBe(401);
+    expect((await list("discord", await stranger.sign(linked()))).status).toBe(401);
+  });
+
+  it("refuses the linked client's agents on every other server", async () => {
+    for (const server of ["board", "task", "review", "routine"] as const) {
+      const labels = { project: "prj_none", role: { board: "manager", task: "worker", review: "reviewer", routine: "routine" }[server], task: "tsk_a", pr: "1", sha: "a".repeat(40), routine: "rtn_a", run: "run_a", guild };
+      const t = await nest.sign(agentClaims(server, "agt_bot1", labels, { client: LINKED, owner: LINKED }));
+      expect((await list(server, t)).status, server).toBe(403);
+      // Its `client` alone refuses it, whatever `owner` says.
+      const asApp = await nest.sign(agentClaims(server, "agt_bot1", labels, { client: LINKED, owner: CLIENT }));
+      expect((await list(server, asApp)).status, server).toBe(403);
+    }
+  });
+
+  it("lets the linked client's connector list, never call", async () => {
+    const t = await nest.sign(connectorClaims("discord", LINKED));
+    expect((await mcp("discord", t, "initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "nest-connector" } })).status).toBe(200);
+    expect((await list("discord", t)).status).toBe(200);
+    const call = await mcp("discord", t, "tools/call", { name: "list_projects", arguments: {} });
+    expect(call.status).toBe(403);
+    expect(await call.text()).toBe("");
+  });
+
+  it("refuses everything while LINKED_CLIENTS names no client: empty, unset, or only the app itself", async () => {
+    for (const v of ["", undefined, ` ,${CLIENT}`]) {
+      await withEnv("LINKED_CLIENTS", v, async () => {
+        expect((await list("discord", await nest.sign(linked()))).status, String(v)).toBe(403);
+        expect((await list("discord", await nest.sign(connectorClaims("discord", LINKED)))).status, String(v)).toBe(403);
+        // Listing the app's own client never opens /mcp/discord to the app's own agents.
+        expect((await list("discord", await nest.sign(linkedClaims("agt_m", guild, { client: CLIENT, owner: CLIENT })))).status, String(v)).toBe(403);
+      });
+    }
+    // Space separated, among others.
+    await withEnv("LINKED_CLIENTS", "cli_first   cli_bot", async () => expect((await list("discord", await nest.sign(linked()))).status).toBe(200));
   });
 });

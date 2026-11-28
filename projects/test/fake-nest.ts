@@ -543,7 +543,7 @@ export class FakeNest {
 }
 
 /** Run `fn` with one of the env's values set (undefined: unset), as the Worker and its objects read the env they share with the tests. */
-export async function withEnv<T>(name: "GITHUB_ACCOUNTS" | "NEST_CLIENT_TOKEN", value: string | undefined, fn: () => Promise<T>): Promise<T> {
+export async function withEnv<T>(name: "GITHUB_ACCOUNTS" | "NEST_CLIENT_TOKEN" | "LINKED_CLIENTS", value: string | undefined, fn: () => Promise<T>): Promise<T> {
   const e = env as unknown as Record<string, unknown>;
   const had = e[name];
   if (value === undefined) delete e[name];
@@ -611,7 +611,20 @@ export function agentClaims(server: "board" | "task" | "review" | "routine", age
   };
 }
 
-export const connectorClaims = (server: "board" | "task" | "review" | "routine") => ({ iss: NEST, aud: `${APP}/mcp/${server}`, sub: "nest:connector", iat: nowS(), exp: nowS() + 300 });
+/** nest's connector listing a client's capability: it names that client (the app's own, unless given; null: none, the operator's). */
+export const connectorClaims = (server: "board" | "task" | "review" | "routine" | "discord", client: string | null = CLIENT) =>
+  ({ iss: NEST, aud: `${APP}/mcp/${server}`, sub: "nest:connector", ...(client === null ? {} : { client }), iat: nowS(), exp: nowS() + 300 });
+
+/** The linked client of the tests (vitest.config.ts's `LINKED_CLIENTS`): the Discord bot's stand-in. */
+export const LINKED = "cli_bot";
+
+/** An agent the linked client created itself, on /mcp/discord, with its `guild` label. */
+export function linkedClaims(agent: string, guild: string | undefined, over: Record<string, unknown> = {}) {
+  return {
+    iss: NEST, aud: `${APP}/mcp/discord`, sub: agent, owner: LINKED, client: LINKED, labels: guild === undefined ? {} : { guild }, epoch: 1, tainted: false,
+    iat: nowS(), exp: nowS() + 300, ...over,
+  };
+}
 
 let rpcId = 0;
 /** One JSON-RPC message to an MCP server, as nest sends it. */
