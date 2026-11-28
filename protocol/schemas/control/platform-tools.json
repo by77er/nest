@@ -472,7 +472,7 @@
   },
   {
     "name": "timer_set",
-    "description": "Set a named timer. When it fires you get an input `Message from timer: timer \"<name>\" fired: <note>`, as an inbox message: during a turn it arrives in that turn; otherwise it starts a turn (and wakes you). Setting a name again replaces its timer. To wait, set a timer and end your turn: whichever comes first, an inbox message or the timer, wakes you. At least 10 s and at most 30 days ahead; at most 32 timers.",
+    "description": "Set a named timer. When it fires you get an input `Message from timer: timer \"<name>\" fired: <note>`, as an inbox message: during a turn it arrives in that turn; otherwise it starts a turn (and wakes you). Setting a name again replaces its timer. To wait, set a timer and end your turn: whichever comes first, an inbox message or the timer, wakes you. At least 10 s and at most 30 days ahead; at most 32 timers. With every_s it repeats at that interval (5 minutes to 30 days; at most 8 repeating) until you cancel it: a daily report, a weekly check-in. A repeating timer's input reads `timer \"<name>\" fired (repeats every <interval>; timer_cancel stops it): <note>`.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -482,11 +482,15 @@
         },
         "after_s": {
           "type": "integer",
-          "description": "Fire this many seconds from now (10 to 2592000). Give this or at_ms."
+          "description": "Fire this many seconds from now (10 to 2592000). Give this or at_ms (with every_s, optional: the first firing)."
         },
         "at_ms": {
           "type": "integer",
-          "description": "Fire at this time (Unix epoch milliseconds). Give this or after_s."
+          "description": "Fire at this time (Unix epoch milliseconds). Give this or after_s (with every_s, optional: the first firing)."
+        },
+        "every_s": {
+          "type": "integer",
+          "description": "Repeat: fire again every this many seconds (300 to 2592000) until cancelled. after_s or at_ms then sets the first firing (default: one interval from now). Missed firings (an outage, or while the last one hasn't run yet) aren't made up."
         },
         "note": {
           "type": "string",
@@ -520,7 +524,7 @@
   },
   {
     "name": "timer_list",
-    "description": "Your timers, soonest first: name, when it fires (at_ms) and its note.",
+    "description": "Your timers, soonest first: name, when it next fires (at_ms), its interval if it repeats (every_ms) and its note.",
     "input_schema": {
       "type": "object",
       "properties": {},

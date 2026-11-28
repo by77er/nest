@@ -83,7 +83,7 @@ Messaging between agents is an external integration ([principle 9](../../README.
 
 ## Schedules
 
-**Designed, not built;** what's built is [`timers`](timers/): named one-shot timers (`timer_set`) that wake the agent through its inbox, without repeats, carried taint or a turn budget. `wake_at(at | every, note)` queues a turn on the agent itself: once at a time, or repeating at an interval. It's how monitors keep their own cadence and how assistants remind me of things. `wake_cancel(id)` stops one.
+**Designed, not built;** what's built is [`timers`](timers/): named timers (`timer_set`), one-shot or repeating at an interval (`every_s`, 2026-11-28), that wake the agent through its inbox, without carried taint or a turn budget. `wake_at(at | every, note)` queues a turn on the agent itself: once at a time, or repeating at an interval. It's how monitors keep their own cadence and how assistants remind me of things. `wake_cancel(id)` stops one.
 
 - **Durable:** wakes are AgentDO alarms, so they survive restarts and moves, and cost nothing while waiting.
 - **A due wake is a turn** carrying the note, and it starts a brain like any other input (see [continuity](../#continuity)).

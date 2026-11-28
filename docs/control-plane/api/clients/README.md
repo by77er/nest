@@ -188,7 +188,7 @@ POST /v1/agents
   - `agent.exited {agent, reason, text}`;
   - `agent.ask {agent, ask, question, approval?}`;
   - `agent.error {agent, code, message}` (`start_refused`: every start refused for good that leaves the agent `errored`, whatever the cause, with the reason in `message`; a refusal while a brain still runs sends none (a credential the grant no longer names or that isn't stored, say); `restart_refused`: a restart given up after 5 retryable failures in a row while its brain still runs; `errored`: its brain kept failing; or the runner's own error code);
-  - `agent.timer_fired {agent, timer, note}` ([timers](#timers));
+  - `agent.timer_fired {agent, timer, note, next_ms?}` ([timers](#timers)); `next_ms` is a repeating timer's next firing;
   - `sandbox.destroyed {sandbox}`.
 - **Delivery:** to the client's webhook (`PUT /v1/clients/self/webhook {url}`, `https` only), signed with `Nest-Signature: t=<ms>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`, with the event's `id` for deduplication. The secret is shown once, when the webhook is set.
 - **A client never blocks an agent:**
@@ -270,8 +270,8 @@ A client's bindings put its secrets into its own sandboxes' requests at nest-pro
 
 ## Timers
 
-An agent with the [`timers`](../../../agents/capabilities/timers/) capability sets named timers (`timer_set {name, after_s? | at_ms?, note?}`, `timer_cancel {name}`, `timer_list`). A fired timer is an inbox message from `timer` (`timer "<name>" fired: <note>`) that wakes the agent.
-- **A client** sees its agents' timers with `GET /v1/agents/<id>/timers` (`{timers: [{name, at_ms, note, set_ms}]}`) and cancels one with `DELETE /v1/agents/<id>/timers/<name>`. Each firing is an `agent.timer_fired` event.
+An agent with the [`timers`](../../../agents/capabilities/timers/) capability sets named timers (`timer_set {name, after_s? | at_ms?, every_s?, note?}`, `timer_cancel {name}`, `timer_list`); one with `every_s` repeats at that interval until cancelled. A fired timer is an inbox message from `timer` (`timer "<name>" fired: <note>`; a repeating one's reads `fired (repeats every <interval>; timer_cancel stops it)`) that wakes the agent.
+- **A client** sees its agents' timers with `GET /v1/agents/<id>/timers` (`{timers: [{name, at_ms, note, set_ms, every_ms?}]}`) and cancels one with `DELETE /v1/agents/<id>/timers/<name>`. Each firing posted is an `agent.timer_fired` event (one skipped, while an earlier one waits or a stop holds, is none).
 - **Waiting for a domain condition is the app's job:** post to the agent's inbox when it holds, and let the agent's timer be the timeout ([the pattern](../../../agents/capabilities/timers/#waiting-is-a-pattern-not-a-tool)).
 
 ## Egress

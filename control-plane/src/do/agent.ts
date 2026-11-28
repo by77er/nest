@@ -11,7 +11,7 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import { SYSTEM_SENDER } from "../lib/senders";
-import { type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX } from "../lib/timers";
+import { everyText, nextFiring, type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX, TIMERS_REPEATING_MAX } from "../lib/timers";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
 import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall, visible } from "../lib/sinks";
@@ -220,7 +220,7 @@ interface PreviousReleaseFields {
 }
 
 /** AgentDO's alarm keys (each needs a handler in `alarm()`). */
-type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events" | "seg_trash" | "rules";
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events" | "seg_trash" | "rules" | "timer_notices";
 /**
  * A `sync` ask's window, `ask:<ask id>`: armed only by the previous release's `ask` tool, which left the
  * platform. One it armed still ends its waiting call here (`askWindowLapsed`); dropped next release.
@@ -440,7 +440,7 @@ export class AgentDO extends DurableObject<Env> {
     this.journal = new BrokeredJournal(this.sql);
     this.timerStore = new TimerStore(this.sql);
     // Timers a rolled-back release left without their deadline are armed again at once (the alarm does too).
-    if (this.timerStore.names().length) void ctx.blockConcurrencyWhile(() => this.rearmTimers());
+    if (this.timerStore.names().length || this.timerStore.notices().length) void ctx.blockConcurrencyWhile(() => this.rearmTimers());
     this.outbox = new ClientOutbox(this.sql);
     this.traceRing = new TraceRing(this.sql);
     // A trace client's keepalive, answered by the runtime without waking this object. The runner sends only JSON objects, never this.
@@ -2893,9 +2893,10 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.load();
     this.refuseEnded(info, "timers");
     const row = this.timerStore.set(t, id);
-    if (!row) throw new NestError(ErrorCodes.FORBIDDEN, `at most ${TIMERS_MAX} timers: cancel one first (timer_list)`, 409);
+    if (row === "full") throw new NestError(ErrorCodes.FORBIDDEN, `at most ${TIMERS_MAX} timers: cancel one first (timer_list)`, 409);
+    if (row === "repeating") throw new NestError(ErrorCodes.FORBIDDEN, `at most ${TIMERS_REPEATING_MAX} repeating timers: cancel one first (timer_list)`, 409);
     const armed = this.deadlines.set(`${TIMER_DEADLINE}${t.name}`, t.at_ms);
-    this.traceEmit({ type: "timer_set", name: t.name, at_ms: t.at_ms, note: t.note });
+    this.traceEmit({ type: "timer_set", name: t.name, at_ms: t.at_ms, note: t.note, ...(t.every_ms !== undefined ? { every_ms: t.every_ms } : {}) });
     await armed;
     return t;
   }
@@ -2921,11 +2922,41 @@ export class AgentDO extends DurableObject<Env> {
     if (!(await this.cancelTimer(name, by))) throw new NestError(ErrorCodes.NOT_FOUND, `no timer ${name}`, 404);
   }
 
-  /** Arm every timer that has no deadline (a release without the handler dropped it): late, never lost. */
+  /**
+   * Arm every timer that has no deadline (a release without the handler dropped it): late, never lost. First,
+   * repeats a release without them left behind (a rollback) are forgotten, in one synchronous step. Nothing that
+   * release leaves says what the agent did with the name afterwards (set it again, cancelled it), so none is
+   * restored: one whose timer that release fired as a one-shot (its input `timer/<id>` is in the inbox) is told to
+   * the agent instead, once, so it can set it again.
+   */
   private async rearmTimers(): Promise<void> {
+    const live = this.exists() && !this.load().ended;
+    for (const r of this.timerStore.orphanedRepeats()) {
+      if (live && this.queue.messageFor(`timer/${r.id}`) !== undefined) this.timerStore.stopRepeat(r);
+      else this.timerStore.forgetRepeat(r.name, r.id);
+    }
+    // Told from the alarm (never from here, which may run inside the constructor's blockConcurrencyWhile, where
+    // waiting on another object could deadlock), armed in the same step as the notices were queued.
+    if (this.timerStore.notices().length && !this.deadlines.has("timer_notices")) await this.deadlines.set("timer_notices", Date.now());
     for (const t of this.timerStore.list()) {
       const key = `${TIMER_DEADLINE}${t.name}` as const;
       if (!this.deadlines.has(key)) await this.deadlines.set(key, t.at_ms);
+    }
+  }
+
+  /** Tell the agent of each repeat a rollback ended (`rearmTimers`), once each: posted, then forgotten. */
+  private async timerNotices(): Promise<void> {
+    for (const n of this.timerStore.notices()) {
+      // Read each time: the agent may end during an earlier notice's delivery.
+      const live = this.exists() && !this.load().ended;
+      // A platform note, not input: it doesn't lift an operator's stop (it waits for real input then), as a
+      // system note doesn't. Once, by its request id.
+      const rid = `timer/${n.id}/stopped`;
+      if (live && !this.queue.messageFor(rid)) {
+        await this.deliver(TIMER_SENDER, `timer "${n.name}" stopped repeating (every ${everyText(n.every_ms)}) during a platform rollback, after firing once: set it again with every_s if you still want it.`,
+          false, rid, false, false);
+      }
+      this.timerStore.noticeDone(n.id);
     }
   }
 
@@ -2939,9 +2970,10 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * A timer's deadline came: its input goes to the agent as an inbox message does (mid-turn, into the
-   * running turn; otherwise a turn of its own, which wakes a brain), keyed by the timer's id so a retried
-   * alarm posts it once, and only then is its row deleted. One cancelled or ended is dropped; one set
-   * again for later (its row's time ahead) is armed for that time.
+   * running turn; otherwise a turn of its own, which wakes a brain), keyed by the timer's id (and, for a
+   * repeating one, this firing's time) so a retried alarm posts it once. Only then is a one-shot timer's row
+   * deleted, or a repeating one moved to its next firing and armed for it, in one synchronous step. One
+   * cancelled or ended is dropped; one set again for later (its row's time ahead) is armed for that time.
    */
   private async timerFired(name: string): Promise<void> {
     if (!this.exists()) return;
@@ -2956,12 +2988,34 @@ export class AgentDO extends DurableObject<Env> {
       this.timerStore.delete(name, row.id);
       return;
     }
-    await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note), false, `timer/${row.id}`);
-    // Re-read: only this timer goes (one set again during the post keeps its row and deadline).
-    if (!this.timerStore.delete(name, row.id)) return;
+    const every = row.every_ms;
+    const firing = every === undefined ? `timer/${row.id}` : `timer/${row.id}/${row.at_ms}`;
+    // A repeating timer with an earlier firing not yet taken in (a queued turn no brain could run: no capacity,
+    // a failing start; or a message pushed into a running turn and never confirmed) isn't posted again: it moves
+    // on, so an outage costs one turn, not one per interval. This firing's own post (an alarm retried after it)
+    // isn't one: it goes again, deduplicated by its request id, and its trace and event are emitted.
+    const waiting = every !== undefined && this.queue.pendingFiring(`timer/${row.id}/`, firing);
+    // While an operator's stop holds, a repeating timer moves on without waking the agent: the stop holds
+    // whatever its timers say (a one-shot timer still wakes it, once, as any input does).
+    const stopped = every !== undefined && quietSinceStop(info);
+    // A firing already posted (an alarm retried after its post) completes as posted, whatever came since.
+    const skip = (waiting || stopped) && !this.queue.messageFor(firing);
+    if (!skip) await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note, every), false, firing);
+    // Re-read: only this timer moves on or goes (one set again or cancelled during the post is left as it is).
+    let next: number | undefined;
+    if (every === undefined) {
+      if (!this.timerStore.delete(name, row.id)) return;
+    } else {
+      next = nextFiring(row.at_ms, every, Date.now());
+      if (!this.timerStore.advance(name, row.id, row.at_ms, next)) return;
+    }
+    const armed = next !== undefined ? this.deadlines.set(`${TIMER_DEADLINE}${name}`, next) : null;
     const after = this.load();
-    this.traceEmit({ type: "timer_fired", name, note: row.note });
-    this.emit(after, `${after.agent}/timer/${row.id}`, { type: "agent.timer_fired", agent: after.agent, timer: name, note: row.note });
+    if (!skip) {
+      this.traceEmit({ type: "timer_fired", name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
+      this.emit(after, `${after.agent}/${firing}`, { type: "agent.timer_fired", agent: after.agent, timer: name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
+    }
+    await armed;
   }
 
   async turns(): Promise<{ turn: string; status: TurnStatus; input: TurnInput }[]> {
@@ -3385,9 +3439,10 @@ export class AgentDO extends DurableObject<Env> {
         const due = timerDue(p.data, Date.now());
         if (!due.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, due.error);
         await live();
-        const t = await this.setTimer({ name: p.data.name, at_ms: due.at_ms, note: p.data.note ?? "", set_ms: Date.now() }, key);
+        const t = await this.setTimer({ name: p.data.name, at_ms: due.at_ms, note: p.data.note ?? "", set_ms: Date.now(), ...(due.every_ms !== undefined ? { every_ms: due.every_ms } : {}) }, key);
+        const repeats = t.every_ms !== undefined ? `, then every ${everyText(t.every_ms)} until you cancel it (timer_cancel)` : "";
         return { status: "ok", content: [
-          { type: "text", text: `Timer ${t.name} fires at ${new Date(t.at_ms).toISOString()} (in ${Math.round((t.at_ms - Date.now()) / 1000)} s), as an inbox message. End your turn to wait for it; an inbox message may wake you first.` },
+          { type: "text", text: `Timer ${t.name} fires at ${new Date(t.at_ms).toISOString()} (in ${Math.round((t.at_ms - Date.now()) / 1000)} s)${repeats}, as an inbox message. End your turn to wait for it; an inbox message may wake you first.` },
           { type: "json", value: t },
         ] };
       }
@@ -3401,7 +3456,7 @@ export class AgentDO extends DurableObject<Env> {
       case "timer_list": {
         const timers = this.timerStore.list();
         return { status: "ok", content: [
-          { type: "text", text: timers.length ? timers.map((t) => `${t.name}: ${new Date(t.at_ms).toISOString()}${t.note ? ` (${t.note})` : ""}`).join("\n") : "No timers." },
+          { type: "text", text: timers.length ? timers.map((t) => `${t.name}: ${new Date(t.at_ms).toISOString()}${t.every_ms !== undefined ? `, then every ${everyText(t.every_ms)}` : ""}${t.note ? ` (${t.note})` : ""}`).join("\n") : "No timers." },
           { type: "json", value: { timers } },
         ] };
       }
@@ -3863,6 +3918,7 @@ export class AgentDO extends DurableObject<Env> {
           await this.deadlines.set("rules", Date.now() + RULES_RETRY_MS);
         }
       },
+      timer_notices: () => this.timerNotices(),
       client_events: async () => {
         if (await this.outbox.handOff(this.env)) await this.deadlines.set("client_events", Date.now());
       },

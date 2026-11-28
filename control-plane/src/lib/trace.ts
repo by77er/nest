@@ -35,8 +35,8 @@ export type TraceBody =
   | { type: "ask"; ask: string; question: string }
   | { type: "ask_answered"; ask: string }
   | { type: "ended"; reason: string }
-  | { type: "timer_set"; name: string; at_ms: number; note: string }
-  | { type: "timer_fired"; name: string; note: string }
+  | { type: "timer_set"; name: string; at_ms: number; note: string; every_ms?: number }
+  | { type: "timer_fired"; name: string; note: string; next_ms?: number }
   | { type: "timer_cancelled"; name: string; by: string }
   /** A request AgentDO sent for one of the agent's tools (lib/outbound.ts). */
   | OutboundRecord;
