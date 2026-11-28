@@ -2,7 +2,7 @@
 
 **Decided (2026-11-02):** a kernel capability, `timers`, that any template may name (the operator's or a client's in its namespace). An agent sets a named timer; when it fires, the agent gets an input and wakes for it. There is no blocking wait.
 
-**Decided (2026-11-28): timers repeat.** A timer set with `every_s` fires again at that interval until it's cancelled or its agent ends: a daily digest, a weekly check-in. This is the repeating half of the `wake_at` design ([capabilities](../#tools-and-capabilities)), built on timers rather than as a second scheduler.
+**Decided (2026-11-28): timers repeat.** A timer set with `every_s` fires again at that interval until it's cancelled or its agent ends: a daily digest, a weekly check-in. This is the repeating half of the `wake_at` design ([capabilities](../#schedules)), built on timers rather than as a second scheduler.
 
 ## Tools
 
@@ -39,7 +39,7 @@
 
 ## Open questions
 
-- **A repeating timer's cost has no budget.** Each firing is a turn on the subscription. An agent may have 8 repeating timers at the 5-minute floor (96 turns an hour), and each agent it spawns as many. A stop holds against them, and cancelling them ends them; `wake_at`'s turn budget ([capabilities](../#tools-and-capabilities)) would bound the rest. Until then, the floor, the cap and coalescing do.
+- **A repeating timer's cost has no budget.** Each firing is a turn on the subscription. An agent may have 8 repeating timers at the 5-minute floor (96 turns an hour), and each agent it spawns as many. A stop holds against them, and cancelling them ends them; `wake_at`'s turn budget ([capabilities](../#schedules)) would bound the rest. Until then, the floor, the cap and coalescing do.
 
 ## Waiting is a pattern, not a tool
 
