@@ -315,7 +315,7 @@ async function clientOAuthCapability(c: { env: Env; caller: Caller; p: { ns: str
   const auth = mcp.auth;
   if (!isClientMcpAuth(auth) || !("authorize" in auth)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name}'s auth isn't {authorize: true}`, 409);
   if (!mcpUrlAllowed(scope.grant, mcp.url)) throw new NestError(ErrorCodes.FORBIDDEN, `${name}: ${mcp.url} is outside ${scope.client}'s grant (mcp_urls)`, 403);
-  return { scope, name, url: mcp.url, scopes: auth.scopes, incarnation: auth.incarnation ?? "0" };
+  return { scope, name, url: mcp.url, scopes: auth.scopes, incarnation: auth.incarnation ?? "0", oauthClient: mcp.oauth_client };
 }
 
 /** Who an audit record names for a client's route: the client itself, or the operator acting on its namespace. */
@@ -1295,9 +1295,10 @@ export const ROUTES: Route[] = [
   route({
     method: "POST", path: "/v1/catalog/capabilities/:ns/:entry/oauth", auth: "owner", optionalBody: true, body: z.strictObject({ scopes: Scopes.optional() }),
     run: async (c) => {
-      const { scope, name, url, scopes, incarnation } = await clientOAuthCapability(c);
+      const { scope, name, url, scopes, incarnation, oauthClient } = await clientOAuthCapability(c);
       return newMethod("BrokerDO.clientOAuthStart", () => broker(c.env).clientOAuthStart({
         client: scope.client, clientName: scope.name, capability: name, entry: c.p.entry, incarnation, url, caller: auditCaller(c.caller), ...(c.body.scopes ? { scopes: c.body.scopes } : {}), ...(scopes ? { capScopes: scopes } : {}),
+        ...(oauthClient ? { oauthClient } : {}),
       }));
     },
   }),

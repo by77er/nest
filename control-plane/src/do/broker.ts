@@ -4,7 +4,7 @@ import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
-import { CLIENT_OAUTH_PREFIX, clientOAuthClientPrefix, isClientMcpAuth, oauthUrls, clientOAuthEntryPrefix, clientOAuthRef, clientOfRef, type OAuthAudit, type OAuthStatus, OAuthStore, type ServerRevocation, type StartAnswer, type StartInput } from "../lib/mcp-auth";
+import { CLIENT_OAUTH_PREFIX, clientOAuthClientPrefix, isClientMcpAuth, oauthUrls, clientOAuthEntryPrefix, clientOAuthRef, clientOfRef, type OAuthAudit, type OAuthStatus, OAuthStore, parseClient, type ServerRevocation, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import { isClientId } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
@@ -137,6 +137,7 @@ export class BrokerDO extends DurableObject<Env> {
     this.oauth = new OAuthStore({
       sql: this.sql,
       secret: (name) => this.secret(name)?.value ?? null,
+      secretExpires: (name) => this.secret(name)?.expires_ms ?? null,
       audit: (r) => this.audit(r),
       publicBaseUrl: env.PUBLIC_BASE_URL,
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
@@ -212,8 +213,12 @@ export class BrokerDO extends DurableObject<Env> {
    * docs/control-plane/api/clients/#mcp-credentials): as `oauthStart`, its tokens kept under the record
    * derived from the client and the entry, never one it names.
    */
-  async clientOAuthStart(input: { client: string; clientName: string; capability: string; entry: string; incarnation: string; url: string; scopes?: string[]; capScopes?: string[]; caller?: string }): Promise<StartAnswer> {
-    const auth = { oauth: clientOAuthRef(input.client, input.entry, input.incarnation), ...(input.capScopes ? { scopes: input.capScopes } : {}) };
+  async clientOAuthStart(input: { client: string; clientName: string; capability: string; entry: string; incarnation: string; url: string; scopes?: string[]; capScopes?: string[]; oauthClient?: string; caller?: string }): Promise<StartAnswer> {
+    // `oauthClient` names the client's own secret (`mcp.oauth_client`): its key is derived here, never taken.
+    const auth = {
+      oauth: clientOAuthRef(input.client, input.entry, input.incarnation), ...(input.capScopes ? { scopes: input.capScopes } : {}),
+      ...(input.oauthClient ? { client: clientSecretKey(input.client, input.oauthClient) } : {}),
+    };
     return await this.oauth.start({
       owner: { id: input.client, name: input.clientName }, capability: input.capability, url: input.url, auth, ...(input.scopes ? { scopes: input.scopes } : {}),
     }, input.caller ?? input.client);
@@ -477,6 +482,7 @@ export class BrokerDO extends DurableObject<Env> {
     if (!isClientId(client)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${client} is not a client`, 400);
     const size = new TextEncoder().encode(value).byteLength;
     if (size > limit.max_bytes) throw new NestError(ErrorCodes.FORBIDDEN, `outside ${client}'s grant: a secret of ${size} bytes (secrets.max_bytes is ${limit.max_bytes})`, 403);
+    this.refuseOAuthClientChange(client, name, { value, expires_ms: input.expires_ms });
     const now = Date.now();
     const cur = this.sql.exec<{ created_ms: number }>("SELECT created_ms FROM client_secrets WHERE client = ? AND name = ?", client, name).toArray()[0];
     if (!cur) {
@@ -499,11 +505,37 @@ export class BrokerDO extends DurableObject<Env> {
    * bound to the name gets a value stored under it again the same way.
    */
   async deleteClientSecret(client: string, name: string): Promise<void> {
+    this.refuseOAuthClientChange(client, name, null);
     const n = this.sql.exec("DELETE FROM client_secrets WHERE client = ? AND name = ?", client, name).rowsWritten;
     this.sql.exec("DELETE FROM secrets WHERE name = ?", clientSecretKey(client, name));
     if (!n) throw new NestError(ErrorCodes.NOT_FOUND, `no secret ${name}`, 404);
     await this.queueSecretPushes(client, name);
     this.auditInBackground({ event: "client_secret_deleted", client, secret: name });
+  }
+
+  /**
+   * A client's secret that is the OAuth client of an authorization (its capability's `mcp.oauth_client`) keeps
+   * its `client_id` and stays without an expiry while any authorization or flow uses it: their tokens are
+   * refreshed and revoked as that client, so another (or none) would strand them at the server. A rotated
+   * client secret under the same id is fine. `next` null: a delete. Checked before anything is written.
+   */
+  private refuseOAuthClientChange(client: string, name: string, next: { value: string; expires_ms: number | null } | null): void {
+    const key = clientSecretKey(client, name);
+    const uses = this.oauth.clientSecretUses(key);
+    if (!uses.length) return;
+    const idOf = (v: string | undefined) => {
+      try {
+        return v === undefined ? null : parseClient(v, null).client_id;
+      } catch {
+        return null;
+      }
+    };
+    const was = idOf(this.secret(key)?.value);
+    if (next && next.expires_ms === null && was !== null && idOf(next.value) === was) return;
+    const unreadable = next !== null && idOf(next.value) === null;
+    const what = next === null ? "deleted" : next.expires_ms !== null ? "given an expiry" : unreadable ? "rewritten with a value that isn't a valid OAuth client" : "rewritten with another client_id";
+    throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name} is the OAuth client ${uses.join(", ")} authorized with, so it can't be ${what}: `
+      + `revoke ${uses.length > 1 ? "those" : "that"} first (DELETE /v1/catalog/capabilities/<ns>/<entry>/oauth, or delete the capability)`, 409);
   }
 
   /** Every secret of client `client`, by name: never a value. */
