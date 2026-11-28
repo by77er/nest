@@ -8,15 +8,18 @@ import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { BrokerDO } from "../src/do/broker";
 import type { McpConnectorDO } from "../src/do/mcp-connector";
-import { connectorName } from "../src/lib/mcp";
-import { authServerMetadataUrls, bearerChallenge, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
-import { adminJson, connectHost, eventually, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
+import { connectorName, grantOf } from "../src/lib/mcp";
+import { specOutsideGrant } from "../src/lib/clients";
+import { authServerMetadataUrls, bearerChallenge, clientOfRef, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
+import { adminJson, BASE, connectHost, eventually, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 /** vitest.config.ts: PUBLIC_BASE_URL. */
 const NEST = "https://nest.test";
 const CALLBACK = `${NEST}/v1/oauth/callback`;
 const CIMD = `${NEST}/v1/oauth/client.json`;
+/** Any of nest's client ID metadata documents: the operator's, or an API client's own. */
+const isCimd = (id: string) => id === CIMD || /^https:\/\/nest\.test\/v1\/oauth\/clients\/cli_[A-Za-z0-9]+\.json$/.test(id);
 const broker = () => env.BROKER.get(env.BROKER.idFromName("broker"));
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 const b64url = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -67,6 +70,9 @@ class FakeAuth {
   /** Holds a code exchange while set; `exchangeHeld` says one is waiting. Polled: no promise crosses contexts. */
   holdExchange = false;
   exchangeHeld = false;
+  /** Holds a start's discovery (the authorization server's metadata) while set; `discoveryHeld` says one is waiting. */
+  holdDiscovery = false;
+  discoveryHeld = false;
   readonly cimdFetches: unknown[] = [];
   /** The MCP server's view: every request's bearer, method and status. */
   readonly rsLog: { token: string | null; method: string; status: number }[] = [];
@@ -123,7 +129,7 @@ class FakeAuth {
     if (!id) return null;
     const c = this.clients.get(id);
     if (c?.secret) return null; // a confidential client must authenticate
-    return c || id === CIMD ? id : null;
+    return c || isCimd(id) ? id : null;
   }
 
   async handle(req: Request): Promise<Response> {
@@ -131,6 +137,11 @@ class FakeAuth {
     if (u.hostname === "rs.test") return this.rs(req, u);
     // Authorization server metadata, path-inserted (RFC 8414 §3.1): the issuer has a path.
     if (u.pathname === `/.well-known/oauth-authorization-server/${this.id}`) {
+      // A start held in discovery (`holdDiscovery`), polled like the exchange hold.
+      while (this.holdDiscovery) {
+        this.discoveryHeld = true;
+        await sleep(10);
+      }
       return this.json(200, {
         issuer: this.issuer, authorization_endpoint: `${this.issuer}/authorize`, token_endpoint: `${this.issuer}/token`,
         ...(this.o.registration ? { registration_endpoint: `${this.issuer}/register` } : {}),
@@ -172,9 +183,11 @@ class FakeAuth {
     const fail = (why: string) => this.json(400, { error: "invalid_request", why });
     const client_id = q.get("client_id")!;
     let redirects: string[] | undefined = this.clients.get(client_id)?.redirect_uris;
-    if (client_id === CIMD && this.o.cimd) {
+    if (isCimd(client_id) && this.o.cimd) {
       // The AS fetches the document; client_id must equal its URL, and the redirect URI must be listed.
-      const doc = (await (await SELF.fetch(client_id)).json()) as { client_id: string; redirect_uris: string[]; client_name: string };
+      const fetched = await SELF.fetch(client_id);
+      if (!fetched.ok) return fail(`metadata document: ${fetched.status}`);
+      const doc = (await fetched.json()) as { client_id: string; redirect_uris: string[]; client_name: string };
       this.cimdFetches.push(doc);
       if (doc.client_id !== client_id || !doc.client_name) return fail("metadata document's client_id isn't its URL");
       redirects = doc.redirect_uris;
@@ -789,5 +802,636 @@ describe("deleting an operator's secret", () => {
 
     expect((await adminJson("/v1/admin/secrets/binding_key:use1", { method: "DELETE" }, 403)).error.code).toBe("forbidden");
     expect((await adminJson("/v1/admin/secrets/client-secret:cli_x:name", { method: "DELETE" }, 403)).error.code).toBe("forbidden");
+  });
+});
+
+// --- An API client's own credentials (docs/control-plane/api/clients/#mcp-credentials) ------------------------
+
+describe("an API client's own mcp credentials", () => {
+  const as = (token: string, path: string, init: { method?: string; body?: unknown } = {}) => SELF.fetch(`${BASE}${path}`, {
+    method: init.method ?? (init.body === undefined ? "GET" : "POST"),
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+  });
+  const asJson = async <T = any>(token: string, path: string, init: { method?: string; body?: unknown } = {}, status?: number): Promise<T> => {
+    const res = await as(token, path, init);
+    const text = await res.text();
+    if (status !== undefined) expect(res.status, `${path}: ${text}`).toBe(status);
+    else expect(res.ok, `${path}: ${res.status} ${text}`).toBe(true);
+    return (text ? JSON.parse(text) : {}) as T;
+  };
+
+  /** A client whose grant reaches `servers` (mcp_urls), with a cell of its own. */
+  async function newClient(servers: string[]) {
+    const cell = uniqueCell();
+    const name = `oc-${rand()}`;
+    const c = await adminJson("/v1/admin/clients", {
+      body: { name, grant: { cells: [cell], credentials: ["claude_oauth_token"], mcp_urls: servers, max_agents: 5, max_sandboxes: 5, secrets: { max_count: 3, max_bytes: 128 } } },
+    }, 201);
+    return { id: c.client as string, name, token: c.token as string, cell };
+  }
+  type Client = Awaited<ReturnType<typeof newClient>>;
+
+  /** The entry's OAuth record of client `c`, whatever its incarnation (undefined: none). */
+  const entryRow = (c: Client, entry: string) => runInDurableObject(broker(), (_: BrokerDO, st) =>
+    st.storage.sql.exec<Record<string, any>>("SELECT * FROM oauth_grants WHERE substr(ref, 1, ?) = ?", `client-oauth:${c.id}:${entry}:`.length, `client-oauth:${c.id}:${entry}:`).toArray()[0] as Record<string, any> | undefined);
+
+  /** A capability `<ns>/<entry>` on `f`'s server, written by the client with `auth`. */
+  const putCap = (c: Client, entry: string, f: FakeAuth, auth: unknown, status?: number) => asJson(c.token, `/v1/catalog/capabilities/${c.name}/${entry}`, {
+    method: "PUT", body: { mcp: { url: f.server, auth, tools: ["echo", "counter_add"], read_only: ["echo"], when_tainted: "allow" } },
+  }, status);
+
+  /** The client's authorization, as its app does it: start, send the person to the URL, land on nest's callback. */
+  async function clientAuthorize(c: Client, entry: string) {
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/${entry}/oauth`, { method: "POST" });
+    const res = await fetch(start.authorize_url, { redirect: "manual" });
+    expect(res.status, await res.clone().text()).toBe(302);
+    const cb = await SELF.fetch(res.headers.get("location")!);
+    return { start, callback: cb, page: await cb.text() };
+  }
+
+  /** The client's agent with capability `<ns>/<entry>`, its runner session open, and a way to call a tool. */
+  async function clientAgent(c: Client, entry: string) {
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/t-${entry}`, {
+      method: "PUT", body: { capabilities: ["nest", `${c.name}/${entry}`], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token" },
+    });
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
+    const host = await connectHost(c.cell, "brain");
+    const ag = await asJson(c.token, "/v1/agents", { body: { template: `${c.name}/t-${entry}`, cell: c.cell } }, 201);
+    await nextCommands(host.ws, (x) => x.type === "agent_start" && x.agent === ag.agent);
+    const ws = await Ws.connect(`/v1/agents/${ag.agent}/session`, host.host_token);
+    ws.send({ type: "hello", protocol_version: 1, agent: ag.agent, host: host.host, instance_id: "rin_one", epoch: 1, session: SESSION });
+    await ws.next("hello_ack");
+    let seq = 0;
+    const call = async (callId: string, tool: string, args: unknown) => {
+      ws.send({ type: "tool_call", seq: ++seq, call: callId, turn: "trn_x", name: `${c.name}-${entry}_${tool}`, arguments: args });
+      return (await ws.next("tool_result", (m) => m.call === callId, 8000)).outcome;
+    };
+    return { agent: ag.agent as string, call };
+  }
+
+  it("expands a client's own form into a record derived from that client and entry, never one it names", () => {
+    const src = { url: "https://rs.example/mcp", tools: undefined, trusted: false, when_tainted: "allow" as const };
+    expect(grantOf("ns-notes", { ...src, auth: { authorize: true, scopes: ["a"], incarnation: "abcd1234" } }, "cli_A", "notes")).toMatchObject({ auth: "client-oauth:cli_A:notes:abcd1234", oauth: { client: null, scopes: ["a"] } });
+    const bearer = grantOf("ns-key", { ...src, auth: { secret: "k" } }, "cli_A", "key");
+    expect(bearer.auth).toBe("client-secret:cli_A:k");
+    expect(bearer.oauth).toBeUndefined();
+    expect(() => grantOf("op", { ...src, auth: { secret: "k" } })).toThrow();
+    expect([clientOfRef("client-oauth:cli_A:notes:abcd1234"), clientOfRef("client-secret:cli_B:k"), clientOfRef("cap:notes"), clientOfRef("client-oauth:nope")]).toEqual(["cli_A", "cli_B", null, null]);
+    // A spec whose record isn't its capability's own client's is outside any grant.
+    const grant = { cells: [], credentials: [], mcp_urls: ["https://rs.example/mcp"] } as unknown as Parameters<typeof specOutsideGrant>[1];
+    const spec = (m: Record<string, unknown>) => ({ credential: "claude_oauth_token", mcp: [{ capability: "x", url: "https://rs.example/mcp", tools: null, idempotent: {}, trusted: false, ...m }] }) as unknown as Parameters<typeof specOutsideGrant>[0];
+    expect(specOutsideGrant(spec({ auth: "client-oauth:cli_A:notes:abcd1234", client: "cli_A" }), grant).filter((x) => x.includes("cli_"))).toEqual([]);
+    expect(specOutsideGrant(spec({ auth: "client-oauth:cli_A:notes:abcd1234", client: "cli_B" }), grant).some((x) => x.includes("credential of cli_A"))).toBe(true);
+  });
+
+  it("are refused in the operator's namespace, and their schema takes only a name or authorize: true", async () => {
+    const put = (name: string, auth: unknown, status?: number) => adminJson(`/v1/admin/capabilities/${name}`, { method: "PUT", body: { mcp: { url: "https://mcp.example.com/mcp", auth } } }, status);
+    expect((await put(`op${rand()}`, { authorize: true }, 400)).error.message).toContain("API client's namespace");
+    expect((await put(`op${rand()}`, { secret: "k" }, 400)).error.message).toContain("API client's namespace");
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "bad", f, { secret: "client-secret:cli_other:k" }, 400);
+    await putCap(c, "bad2", f, { authorize: false }, 400);
+    await putCap(c, "bad3", f, { secret: "k", authorize: true }, 400);
+  });
+
+  it("{authorize}: the client starts OAuth, the person lands on nest's callback, its agent's calls carry the token, and another client can't start, read or revoke it", async () => {
+    const f = new FakeAuth(rand(), { cimd: true, revocation: true });
+    fakes.set(f.id, f);
+    const a = await newClient([f.server]);
+    const b = await newClient([f.server]);
+    const written = await putCap(a, "notes", f, { authorize: true, incarnation: "chosenbyclient" });
+    // The incarnation is nest's, whatever the client sent.
+    expect(written.mcp.auth.incarnation).toMatch(/^[0-9a-f]{16}$/);
+    const ref = `client-oauth:${a.id}:notes:${written.mcp.auth.incarnation}`;
+    expect((await asJson(a.token, `/v1/catalog/capabilities/${a.name}/notes/oauth`)).status).toBe("unauthorized");
+
+    const { start, callback, page } = await clientAuthorize(a, "notes");
+    expect(start).toMatchObject({ client: "metadata", resource: f.server, capability: `${a.name}/notes` });
+    // Its own client identity: its metadata document, named for it, and its own callback.
+    const authorizeQuery = new URL(start.authorize_url).searchParams;
+    expect(authorizeQuery.get("client_id")).toBe(`${NEST}/v1/oauth/clients/${a.id}.json`);
+    expect(authorizeQuery.get("redirect_uri")).toBe(`${NEST}/v1/oauth/callback/${a.id}`);
+    expect(f.cimdFetches.at(-1)).toMatchObject({ client_name: `${a.name} (via nest)`, redirect_uris: [`${NEST}/v1/oauth/callback/${a.id}`] });
+    expect(callback.status, page).toBe(200);
+    expect(page).toContain(`${a.name}/notes is authorized`);
+    expect((await grantRow(ref)).status).toBe("authorized");
+    const status = await asJson(a.token, `/v1/catalog/capabilities/${a.name}/notes/oauth`);
+    expect(status).toMatchObject({ ref, status: "authorized", server_url: f.server });
+    expect(JSON.stringify(status)).not.toMatch(/at-|rt-/);
+
+    // Another client: refused on a's namespace without a lookup (403), for each route.
+    for (const method of ["POST", "GET", "DELETE"]) expect((await as(b.token, `/v1/catalog/capabilities/${a.name}/notes/oauth`, { method })).status).toBe(403);
+
+    const ag = await clientAgent(a, "notes");
+    expect(await ag.call("cal_c1", "echo", { text: "hi" })).toMatchObject({ status: "ok", content: [{ type: "text", text: "hi" }] });
+    const used = f.rsLog.filter((l) => l.method === "tools/call" && l.status === 200);
+    expect(used.length).toBe(1);
+    expect(used[0]!.token).toBe((await grantRow(ref)).access_token);
+
+    // Revoked by its client: gone here, revoked at the server, and the agent's next call names who authorizes it.
+    const revoked = await asJson(a.token, `/v1/catalog/capabilities/${a.name}/notes/oauth`, { method: "DELETE" });
+    expect(revoked).toEqual({ revoked: [{ ref, issuer: f.issuer, server: "revoked" }] });
+    expect(await grantRow(ref)).toBeUndefined();
+    const after = await ag.call("cal_c2", "echo", { text: "again" });
+    expect(after.status).not.toBe("ok");
+    expect(JSON.stringify(after)).toContain(`/v1/catalog/capabilities/<ns>/<entry>/oauth`);
+  });
+
+  it("{secret}: the client's own secret is the bearer, and the same form in another client's namespace reaches only that client's", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const value = `static-${random()}`;
+    f.access.set(value, { resource: f.server, exp: Date.now() + 3_600_000 });
+    const a = await newClient([f.server]);
+    const b = await newClient([f.server]);
+    await asJson(a.token, "/v1/clients/self/secrets/notes-key", { method: "PUT", body: { value } });
+    await putCap(a, "key", f, { secret: "notes-key" });
+    await putCap(b, "key", f, { secret: "notes-key" });
+    // A static bearer has nothing to authorize.
+    expect((await asJson(a.token, `/v1/catalog/capabilities/${a.name}/key/oauth`, { method: "POST" }, 409)).error.message).toContain("authorize");
+
+    const agA = await clientAgent(a, "key");
+    expect(await agA.call("cal_k1", "echo", { text: "a" })).toMatchObject({ status: "ok" });
+    expect(f.rsLog.filter((l) => l.method === "tools/call").map((l) => l.token)).toEqual([value]);
+
+    // b names the same secret name: it resolves to b's own (none stored), so a's value never goes out for b.
+    const agB = await clientAgent(b, "key");
+    expect((await agB.call("cal_k2", "echo", { text: "b" })).status).not.toBe("ok");
+    expect(f.rsLog.filter((l) => l.method === "tools/call" && l.token === value)).toHaveLength(1);
+  });
+
+  it("a client deleted while its callback exchanges the code: the tokens are never stored, and are revoked at the server", async () => {
+    const f = new FakeAuth(rand(), { cimd: true, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "late", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/late/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    // No record yet and no flow row left; the client's delete (its namespace goes first) stops it.
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
+    f.holdExchange = false;
+    expect(await callback).toContain("revoked while its code was being exchanged");
+    expect(await entryRow(c, "late")).toBeUndefined();
+    expect(f.revocations).toHaveLength(1);
+  });
+
+  it("a capability deleted while its start awaits discovery: the start stores no flow, and one made again starts unauthorized", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "race", f, { authorize: true });
+    f.holdDiscovery = true;
+    const started = as(c.token, `/v1/catalog/capabilities/${c.name}/race/oauth`, { method: "POST" });
+    await eventually("the start to reach discovery", () => f.discoveryHeld);
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/race`, { method: "DELETE" });
+    f.holdDiscovery = false;
+    const res = await started;
+    expect(res.status).toBe(409);
+    // Refused by its catalog check (the capability changed or went) or its revocation count, whichever sees it first.
+    expect(await res.text()).toMatch(/(changed or went|revoked) while this (authorization|one) was starting: start again/);
+    expect(await runInDurableObject(broker(), (_: BrokerDO, st) => st.storage.sql.exec("SELECT body FROM oauth_flows").toArray()
+      .filter((r) => String(r.body).includes(`client-oauth:${c.id}:race:`)).length)).toBe(0);
+    await putCap(c, "race", f, { authorize: true });
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/race/oauth`)).status).toBe("unauthorized");
+  });
+
+  it("a capability made again gets a new incarnation and starts unauthorized, and deleting it again revokes every incarnation's record", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    const first = (await putCap(c, "inc", f, { authorize: true })).mcp.auth.incarnation;
+    // Rewriting it with the same URL and form keeps the incarnation (and so its authorization).
+    expect((await putCap(c, "inc", f, { authorize: true, scopes: ["notes"] })).mcp.auth.incarnation).toBe(first);
+    await clientAuthorize(c, "inc");
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/inc/oauth`)).status).toBe("authorized");
+    // Emulate a delete whose revocation never ran (a rolled-back Worker): the capability goes, the record stays.
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog")) as unknown as { deleteCapability(name: string): Promise<void> };
+    await catalogStub.deleteCapability(`${c.name}/inc`);
+    const again = (await putCap(c, "inc", f, { authorize: true })).mcp.auth.incarnation;
+    expect(again).not.toBe(first);
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/inc/oauth`)).status).toBe("unauthorized");
+    // Deleting it again, the old capability long gone, still revokes every record of the entry.
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/inc`, { method: "DELETE" });
+    expect(await entryRow(c, "inc")).toBeUndefined();
+  });
+
+  it("changing an {authorize} capability's URL or form revokes its authorization", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    await putCap(c, "move", f, { authorize: true });
+    await clientAuthorize(c, "move");
+    expect(await entryRow(c, "move")).toBeDefined();
+    await putCap(c, "move", g, { authorize: true });
+    expect(await entryRow(c, "move")).toBeUndefined();
+    await putCap(c, "move", g, { authorize: true });
+    await clientAuthorize(c, "move");
+    await asJson(c.token, "/v1/clients/self/secrets/k", { method: "PUT", body: { value: "v" } });
+    await putCap(c, "move", g, { secret: "k" });
+    expect(await entryRow(c, "move")).toBeUndefined();
+  });
+
+  it("refuses a start once the grant no longer reaches the server, and lets the operator act on a client's routes", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "narrow", f, { authorize: true });
+    expect((await adminJson(`/v1/catalog/capabilities/${c.name}/narrow/oauth`)).status).toBe("unauthorized");
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token"], mcp_urls: [], max_agents: 5, max_sandboxes: 5, secrets: { max_count: 3, max_bytes: 128 } } } });
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/narrow/oauth`, { method: "POST" }, 403)).error.message).toContain("mcp_urls");
+  });
+
+  it("{secret}: an expired secret is no bearer", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const value = `static-${random()}`;
+    f.access.set(value, { resource: f.server, exp: Date.now() + 3_600_000 });
+    const c = await newClient([f.server]);
+    await asJson(c.token, "/v1/clients/self/secrets/old-key", { method: "PUT", body: { value } });
+    await putCap(c, "old", f, { secret: "old-key" });
+    await runInDurableObject(broker(), (_: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE secrets SET expires_ms = ? WHERE name = ?", Date.now() - 1000, `client-secret:${c.id}:old-key`);
+    });
+    const ag = await clientAgent(c, "old");
+    expect((await ag.call("cal_e1", "echo", { text: "x" })).status).not.toBe("ok");
+    expect(f.rsLog.filter((l) => l.token === value)).toHaveLength(0);
+  });
+
+  it("each client is its own OAuth client: registrations aren't shared, and a state never lands on another client's callback", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: true });
+    fakes.set(f.id, f);
+    const a = await newClient([f.server]);
+    const b = await newClient([f.server]);
+    await putCap(a, "reg", f, { authorize: true });
+    await putCap(b, "reg", f, { authorize: true });
+    const sa = await asJson(a.token, `/v1/catalog/capabilities/${a.name}/reg/oauth`, { method: "POST" });
+    const sb = await asJson(b.token, `/v1/catalog/capabilities/${b.name}/reg/oauth`, { method: "POST" });
+    expect(sa.client).toBe("registered");
+    // One registration each, under each one's own callback and name.
+    expect(f.registrations).toMatchObject([
+      { client_name: `${a.name} (via nest)`, redirect_uris: [`${NEST}/v1/oauth/callback/${a.id}`] },
+      { client_name: `${b.name} (via nest)`, redirect_uris: [`${NEST}/v1/oauth/callback/${b.id}`] },
+    ]);
+    expect(new URL(sa.authorize_url).searchParams.get("client_id")).not.toBe(new URL(sb.authorize_url).searchParams.get("client_id"));
+    // a's state brought to b's callback, or to the operator's, is refused for that reason (a fresh flow each).
+    const wrongPaths = [`/v1/oauth/callback/${b.id}`, "/v1/oauth/callback"];
+    for (const [k, path] of wrongPaths.entries()) {
+      const flow = k === 0 ? sa : await asJson(a.token, `/v1/catalog/capabilities/${a.name}/reg/oauth`, { method: "POST" });
+      const back = new URL((await fetch(flow.authorize_url, { redirect: "manual" })).headers.get("location")!);
+      const wrong = await SELF.fetch(`${NEST}${path}${back.search}`);
+      expect(wrong.status).toBe(400);
+      expect(await wrong.text()).toContain("came back to another client");
+    }
+    expect(await entryRow(a, "reg")).toBeUndefined();
+    // A client that isn't (any more) has no metadata document.
+    expect((await SELF.fetch(`${NEST}/v1/oauth/clients/cli_nobody.json`)).status).toBe(404);
+    await adminJson(`/v1/admin/clients/${b.id}`, { method: "DELETE" });
+    expect((await SELF.fetch(`${NEST}/v1/oauth/clients/${b.id}.json`)).status).toBe(404);
+  });
+
+  it("a URL changed while a code is being exchanged: the tokens are never stored (the callback asks the catalog)", async () => {
+    const f = new FakeAuth(rand(), { cimd: true, revocation: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    await putCap(c, "moving", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/moving/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    // The write's revocation counts against this callback (it keeps another incarnation), and the catalog
+    // check would refuse it too; each alone is tested below.
+    await putCap(c, "moving", g, { authorize: true });
+    f.holdExchange = false;
+    expect(await callback).toContain("revoked while its code was being exchanged");
+    expect(await entryRow(c, "moving")).toBeUndefined();
+    expect(f.revocations).toHaveLength(1);
+  });
+
+  it("a write whose revocation couldn't run (503) is finished by the same request again", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    await putCap(c, "retry", f, { authorize: true });
+    await clientAuthorize(c, "retry");
+    const { BrokerDO: Broker } = await import("../src/do/broker");
+    const real = Broker.prototype.clientOAuthRevoke;
+    Broker.prototype.clientOAuthRevoke = async function () {
+      throw new Error("RPC receiver does not implement the method \"clientOAuthRevoke\"");
+    };
+    try {
+      const refused = await putCap(c, "retry", g, { authorize: true }, 503);
+      expect(refused.error).toMatchObject({ retryable: true });
+    } finally {
+      Broker.prototype.clientOAuthRevoke = real;
+    }
+    // The write landed (a new incarnation), the old authorization is still stored: the same request finishes it.
+    expect(await entryRow(c, "retry")).toBeDefined();
+    await putCap(c, "retry", g, { authorize: true });
+    expect(await entryRow(c, "retry")).toBeUndefined();
+  });
+
+  it("the client's revocation count alone: a client's records revoked while its start or its callback is in flight store nothing", async () => {
+    const f = new FakeAuth(rand(), { cimd: true, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "count", f, { authorize: true });
+    // The capability stays in the catalog throughout: only the count can stop these.
+    f.holdDiscovery = true;
+    const started = as(c.token, `/v1/catalog/capabilities/${c.name}/count/oauth`, { method: "POST" });
+    await eventually("the start to reach discovery", () => f.discoveryHeld);
+    await broker().deleteClientSecrets(c.id);
+    f.holdDiscovery = false;
+    expect((await started).status).toBe(409);
+
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/count/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    await broker().deleteClientSecrets(c.id);
+    f.holdExchange = false;
+    expect(await callback).toContain("revoked while its code was being exchanged");
+    expect(await entryRow(c, "count")).toBeUndefined();
+  });
+
+  it("a write that lands while the catalog's answer is on its way back: the callback stores nothing for the old incarnation", async () => {
+    const f = new FakeAuth(rand(), { cimd: true, revocation: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    await putCap(c, "late", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/late/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    // CatalogDO answers "holds the old incarnation", and before the answer reaches BrokerDO the capability moves to
+    // g and the write's revocation runs (as the PUT route does), with nothing stored yet to revoke.
+    const { CatalogDO: Catalog } = await import("../src/do/catalog");
+    const real = Catalog.prototype.entry;
+    let raced = false;
+    Catalog.prototype.entry = async function (this: InstanceType<typeof Catalog>, kind: "templates" | "capabilities", name: string) {
+      const answer = await real.call(this, kind, name);
+      if (!raced && name === `${c.name}/late`) {
+        raced = true;
+        await this.putCapability(name, { ...(answer as any), mcp: { ...(answer as any).mcp, url: g.server, auth: { authorize: true } } }, await env.CLIENT.get(env.CLIENT.idFromName(c.id)).scope());
+        await broker().clientOAuthRevoke(c.id, name, "late", { write: true });
+      }
+      return answer;
+    };
+    try {
+      expect(await (await SELF.fetch(back)).text()).toContain("revoked while its code was being exchanged");
+    } finally {
+      Catalog.prototype.entry = real;
+    }
+    expect(raced).toBe(true);
+    expect(await entryRow(c, "late")).toBeUndefined();
+  });
+
+  it("a write's revocation keeps the incarnation the catalog holds now, whatever arrives late", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    await putCap(c, "keep", f, { authorize: true });
+    await putCap(c, "keep", g, { authorize: true });
+    await clientAuthorize(c, "keep");
+    // A write's revocation (a delayed one, say) runs again: the current authorization stays.
+    await broker().clientOAuthRevoke(c.id, `${c.name}/keep`, "keep", { write: true });
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/keep/oauth`)).status).toBe("authorized");
+  });
+
+  it("a client's own credential serves only its own subtree's agents: the operator's spawn of its template is refused", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "mine", f, { authorize: true });
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/t-mine`, {
+      method: "PUT", body: { capabilities: ["nest", `${c.name}/mine`], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token" },
+    });
+    const refused = await adminJson("/v1/agents", { body: { template: `${c.name}/t-mine`, cell: c.cell } }, 400);
+    expect(refused.error.message).toContain(`only an agent of ${c.name}'s subtree uses it`);
+  });
+
+  it("BrokerDO serves a bearer only for an operator's cap: secret or a client's own derived record, nothing else", async () => {
+    const value = `v-${random()}`;
+    await adminJson("/v1/admin/secrets/cap:guard-ok", { method: "PUT", body: { value } });
+    const c = await newClient([]);
+    await asJson(c.token, "/v1/clients/self/secrets/k", { method: "PUT", body: { value: "client-value" } });
+    expect(await broker().capabilityToken("cap:guard-ok")).toBe(value);
+    expect(await broker().capabilityToken(`client-secret:${c.id}:k`)).toBe("client-value");
+    for (const ref of ["claude_oauth_token", "client-secret:bogus", `client-secret:${c.id}`, "client-oauth:nope", "http:x", "binding_key:use1"]) {
+      await expect(Promise.resolve().then(() => broker().capabilityToken(ref)), ref).rejects.toThrow("not a capability credential");
+    }
+    for (const ref of ["claude_oauth_token", "client-oauth:bogus", `client-secret:${c.id}:k`, "inject:x"]) {
+      await expect(Promise.resolve().then(() => broker().mcpOAuthToken(ref, "https://rs.test/x/mcp")), ref).rejects.toThrow("not a capability credential");
+    }
+  });
+
+  it("a write moving the URL while a start awaits discovery: the start stores no flow (409)", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    await putCap(c, "wstart", f, { authorize: true });
+    f.holdDiscovery = true;
+    const started = as(c.token, `/v1/catalog/capabilities/${c.name}/wstart/oauth`, { method: "POST" });
+    await eventually("the start to reach discovery", () => f.discoveryHeld);
+    await putCap(c, "wstart", g, { authorize: true });
+    f.holdDiscovery = false;
+    const res = await started;
+    expect(res.status).toBe(409);
+    // Refused by its catalog check (the capability changed or went) or its revocation count, whichever sees it first.
+    expect(await res.text()).toMatch(/(changed or went|revoked) while this (authorization|one) was starting: start again/);
+  });
+
+  it("a write that keeps the incarnation (same URL and form) lets a callback in flight store its tokens", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "same", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/same/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    await putCap(c, "same", f, { authorize: true, scopes: ["notes"] });
+    f.holdExchange = false;
+    expect(await callback).toContain("is authorized");
+    expect((await entryRow(c, "same"))!.status).toBe("authorized");
+  });
+
+  it("a write's revocation that a newer write overtakes while it reads the catalog reads it again, and keeps the newer authorization", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    const h = new FakeAuth(rand(), { cimd: true });
+    for (const x of [f, g, h]) fakes.set(x.id, x);
+    const c = await newClient([f.server, g.server, h.server]);
+    const name = `${c.name}/order`;
+    await putCap(c, "order", f, { authorize: true });
+    await putCap(c, "order", g, { authorize: true });
+    // R1, g's write's revocation, has its catalog read held: it read g's incarnation, and is slow to come back.
+    const { CatalogDO: Catalog } = await import("../src/do/catalog");
+    const real = Catalog.prototype.entry;
+    const gate = { holdNext: true, held: false, release: false };
+    Catalog.prototype.entry = async function (this: InstanceType<typeof Catalog>, kind: "templates" | "capabilities", n: string) {
+      const answer = await real.call(this, kind, n);
+      if (gate.holdNext && n === name) {
+        gate.holdNext = false;
+        gate.held = true;
+        while (!gate.release) await sleep(10);
+      }
+      return answer;
+    };
+    try {
+      const r1 = broker().clientOAuthRevoke(c.id, name, "order", { write: true });
+      await eventually("R1's catalog read to be held", () => gate.held);
+      // Meanwhile the capability moves to h (its own revocation runs), and someone authorizes it.
+      await putCap(c, "order", h, { authorize: true });
+      await clientAuthorize(c, "order");
+      expect((await asJson(c.token, `/v1/catalog/capabilities/${name}/oauth`)).status).toBe("authorized");
+      gate.release = true;
+      await r1;
+    } finally {
+      Catalog.prototype.entry = real;
+    }
+    // R1 came back late, saw a newer write, read again: h's authorization stays.
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${name}/oauth`)).status).toBe("authorized");
+  });
+
+  it("a start for an incarnation a write already replaced is refused before anyone sees a consent screen", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    const g = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    fakes.set(g.id, g);
+    const c = await newClient([f.server, g.server]);
+    const old = (await putCap(c, "stale", f, { authorize: true })).mcp.auth.incarnation as string;
+    await putCap(c, "stale", g, { authorize: true });
+    // A start whose catalog read (in the Worker) came before the write, reaching BrokerDO after it.
+    await expect(Promise.resolve().then(() => broker().clientOAuthStart({ client: c.id, clientName: c.name, capability: `${c.name}/stale`, entry: "stale", incarnation: old, url: f.server })))
+      .rejects.toThrow("changed or went while this authorization was starting");
+    expect(await runInDurableObject(broker(), (_: BrokerDO, st) => st.storage.sql.exec("SELECT body FROM oauth_flows").toArray()
+      .filter((r) => String(r.body).includes(`client-oauth:${c.id}:stale:`)).length)).toBe(0);
+  });
+
+  it("the callback's catalog check alone: a capability gone with no revocation (one that never ran) gets no tokens", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "gone", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/gone/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    // Deleted in CatalogDO alone: no count moves, only the callback's question to the catalog can refuse.
+    await (env.CATALOG.get(env.CATALOG.idFromName("catalog")) as unknown as { deleteCapability(n: string): Promise<void> }).deleteCapability(`${c.name}/gone`);
+    expect(await (await SELF.fetch(back)).text()).toContain("revoked while its code was being exchanged");
+    expect(await entryRow(c, "gone")).toBeUndefined();
+  });
+
+  it("a write's revocation that finds the capability gone revokes every incarnation", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "race", f, { authorize: true });
+    await clientAuthorize(c, "race");
+    await (env.CATALOG.get(env.CATALOG.idFromName("catalog")) as unknown as { deleteCapability(n: string): Promise<void> }).deleteCapability(`${c.name}/race`);
+    await broker().clientOAuthRevoke(c.id, `${c.name}/race`, "race", { write: true });
+    expect(await entryRow(c, "race")).toBeUndefined();
+  });
+
+  it("a start straddling its client's deletion keeps no registration", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "straddle", f, { authorize: true });
+    f.holdDiscovery = true;
+    const started = as(c.token, `/v1/catalog/capabilities/${c.name}/straddle/oauth`, { method: "POST" });
+    await eventually("the start to reach discovery", () => f.discoveryHeld);
+    await broker().deleteClientSecrets(c.id);
+    f.holdDiscovery = false;
+    expect((await started).status).toBe(409);
+    expect(await runInDurableObject(broker(), (_: BrokerDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM oauth_clients WHERE redirect_uri = ?", `${NEST}/v1/oauth/callback/${c.id}`).toArray().length)).toBe(0);
+  });
+
+  it("the callback fails closed when CatalogDO can't answer", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "down", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/down/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    const { CatalogDO: Catalog } = await import("../src/do/catalog");
+    const real = Catalog.prototype.entry;
+    Catalog.prototype.entry = async function () {
+      throw new Error("catalog unavailable");
+    };
+    try {
+      expect(await (await SELF.fetch(back)).text()).toContain("Not authorized");
+    } finally {
+      Catalog.prototype.entry = real;
+    }
+    expect(await entryRow(c, "down")).toBeUndefined();
+  });
+
+  it("DELETE …/oauth while a person still has the authorize URL open: finishing it later stores nothing", async () => {
+    const f = new FakeAuth(rand(), { cimd: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "open", f, { authorize: true });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/open/oauth`, { method: "POST" });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/open/oauth`, { method: "DELETE" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    expect(await (await SELF.fetch(back)).text()).toContain("unknown or expired state");
+    expect(await entryRow(c, "open")).toBeUndefined();
+  });
+
+  it("deleting a client forgets its registrations, once its tokens are revoked", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: true, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "reg", f, { authorize: true });
+    await clientAuthorize(c, "reg");
+    const registrations = () => runInDurableObject(broker(), (_: BrokerDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM oauth_clients WHERE redirect_uri = ?", `${NEST}/v1/oauth/callback/${c.id}`).toArray().length);
+    expect(await registrations()).toBe(1);
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
+    await eventually("the deleted client's registration forgotten", async () => (await registrations()) === 0);
+    // Its token was revoked first, as the registered client.
+    expect(f.revocations).toHaveLength(1);
+  });
+
+  it("deleting the capability revokes its tokens, and so does deleting the client", async () => {
+    const f = new FakeAuth(rand(), { cimd: true, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "one", f, { authorize: true });
+    await putCap(c, "two", f, { authorize: true });
+    await clientAuthorize(c, "one");
+    await clientAuthorize(c, "two");
+    expect((await entryRow(c, "one"))!.status).toBe("authorized");
+
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/one`, { method: "DELETE" });
+    expect(await entryRow(c, "one")).toBeUndefined();
+    expect(f.revocations).toHaveLength(1);
+    // A capability made again under the name starts unauthorized.
+    await putCap(c, "one", f, { authorize: true });
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/one/oauth`)).status).toBe("unauthorized");
+
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
+    expect(await entryRow(c, "two")).toBeUndefined();
+    await eventually("the deleted client's tokens revoked at the server", () => f.revocations.length === 2);
   });
 });

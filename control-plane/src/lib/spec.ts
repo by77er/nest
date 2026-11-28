@@ -6,6 +6,7 @@
 import { z } from "zod";
 import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protocol/control";
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
+import { isClientMcpAuth } from "./mcp-auth";
 import { ClientInjections, type HeldInjection, holdInjections, narrowInjections } from "./client-secrets";
 import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, REMOVED_TOOL_NAMES, type BrokeredGrant, checkBrokered, grantOfEntry, StoredBrokeredSource } from "./brokered";
 import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
@@ -589,7 +590,7 @@ export function checkCapability(
     const idem = cap.mcp.idempotent;
     if (Array.isArray(idem) && new Set(idem).size !== idem.length) return err("mcp.idempotent lists a tool twice");
     const auth = cap.mcp.auth;
-    if (auth !== undefined && typeof auth !== "string" && auth.client === auth.oauth) return err("mcp.auth: the client secret and the token record must be different names");
+    if (auth !== undefined && typeof auth !== "string" && "oauth" in auth && auth.client === auth.oauth) return err("mcp.auth: the client secret and the token record must be different names");
   }
   if (cap.brokered) {
     const b = checkBrokered(cap.brokered, mcp?.allowLoopbackBrokered ?? false);
@@ -715,8 +716,16 @@ export function expandTemplate(
     const cap = catalog.capabilities[c]!;
     caps.push(cap);
     if (cap.mcp) {
-      const ns = c.includes("/") ? c.slice(0, c.indexOf("/")) : null;
-      const g = grantOf(mcpPrefix(c), cap.mcp, ns !== null && Object.hasOwn(clients, ns) ? clients[ns] : undefined);
+      const capNs = c.includes("/") ? c.slice(0, c.indexOf("/")) : null;
+      const owner = capNs !== null && Object.hasOwn(clients, capNs) ? clients[capNs] : undefined;
+      if (isClientMcpAuth(cap.mcp.auth)) {
+        // A client's own credential is that client's: never expanded where no client owns the namespace, and only
+        // for an agent joining that client's own subtree (`ns`), so a person's consent to the app never serves
+        // the operator's agents or another subtree's.
+        if (owner === undefined) return err(`template ${name}: capability ${c} names a client's own credential, and no client is named ${capNs ?? "(the operator's namespace)"}`);
+        if (ns !== capNs) return err(`template ${name}: capability ${c} holds ${capNs}'s own credential: only an agent of ${capNs}'s subtree uses it`);
+      }
+      const g = grantOf(mcpPrefix(c), cap.mcp, owner, capNs === null ? undefined : c.slice(capNs.length + 1));
       if (mcp.some((x) => x.capability === g.capability)) return err(`template ${name}: two mcp capabilities make tools named ${g.capability}_*`);
       mcp.push(g);
     }

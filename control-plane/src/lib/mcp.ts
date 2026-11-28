@@ -4,7 +4,7 @@
 // (sessions, the tool cache, the forward ledger, fencing and retries) is lib/mcp-proxy.ts.
 import { z } from "zod";
 import type { ToolContent, ToolDef } from "../protocol/control";
-import { CapRef, OAuthAuth, type OAuthGrant } from "./mcp-auth";
+import { CapRef, ClientOAuthAuth, ClientSecretAuth, clientMcpRef, isClientMcpAuth, OAuthAuth, type OAuthGrant } from "./mcp-auth";
 import { argsDigest, gated } from "./sinks";
 import { IDENTITY_HEADER } from "./identity";
 
@@ -41,6 +41,7 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
 /**
  * The `mcp` source of a capability (docs/agents/capabilities/#sources). `auth` names the BrokerDO secret
  * holding the bearer token (`cap:<name>`), or is the oauth form (`{oauth, client?, scopes?}`, lib/mcp-auth.ts),
+ * or, in a client's namespace only, one of the client's own forms (`{secret}`, `{authorize, scopes?}`: `ClientMcpAuth`),
  * or is absent: no bearer, and `Nest-Identity` is the only credential; `tools` is the allowlist (absent: every tool the server lists); `idempotent`
  * overrides the server's annotations (a list of tools that are, or a map of tool → whether it is);
  * `read_only` likewise marks the tools that aren't sinks; `trusted` (default false) means its list and
@@ -50,7 +51,7 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
  */
 export const McpSource = z.object({
   url: z.string().min(1).max(2048),
-  auth: z.union([CapRef, OAuthAuth]).optional(),
+  auth: z.union([CapRef, OAuthAuth, ClientSecretAuth, ClientOAuthAuth]).optional(),
   tools: z.array(McpToolName).max(MAX_TOOLS_PER_CAPABILITY).optional(),
   idempotent: ToolFlags.optional(),
   read_only: ToolFlags.optional(),
@@ -104,14 +105,33 @@ export const connectorName = (g: Pick<McpGrant, "url" | "auth" | "client">): str
 export const sameConnector = (a: Pick<McpGrant, "url" | "auth" | "client">, b: Pick<McpGrant, "url" | "auth" | "client">): boolean =>
   connectorName(a) === connectorName(b);
 
-/** What a spec keeps of capability `capability`'s source; `client`: whose namespace it is in (absent: the operator's). */
-export function grantOf(capability: string, src: McpSource, client?: string): McpGrant {
+/**
+ * What a spec keeps of capability `capability`'s source; `client`: whose namespace it is in (absent: the
+ * operator's), and `entry`: its name there. A client's own form (`{secret}`, `{authorize}`) becomes the record
+ * of that client it derives (`clientMcpRef`): a static bearer, or OAuth tokens. Throws for one without a client
+ * (expansion refuses that first).
+ */
+export function grantOf(capability: string, src: McpSource, client?: string, entry?: string): McpGrant {
   const auth = src.auth;
+  let ref: string | undefined;
+  let oauth: OAuthGrant | undefined;
+  if (auth === undefined) {
+    ref = undefined;
+  } else if (typeof auth === "string") {
+    ref = auth;
+  } else if (isClientMcpAuth(auth)) {
+    if (!client || !entry) throw new Error(`${capability}: a client's own mcp credential outside a client's namespace`);
+    ref = clientMcpRef(client, entry, auth);
+    if ("authorize" in auth) oauth = { client: null, scopes: auth.scopes ? [...auth.scopes] : null };
+  } else {
+    ref = auth.oauth;
+    oauth = { client: auth.client ?? null, scopes: auth.scopes ? [...auth.scopes] : null };
+  }
   return {
     capability,
     url: src.url,
-    ...(auth === undefined ? {} : { auth: typeof auth === "string" ? auth : auth.oauth }),
-    ...(auth === undefined || typeof auth === "string" ? {} : { oauth: { client: auth.client ?? null, scopes: auth.scopes ? [...auth.scopes] : null } }),
+    ...(ref === undefined ? {} : { auth: ref }),
+    ...(oauth ? { oauth } : {}),
     tools: src.tools ? [...src.tools] : null,
     idempotent: flags(src.idempotent),
     read_only: flags(src.read_only),

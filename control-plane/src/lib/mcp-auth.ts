@@ -9,6 +9,7 @@
 // `mcpBearer` is the one function the MCP proxy asks for a server's bearer.
 import { z } from "zod";
 import { ErrorCodes } from "../protocol/model";
+import { CLIENT_SECRET_PREFIX, ClientSecretName, clientSecretKey } from "./client-secrets";
 import { storedEnum } from "./stored";
 import { b64url, NestError } from "./util";
 import type { McpGrant } from "./mcp";
@@ -26,6 +27,54 @@ export const Scopes = z.array(Scope).min(1).max(32);
  */
 export const OAuthAuth = z.strictObject({ oauth: CapRef, client: CapRef.optional(), scopes: Scopes.optional() });
 export type OAuthAuth = z.output<typeof OAuthAuth>;
+
+/**
+ * An API client's own credential for an mcp capability in its namespace (docs/control-plane/api/clients/#mcp-credentials):
+ * - `{secret}`: one of its own secrets (`PUT /v1/clients/self/secrets/<name>`) is the static bearer;
+ * - `{authorize: true, scopes?}`: nest keeps OAuth tokens for it, which the client authorizes itself
+ *   (`POST /v1/catalog/capabilities/<ns>/<entry>/oauth`), as the operator does for `{oauth}`.
+ * Neither names a BrokerDO record: expansion derives the record from the namespace's client and the entry
+ * (`clientMcpRef`), so a client can only ever reach its own. Never in the operator's namespace.
+ */
+export const ClientSecretAuth = z.strictObject({ secret: ClientSecretName });
+/**
+ * `incarnation` is CatalogDO's, never the client's: a random id it sets when the capability is written with
+ * this form (kept while its URL and form stay), so a capability deleted and made again under the entry, or one
+ * authorized by a flow still in flight when it went, never inherits an earlier authorization.
+ */
+export const ClientOAuthAuth = z.strictObject({ authorize: z.literal(true), scopes: Scopes.optional(), incarnation: z.string().regex(/^[a-z0-9]{8,32}$/).optional() });
+export type ClientMcpAuth = z.output<typeof ClientSecretAuth> | z.output<typeof ClientOAuthAuth>;
+
+/** Where BrokerDO keeps the OAuth tokens of a client's `{authorize}` capability: per client id, entry and incarnation. */
+export const CLIENT_OAUTH_PREFIX = "client-oauth:";
+export const clientOAuthRef = (client: string, entry: string, incarnation: string) => `${clientOAuthEntryPrefix(client, entry)}${incarnation}`;
+/** Every record of one entry of a client's, whatever its incarnation (entries hold no `:`). */
+export const clientOAuthEntryPrefix = (client: string, entry: string) => `${CLIENT_OAUTH_PREFIX}${client}:${entry}:`;
+/** Every record of a client's. */
+export const clientOAuthClientPrefix = (client: string) => `${CLIENT_OAUTH_PREFIX}${client}:`;
+
+/** Whether an `auth` is one of a client's own forms. */
+export const isClientMcpAuth = (a: unknown): a is ClientMcpAuth =>
+  typeof a === "object" && a !== null && ("secret" in a || "authorize" in a);
+
+/**
+ * The BrokerDO record a client's own form names, for the capability `<ns>/<entry>` of client `client`:
+ * its secret's key, or its OAuth token record.
+ */
+export function clientMcpRef(client: string, entry: string, a: ClientMcpAuth): string {
+  return "secret" in a ? clientSecretKey(client, a.secret) : clientOAuthRef(client, entry, a.incarnation ?? "0");
+}
+
+/** The client a record of a client's own belongs to (`cli_…`), or null for an operator's `cap:` record. */
+export function clientOfRef(ref: string): string | null {
+  for (const prefix of [CLIENT_SECRET_PREFIX, CLIENT_OAUTH_PREFIX]) {
+    if (ref.startsWith(prefix)) {
+      const m = /^(cli_[A-Za-z0-9]+):./.exec(ref.slice(prefix.length));
+      return m ? m[1]! : null;
+    }
+  }
+  return null;
+}
 
 /** What an agent's spec keeps of the oauth form (`McpGrant.oauth`); the token record is `McpGrant.auth`. */
 export interface OAuthGrant {
@@ -285,21 +334,32 @@ async function authServerMetadata(issuer: URL, allowLoopback: boolean): Promise<
 
 // --- Client identity -------------------------------------------------------------------------------------------
 
-/** The Worker's OAuth URLs: the redirect URI, and the client ID metadata document (which is the client id). */
-export function oauthUrls(publicBaseUrl: string): { redirect_uri: string; client_id: string } {
+/**
+ * The Worker's OAuth URLs (the redirect URI, and the client ID metadata document, which is the client id): nest's
+ * OAuth client identity for a flow: the operator's own, or, for an API client's capability, that
+ * client's (`owner`, its id), with a callback and a metadata document of its own. So an authorization server
+ * sees each app as a client of its own: consent given to one never lets another app's flow through unasked,
+ * and a registration (keyed by its redirect URI) is never shared between them (docs/control-plane/api/clients/#mcp-credentials).
+ */
+export function oauthUrls(publicBaseUrl: string, owner?: string): { redirect_uri: string; client_id: string } {
   const base = publicBaseUrl.replace(/\/$/, "");
-  return { redirect_uri: `${base}/v1/oauth/callback`, client_id: `${base}/v1/oauth/client.json` };
+  return owner
+    ? { redirect_uri: `${base}/v1/oauth/callback/${owner}`, client_id: `${base}/v1/oauth/clients/${owner}.json` }
+    : { redirect_uri: `${base}/v1/oauth/callback`, client_id: `${base}/v1/oauth/client.json` };
 }
+
+/** The name an authorization server shows for a client's flows: the app's, marked as through nest. */
+export const ownerClientName = (name: string) => `${name} (via nest)`;
 
 /**
  * The client ID metadata document (draft-ietf-oauth-client-id-metadata-document-00; the spec requires
  * `client_id` equal to its URL, `client_name` and `redirect_uris`): a public client, authorization code and refresh.
  */
-export function clientMetadataDocument(publicBaseUrl: string) {
-  const u = oauthUrls(publicBaseUrl);
+export function clientMetadataDocument(publicBaseUrl: string, owner?: { id: string; name: string }) {
+  const u = oauthUrls(publicBaseUrl, owner?.id);
   return {
     client_id: u.client_id,
-    client_name: "nest",
+    client_name: owner ? ownerClientName(owner.name) : "nest",
     redirect_uris: [u.redirect_uri],
     grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
@@ -356,12 +416,12 @@ function defaultMethod(hasSecret: boolean, supported: string[] | null): string {
 }
 
 /** RFC 7591 §3: register nest's redirect URI as a public client (or whatever the AS hands back). */
-export async function registerClient(as: AuthServer, redirectUri: string): Promise<OAuthClient> {
+export async function registerClient(as: AuthServer, redirectUri: string, clientName = "nest"): Promise<OAuthClient> {
   const r = await exchange(as.registration_endpoint!, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify({
-      client_name: "nest", redirect_uris: [redirectUri], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"],
+      client_name: clientName, redirect_uris: [redirectUri], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"],
       token_endpoint_auth_method: "none",
     }),
   });
@@ -505,9 +565,16 @@ export interface StoreDeps {
   audit(r: OAuthAudit): void;
   publicBaseUrl: string;
   allowLoopback: boolean;
+  /**
+   * The incarnation a client's `{authorize}` capability (`<ns>/<entry>`) holds now in CatalogDO, or null (gone, or
+   * another form). A callback stores a client's tokens only when it is theirs, in the step after the answer.
+   */
+  incarnationOf?(capability: string): Promise<string | null>;
 }
 
 export interface StartInput {
+  /** The API client whose flow this is (its id and name): its own client identity. Absent: the operator's. */
+  owner?: { id: string; name: string };
   capability: string;
   url: string;
   auth: OAuthAuth;
@@ -540,7 +607,9 @@ export interface OAuthStatus {
   reason?: string | null;
 }
 
-const startRoute = (capability: string) => `POST /v1/admin/capabilities/${capability}/oauth`;
+/** Who authorizes a record, and where: the operator for `cap:` records, the client for its own. */
+const startRoute = (capability: string, ref: string) =>
+  ref.startsWith(CLIENT_OAUTH_PREFIX) ? `its client: POST /v1/catalog/capabilities/${capability}/oauth` : `the operator: POST /v1/admin/capabilities/${capability}/oauth`;
 
 export class OAuthStore {
   /** Refreshes in flight, by token record: concurrent callers share one, so a rotated refresh token is spent once. */
@@ -590,9 +659,15 @@ export class OAuthStore {
    * opens. The PKCE verifier stays in the flow row; the `state` names it, is single use, and lasts 10 minutes.
    */
   async start(input: StartInput, caller: string): Promise<StartAnswer> {
+    // A revoke (of the capability, or of its client's records) while this start awaits discovery or
+    // registration finds no flow to delete yet: seen here by its count, and the flow is never written.
+    const revokedBefore = this.revocationsOf({ capability: input.capability, ref: input.auth.oauth });
+    const writesBefore = this.writesOf(input.auth.oauth);
     const server = checkOAuthUrl(input.url, this.d.allowLoopback, "the server URL");
+    // A client's record only through its own identity, and only its own record (BrokerDO derives both).
+    if ((clientOfRef(input.auth.oauth) ?? undefined) !== input.owner?.id) throw oauthError(`${input.auth.oauth} isn't a record of ${input.owner?.id ?? "the operator"}`, 403);
     const found = await discover(server, this.d.allowLoopback);
-    const { redirect_uri, client_id } = oauthUrls(this.d.publicBaseUrl);
+    const { redirect_uri, client_id } = oauthUrls(this.d.publicBaseUrl, input.owner?.id);
     let client: ClientRef;
     let id: string;
     if (input.auth.client) {
@@ -607,7 +682,11 @@ export class OAuthStore {
       if (known) {
         id = (JSON.parse(known.client) as OAuthClient).client_id;
       } else {
-        const registered = await registerClient(found.as, redirect_uri);
+        const registered = await registerClient(found.as, redirect_uri, input.owner ? ownerClientName(input.owner.name) : "nest");
+        // A client deleted (or its capability revoked) while registering: its registration is never kept.
+        if (this.revocationsOf({ capability: input.capability, ref: input.auth.oauth }) !== revokedBefore) {
+          throw oauthError(`${input.capability}'s authorization was revoked while this one was starting: start again`, 409);
+        }
         // Another start may have registered across the await: the first stored registration wins.
         const again = this.d.sql.exec<{ client: string }>("SELECT client FROM oauth_clients WHERE issuer = ? AND redirect_uri = ?", found.as.issuer, redirect_uri).toArray()[0];
         if (again) {
@@ -631,6 +710,15 @@ export class OAuthStore {
       capability: input.capability, ref: input.auth.oauth, server_url: input.url, resource: found.resource, issuer: found.as.issuer,
       token_endpoint: found.as.token_endpoint, iss_parameter: found.as.iss_parameter, client, verifier, redirect_uri, scopes,
     };
+    // A client's flow only for the incarnation its capability holds now: a start whose catalog read (in the
+    // Worker) a delete or a new URL overtook before it got here sends nobody to a consent screen for nothing.
+    if (flow.ref.startsWith(CLIENT_OAUTH_PREFIX) && this.d.incarnationOf) {
+      const current = await this.d.incarnationOf(input.capability).catch(() => null);
+      if (current !== flow.ref.slice(flow.ref.lastIndexOf(":") + 1)) throw oauthError(`${input.capability} changed or went while this authorization was starting: start again`, 409);
+    }
+    if (this.revocationsOf(flow) !== revokedBefore || this.overtakenByWrite(flow.ref, writesBefore)) {
+      throw oauthError(`${input.capability}'s authorization was revoked while this one was starting: start again`, 409);
+    }
     this.d.sql.exec("DELETE FROM oauth_flows WHERE expires_ms <= ?", now);
     this.d.sql.exec("INSERT INTO oauth_flows (state, body, expires_ms) VALUES (?, ?, ?)", state, JSON.stringify(flow), now + OAUTH_FLOW_TTL_MS);
     this.d.audit({ event: "oauth_start", capability: input.capability, ref: input.auth.oauth, resource: found.resource, issuer: found.as.issuer, client: id, scope: scopes?.join(" ") ?? null, caller });
@@ -645,7 +733,7 @@ export class OAuthStore {
    * state works once; the code is exchanged with the flow's verifier, and the tokens replace any
    * stored for its capability. The answer is for a browser: it never holds a token.
    */
-  async callback(q: { state?: string; code?: string; error?: string; iss?: string }, caller: string): Promise<{ ok: boolean; capability: string | null; message: string }> {
+  async callback(q: { state?: string; code?: string; error?: string; iss?: string }, caller: string, owner?: string): Promise<{ ok: boolean; capability: string | null; message: string }> {
     const refuse = (message: string, flow?: Flow) => {
       this.d.audit({ event: "oauth_callback_refused", ...(flow ? { capability: flow.capability, ref: flow.ref, issuer: flow.issuer } : {}), caller, reason: message });
       return { ok: false, capability: flow?.capability ?? null, message };
@@ -655,6 +743,8 @@ export class OAuthStore {
     this.d.sql.exec("DELETE FROM oauth_flows WHERE state = ?", q.state);
     if (!row || row.expires_ms <= Date.now()) return refuse("unknown or expired state: start the authorization again");
     const flow = JSON.parse(row.body) as Flow;
+    // Each client's flows come back to its own callback, the operator's to nest's: a state never crosses them.
+    if ((clientOfRef(flow.ref) ?? undefined) !== owner) return refuse("this authorization came back to another client's callback", flow);
     // RFC 9207: an `iss` that doesn't match is a mix-up; one the AS promised must be there.
     if ((q.iss !== undefined || flow.iss_parameter) && q.iss !== flow.issuer) return refuse(`the response's iss is ${q.iss ?? "missing"}, not ${flow.issuer}`, flow);
     if (q.error) return refuse(`the authorization server answered ${q.error.slice(0, 64)}`, flow);
@@ -662,12 +752,19 @@ export class OAuthStore {
     const client = this.client(flow.client, null);
     // A revoke that lands while the code is being exchanged finds no flow row (it went above) and no
     // record yet: it is seen here by its count, read before the await and again after.
-    const revokedBefore = this.revocations.get(flow.capability) ?? 0;
+    const revokedBefore = this.revocationsOf(flow);
+    const writesBefore = this.writesOf(flow.ref);
     const a = await tokenRequest(flow.token_endpoint, client, {
       grant_type: "authorization_code", code: q.code, redirect_uri: flow.redirect_uri, code_verifier: flow.verifier, resource: flow.resource,
     });
     if (a.kind !== "tokens") return refuse(`the token endpoint ${a.kind === "refused" ? `refused the code (${a.error})` : `gave no answer (${a.why})`}`, flow);
-    if ((this.revocations.get(flow.capability) ?? 0) !== revokedBefore) {
+    // A client's record is stored only while its capability still holds the incarnation it is for: a delete, a
+    // new URL or form since the start (whose revocation may have run before this flow existed) means never.
+    const incarnation = flow.ref.startsWith(CLIENT_OAUTH_PREFIX) ? flow.ref.slice(flow.ref.lastIndexOf(":") + 1) : null;
+    const held = incarnation === null || !this.d.incarnationOf ? true : (await this.d.incarnationOf(flow.capability).catch(() => null)) === incarnation;
+    // A write's revocation that ran across these awaits, keeping another incarnation, outranks the answer above
+    // (it may have been on its way back while the write landed).
+    if (!held || this.revocationsOf(flow) !== revokedBefore || this.overtakenByWrite(flow.ref, writesBefore)) {
       // Revoked meanwhile: these tokens are never stored, and are revoked at the server where it can be.
       const r = await this.revokeAtServer({ issuer: flow.issuer, client: flow.client, refresh_token: a.refresh_token, access_token: a.access_token });
       return refuse(`${flow.capability}'s authorization was revoked while its code was being exchanged; the new tokens were dropped (at the server: ${r.server})`, flow);
@@ -704,11 +801,15 @@ export class OAuthStore {
       this.d.audit({ event: "oauth_token_refused", ref, ...(row ? { capability: row.capability, issuer: row.issuer } : {}), caller, reason: message });
       throw new NestError(code, message, status, retryable);
     };
-    if (!row) return deny(ErrorCodes.FORBIDDEN, 409, `no OAuth authorization stored as ${ref}: the operator authorizes the capability (POST /v1/admin/capabilities/<name>/oauth)`);
-    if (row.server_url !== serverUrl) {
-      return deny(ErrorCodes.FORBIDDEN, 409, `the OAuth tokens stored as ${ref} are for ${row.server_url}, not ${serverUrl}: authorize again (${startRoute(row.capability)})`);
+    if (!row) {
+      return deny(ErrorCodes.FORBIDDEN, 409, ref.startsWith(CLIENT_OAUTH_PREFIX)
+        ? `no OAuth authorization stored as ${ref}: its client authorizes the capability (POST /v1/catalog/capabilities/<ns>/<entry>/oauth)`
+        : `no OAuth authorization stored as ${ref}: the operator authorizes the capability (POST /v1/admin/capabilities/<name>/oauth)`);
     }
-    if (row.status === "reauthorize") return deny(ErrorCodes.UNAUTHORIZED, 401, `${row.capability} needs the operator to authorize it again (${startRoute(row.capability)}): ${row.reason ?? "its tokens were refused"}`);
+    if (row.server_url !== serverUrl) {
+      return deny(ErrorCodes.FORBIDDEN, 409, `the OAuth tokens stored as ${ref} are for ${row.server_url}, not ${serverUrl}: authorize again (${startRoute(row.capability, ref)})`);
+    }
+    if (row.status === "reauthorize") return deny(ErrorCodes.UNAUTHORIZED, 401, `${row.capability} needs authorizing again, by ${startRoute(row.capability, ref)}: ${row.reason ?? "its tokens were refused"}`);
     const now = Date.now();
     const fresh = row.access_token !== null && (row.access_expires_ms === null || row.access_expires_ms - now > OAUTH_REFRESH_SKEW_MS);
     if (fresh && row.access_token !== refused) return row.access_token;
@@ -746,8 +847,79 @@ export class OAuthStore {
     return out;
   }
 
+  /**
+   * Revoke every record whose ref starts with `prefix` (a client's own: one entry's, any incarnation, or all of
+   * a client's), and every flow started for one: they go in this call's first, synchronous step (so a caller
+   * that doesn't await still has them gone), then each record's tokens are revoked at its authorization
+   * server, best effort, as `revoke` does. `bump`: the capability or client whose count a start or callback in
+   * flight reads (their flow rows may be gone already, and their record not written yet).
+   */
+  async revokePrefix(prefix: string, caller: string, bump: { capability?: string; client?: string; write?: boolean }, keep?: string): Promise<{ ref: string; issuer: string; server: ServerRevocation }[]> {
+    // `keep`: a record (and its flows) that stays, the capability's current incarnation's.
+    const owned = (ref: string) => ref.startsWith(prefix) && ref !== keep;
+    // A write's revocation: a start or callback of this entry in flight across it stores nothing unless it is for `keep`.
+    if (bump.write) this.writeRevocations.set(prefix, { count: (this.writeRevocations.get(prefix)?.count ?? 0) + 1, keep: keep ?? null });
+    if (bump.client) this.clientRevocations.set(bump.client, (this.clientRevocations.get(bump.client) ?? 0) + 1);
+    if (bump.capability) this.revocations.set(bump.capability, (this.revocations.get(bump.capability) ?? 0) + 1);
+    const refs = this.d.sql.exec<{ ref: string }>("SELECT ref FROM oauth_grants").toArray().map((r) => r.ref).filter(owned);
+    const rows = refs.map((ref) => this.grant(ref)!);
+    for (const ref of refs) this.d.sql.exec("DELETE FROM oauth_grants WHERE ref = ?", ref);
+    for (const f of this.d.sql.exec<{ state: string; body: string }>("SELECT state, body FROM oauth_flows").toArray()) {
+      const flow = JSON.parse(f.body) as { ref?: string };
+      if (typeof flow.ref === "string" && owned(flow.ref)) this.d.sql.exec("DELETE FROM oauth_flows WHERE state = ?", f.state);
+    }
+    const out: { ref: string; issuer: string; server: ServerRevocation }[] = [];
+    for (const row of rows) {
+      const { server, reason } = await this.revokeAtServer(row);
+      this.d.audit({ event: "oauth_revoked", capability: row.capability, ref: row.ref, issuer: row.issuer, caller, reason: reason ? `${server}: ${reason.slice(0, 200)}` : server });
+      out.push({ ref: row.ref, issuer: row.issuer, server });
+    }
+    return out;
+  }
+
   /** Revocations per capability since this object started (memory: a reset ends any callback in flight too). */
   private readonly revocations = new Map<string, number>();
+  /** Revocations of every record of an API client (`revokePrefix` with a client), by client id, since this object started. */
+  private readonly clientRevocations = new Map<string, number>();
+
+  /**
+   * Forget the registrations made for one redirect URI: a deleted API client's own (`oauthUrls` with its id), once
+   * its records' tokens were revoked (revoking authenticates as the registered client). Answers how many went.
+   */
+  forgetRegistrations(redirectUri: string): number {
+    return this.d.sql.exec("DELETE FROM oauth_clients WHERE redirect_uri = ?", redirectUri).rowsWritten;
+  }
+
+  /** Writes' revocations per client entry (`clientOAuthEntryPrefix`), and the record each kept, since this object started. */
+  private readonly writeRevocations = new Map<string, { count: number; keep: string | null }>();
+
+  private entryPrefixOf(ref: string): string | null {
+    return ref.startsWith(CLIENT_OAUTH_PREFIX) ? ref.slice(0, ref.lastIndexOf(":") + 1) : null;
+  }
+
+  /** How many writes' revocations reached a client entry (`clientOAuthEntryPrefix`). */
+  writesOfEntry(prefix: string): number {
+    return this.writeRevocations.get(prefix)?.count ?? 0;
+  }
+
+  /** How many writes' revocations reached `ref`'s entry (0 for an operator's record). */
+  private writesOf(ref: string): number {
+    const p = this.entryPrefixOf(ref);
+    return p === null ? 0 : (this.writeRevocations.get(p)?.count ?? 0);
+  }
+
+  /** Whether a write's revocation of `ref`'s entry ran since `before`, keeping another record than `ref`. */
+  private overtakenByWrite(ref: string, before: number): boolean {
+    const p = this.entryPrefixOf(ref);
+    const w = p === null ? undefined : this.writeRevocations.get(p);
+    return !!w && w.count !== before && w.keep !== ref;
+  }
+
+  /** Revocations that reach a flow: of its capability, and of its client's records when it is a client's. */
+  private revocationsOf(flow: Pick<Flow, "capability" | "ref">): number {
+    const client = clientOfRef(flow.ref);
+    return (this.revocations.get(flow.capability) ?? 0) + (client === null ? 0 : (this.clientRevocations.get(client) ?? 0));
+  }
 
   /**
    * Best effort, RFC 7009: revoke the refresh token (else the access token) at its authorization server,
@@ -771,7 +943,7 @@ export class OAuthStore {
     this.d.sql.exec(`UPDATE oauth_grants SET status = 'reauthorize', reason = ?, access_token = NULL, refresh_token = NULL, updated_ms = ?
       WHERE ref = ? AND generation = ?`, reason, Date.now(), row.ref, row.generation);
     this.d.audit({ event: "oauth_refresh_failed", capability: row.capability, ref: row.ref, issuer: row.issuer, caller, reason });
-    throw new NestError(ErrorCodes.UNAUTHORIZED, `${row.capability} needs the operator to authorize it again (${startRoute(row.capability)}): ${reason}`, 401);
+    throw new NestError(ErrorCodes.UNAUTHORIZED, `${row.capability} needs authorizing again, by ${startRoute(row.capability, row.ref)}: ${reason}`, 401);
   }
 
   private async refresh(ref: string, caller: string): Promise<string> {

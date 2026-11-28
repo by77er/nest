@@ -4,7 +4,7 @@ import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
-import { type OAuthAudit, type OAuthStatus, OAuthStore, type ServerRevocation, type StartAnswer, type StartInput } from "../lib/mcp-auth";
+import { CLIENT_OAUTH_PREFIX, clientOAuthClientPrefix, isClientMcpAuth, oauthUrls, clientOAuthEntryPrefix, clientOAuthRef, clientOfRef, type OAuthAudit, type OAuthStatus, OAuthStore, type ServerRevocation, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import { isClientId } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
@@ -140,6 +140,8 @@ export class BrokerDO extends DurableObject<Env> {
       audit: (r) => this.audit(r),
       publicBaseUrl: env.PUBLIC_BASE_URL,
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
+      // CatalogDO holds the capability; a callback asks it, then stores in the next synchronous step.
+      incarnationOf: (capability) => this.incarnationOf(capability),
     });
   }
 
@@ -163,8 +165,8 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   /** The authorization server's redirect through the Worker's callback route (no admin token: the state is the proof). */
-  async oauthCallback(q: { state?: string; code?: string; error?: string; iss?: string }): Promise<{ ok: boolean; capability: string | null; message: string }> {
-    return await this.oauth.callback(q, "callback");
+  async oauthCallback(q: { state?: string; code?: string; error?: string; iss?: string }, owner?: string): Promise<{ ok: boolean; capability: string | null; message: string }> {
+    return await this.oauth.callback(q, "callback", owner);
   }
 
   /**
@@ -172,7 +174,10 @@ export class BrokerDO extends DurableObject<Env> {
    * needed; the refresh token never leaves BrokerDO. See `OAuthStore.token`.
    */
   async mcpOAuthToken(ref: string, serverUrl: string, refused?: string): Promise<string | null> {
-    if (!/^cap:./.test(ref)) throw new NestError(ErrorCodes.FORBIDDEN, `${ref} is not a capability credential`, 403);
+    // An operator's record, or an API client's own (docs/control-plane/api/clients/#mcp-credentials).
+    if (!/^cap:./.test(ref) && !(ref.startsWith(CLIENT_OAUTH_PREFIX) && clientOfRef(ref) !== null)) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `${ref} is not a capability credential`, 403);
+    }
     return await this.oauth.token(ref, serverUrl, refused, "AgentDO");
   }
 
@@ -181,9 +186,68 @@ export class BrokerDO extends DurableObject<Env> {
     return this.oauth.status(ref);
   }
 
-  /** The operator revokes a capability's OAuth authorizations (`OAuthStore.revoke`): gone here at once, revoked at the AS where it can be. */
-  async oauthRevoke(capability: string): Promise<{ revoked: { ref: string; issuer: string; server: ServerRevocation }[] }> {
-    return { revoked: await this.oauth.revoke(capability, "operator") };
+  /**
+   * Revoke a capability's OAuth authorizations (`OAuthStore.revoke`): gone here at once, revoked at the AS
+   * where it can be. `caller`: the operator, or the API client whose namespace the capability is in.
+   */
+  async oauthRevoke(capability: string, caller = "operator"): Promise<{ revoked: { ref: string; issuer: string; server: ServerRevocation }[] }> {
+    return { revoked: await this.oauth.revoke(capability, caller) };
+  }
+
+  /** The incarnation a client's `{authorize}` capability holds now in CatalogDO, or null (gone, or another form). */
+  private async incarnationOf(capability: string): Promise<string | null> {
+    let cap: unknown;
+    try {
+      cap = await this.env.CATALOG.get(this.env.CATALOG.idFromName("catalog")).entry("capabilities", capability);
+    } catch (e) {
+      if ((e as { status?: number } | null)?.status === 404 || /unknown capability/.test(String(e))) return null;
+      throw e;
+    }
+    const auth = (cap as { mcp?: { auth?: unknown } } | undefined)?.mcp?.auth;
+    return isClientMcpAuth(auth) && "authorize" in auth ? (auth.incarnation ?? "0") : null;
+  }
+
+  /**
+   * An API client starts authorizing an mcp capability of its own namespace (`{authorize}` auth,
+   * docs/control-plane/api/clients/#mcp-credentials): as `oauthStart`, its tokens kept under the record
+   * derived from the client and the entry, never one it names.
+   */
+  async clientOAuthStart(input: { client: string; clientName: string; capability: string; entry: string; incarnation: string; url: string; scopes?: string[]; capScopes?: string[]; caller?: string }): Promise<StartAnswer> {
+    const auth = { oauth: clientOAuthRef(input.client, input.entry, input.incarnation), ...(input.capScopes ? { scopes: input.capScopes } : {}) };
+    return await this.oauth.start({
+      owner: { id: input.client, name: input.clientName }, capability: input.capability, url: input.url, auth, ...(input.scopes ? { scopes: input.scopes } : {}),
+    }, input.caller ?? input.client);
+  }
+
+  /**
+   * An API client revokes its own capability's authorizations: every record of the entry, whatever its
+   * incarnation, so it works after the capability was deleted and never touches a record of another client's.
+   * A start or callback in flight for it stores nothing.
+   */
+  async clientOAuthRevoke(client: string, capability: string, entry: string, o?: { write: true; caller?: string }, caller = client): Promise<{ revoked: { ref: string; issuer: string; server: ServerRevocation }[] }> {
+    // A write (`o`) revokes every incarnation but the one the capability holds now, as CatalogDO says it (read
+    // here, not taken from the caller, so a write's revocation that arrives late never takes a newer
+    // authorization), and a start or callback in flight for another incarnation stores nothing. A delete
+    // revokes all, and cancels everything in flight for the capability.
+    if (o) {
+      const prefix = clientOAuthEntryPrefix(client, entry);
+      // Another write's revocation may run while CatalogDO answers (it ran on a newer catalog read): then the
+      // answer is stale, and is read again, so this one never takes what a newer write kept.
+      for (;;) {
+        const before = this.oauth.writesOfEntry(prefix);
+        const current = await this.incarnationOf(capability);
+        if (this.oauth.writesOfEntry(prefix) !== before) continue;
+        const keep = current === null ? undefined : clientOAuthRef(client, entry, current);
+        // `revokePrefix` deletes in its first synchronous step: nothing runs between this check and that.
+        return { revoked: await this.oauth.revokePrefix(prefix, o.caller ?? client, { write: true }, keep) };
+      }
+    }
+    return { revoked: await this.oauth.revokePrefix(clientOAuthEntryPrefix(client, entry), caller, { capability }) };
+  }
+
+  /** What an API client may see of its own capability's authorization (its current incarnation's): never a token. */
+  async clientOAuthStatus(client: string, entry: string, incarnation: string): Promise<OAuthStatus> {
+    return this.oauth.status(clientOAuthRef(client, entry, incarnation));
   }
 
   /**
@@ -372,7 +436,12 @@ export class BrokerDO extends DurableObject<Env> {
    * Null when none is stored.
    */
   async capabilityToken(ref: string): Promise<string | null> {
-    if (!/^cap:./.test(ref)) throw new NestError(ErrorCodes.FORBIDDEN, `${ref} is not a capability credential`, 403);
+    // An operator's `cap:` secret, or an API client's own secret its capability names as the bearer
+    // (`{secret}`, docs/control-plane/api/clients/#mcp-credentials): expansion derived the key from the
+    // capability's own client, so it is never another client's. An expired one is no bearer.
+    if (!/^cap:./.test(ref) && !(ref.startsWith(CLIENT_SECRET_PREFIX) && clientOfRef(ref) !== null)) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `${ref} is not a capability credential`, 403);
+    }
     return this.secret(ref)?.value ?? null;
   }
 
@@ -443,8 +512,16 @@ export class BrokerDO extends DurableObject<Env> {
       .map((r) => this.clientSecretView(client, r.name)!);
   }
 
-  /** A deleted client's secrets, all of them. */
+  /** A deleted client's secrets, all of them, and its own OAuth authorizations (revoked at their servers in the background). */
   async deleteClientSecrets(client: string): Promise<number> {
+    // Its records go in this call's synchronous first step; the revocations at the servers follow.
+    // Then its own registrations (one per authorization server it used), once the revocations, which
+    // authenticate as them, are done: nothing of a deleted client's is left in `oauth_clients`.
+    this.ctx.waitUntil(this.oauth.revokePrefix(clientOAuthClientPrefix(client), "client_deleted", { client }).then(() => {
+      this.oauth.forgetRegistrations(oauthUrls(this.env.PUBLIC_BASE_URL, client).redirect_uri);
+    }, (e: unknown) => {
+      console.error("BrokerDO: revoking a deleted client's OAuth tokens", e);
+    }));
     const names = this.sql.exec<{ name: string }>("SELECT name FROM client_secrets WHERE client = ?", client).toArray().map((r) => r.name);
     for (const name of names) this.sql.exec("DELETE FROM secrets WHERE name = ?", clientSecretKey(client, name));
     this.sql.exec("DELETE FROM client_secrets WHERE client = ?", client);

@@ -6,8 +6,10 @@
 
 **No GitHub in this interface (decided 2026-11-12; built 2026-11-15, phases C1 and C3):** a grant holds no GitHub authority ([below](#no-github-authority)), and nest mints no GitHub token for a client or a sandbox, nor says which repos it may reach ([no repo tokens](../../../sandbox/networking/egress/policy/#no-repo-tokens)). An app does the same on generic primitives: its own GitHub App, its tokens as [secrets](#secrets) that expire and are pushed on write, and its own request guards ([principle 10](../../../README.md#principles)).
 
+**Built (2026-11-27):** [mcp credentials of a client's own](#mcp-credentials): its secret as a capability's bearer, and OAuth it authorizes itself.
+
 **How the built parts read the grant** (each a choice the design left open):
-- **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. The model credential is checked again at each brain start against the grant as it is then, and a client's agent runs only on that credential: if it isn't stored (or has expired) the start is refused, never moved to the operator's default token ([BrokerDO](../../durable-objects/broker/), 2026-11-06). So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
+- **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. The exception is a client's own record ([mcp credentials](#mcp-credentials)), which no grant field names: it must be the capability's own client's. The model credential is checked again at each brain start against the grant as it is then, and a client's agent runs only on that credential: if it isn't stored (or has expired) the start is refused, never moved to the operator's default token ([BrokerDO](../../durable-objects/broker/), 2026-11-06). So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
 - **Brokered actions:** none is within a grant. An http profile names a URL and a credential no field covers.
 - **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT|DELETE /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
 - **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
@@ -86,12 +88,47 @@ The checks:
 | `DELETE` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
 | `GET` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
 | `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (`mcp_urls`, `credentials`, brokered actions). Its `rules` reach the live agents of its subtree that list it ([live rules](../../durable-objects/catalog/#live-rules)); a refused write reaches none. |
-| `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. The live agents that read its rules have none of them from then on. |
+| `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. The live agents that read its rules have none of them from then on. An `{authorize}` capability's OAuth tokens are revoked with it ([mcp credentials](#mcp-credentials)). |
+| `POST` | `/v1/catalog/capabilities/<ns>/<entry>/oauth` | Namespace. Its `auth` must be `{authorize}` (409), its URL still within `mcp_urls` (403) ([mcp credentials](#mcp-credentials)). |
+| `GET` | `/v1/catalog/capabilities/<ns>/<entry>/oauth` | Namespace, as `POST`. |
+| `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>/oauth` | Namespace. By the record alone: it works after the capability is deleted. |
 | `GET` | `/v1/clients/self` | Self. |
 | `PUT` | `/v1/clients/self/webhook` | Self ([events](#events-to-the-owner)). |
 | `GET` | `/v1/clients/self/secrets` | Self ([secrets](#secrets)). |
 | `PUT` | `/v1/clients/self/secrets/<name>` | Self. Within `secrets`. |
 | `DELETE` | `/v1/clients/self/secrets/<name>` | Self. |
+
+## MCP credentials
+
+**Decided (2026-11-27, the owner's):** an app connects its users' external services for its agents without the operator, so a client gives an mcp capability in its own namespace a credential of its own. Before this, a client's capability could only name a credential the operator granted (`credentials`) and authorized (`POST /v1/admin/capabilities/<name>/oauth`, admin only), so an app that lets people connect their own services had nowhere to put them but its own storage, outside BrokerDO ([principle 9](../../../README.md#principles)).
+- **Two forms of `auth`,** only in a client's namespace (the operator's namespace refuses both, 400):
+  - `{"secret": "<name>"}`: one of the client's own [secrets](#secrets) is the static bearer.
+  - `{"authorize": true, "scopes"?: [...]}`: nest keeps OAuth tokens for the capability, which the client authorizes. Discovery, PKCE, refresh and revocation are the operator's flow's own ([mcp OAuth](../../../agents/capabilities/mcp/#oauth)).
+- **Each client is an OAuth client of its own** (decided 2026-11-27, after a review found the shared identity let one app's link reuse consent given to another):
+  - **Identity:** its own client ID metadata document, `/v1/oauth/clients/<cli>.json`, named `<client name> (via nest)`, with its own callback `/v1/oauth/callback/<cli>`. Where a server takes registration instead, its own registration, keyed by that callback.
+  - **Why:** an authorization server that skips the consent screen for a client someone already approved never lets one app's flow through on consent given to another app or to the operator. A person sees which app they are authorizing.
+  - **The callback:** a state comes back only to its own client's callback; brought to another's (or the operator's), it is refused and spent.
+  - **Unknown clients:** a client that doesn't exist, or is being deleted, has no document (404).
+- **Neither names a record.** Expansion derives it from the namespace's client and the entry: `client-secret:<cli>:<name>` (where the secret already lives) and `client-oauth:<cli>:<entry>:<incarnation>`. So no client can reach another's record or the operator's, whatever it writes, and a spec whose record isn't its capability's own client's is outside every grant.
+- **Only the client's own subtree uses it.** A template listing such a capability expands only for an agent joining that client's subtree (the client's own spawns, its agents' spawns, and an operator's spawn naming an owner in its subtree). Any other spawn of it, the operator's own included, is refused (400). So a person's consent to an app never serves anyone else's agents.
+- **An incarnation per `{authorize}` capability:** CatalogDO sets a random `incarnation` when the capability is written (whatever the writer sent) and keeps it while the URL and form stay. A capability made again under the entry gets a new one, so it never inherits an earlier authorization, not even one a flow still in flight completed for the old one.
+- **No grant field:** `mcp_urls` still bounds where the bearer may go, checked at the write, at each spawn and at each OAuth start. A `{secret}` bearer counts in `secrets` like any secret.
+- **Authorizing,** the client's own routes (namespace auth: the client, or the operator):
+  1. `POST /v1/catalog/capabilities/<ns>/<entry>/oauth {scopes?}` answers `{authorize_url, expires_ms, capability, resource, issuer, client, scopes}`, as the operator's start does.
+  2. The app sends a person to `authorize_url`. Whoever approves binds their account to the capability, so the app shows the URL only to someone allowed to connect it.
+  3. The authorization server redirects their browser to the client's own callback, `/v1/oauth/callback/<cli>`. Its page holds no token, and says the capability is authorized.
+  4. `GET …/oauth` shows the state, never a token. `DELETE …/oauth` revokes the tokens (gone at once, revoked at the server where it can be, [revoking](../../../agents/capabilities/mcp/#oauth)).
+- **Revoked with what owns it:**
+  - **Deleting the capability** revokes every record of its entry, whatever it held then, so a retried delete still does.
+  - **Writing it** revokes every record but the incarnation it holds afterwards (all of them, when it is no longer `{authorize}`). A new URL or form leaves no authorization behind once that revocation has run: it runs in the write's own request, not from a durable notice, so a request that dies between the write and the revocation, or a 503 never sent again, leaves the old records (and the agents spawned with them) until the entry's next write, delete or `DELETE …/oauth`. A write that changes neither revokes nothing.
+  - **A revocation that can't run** (503, retryable): the capability is deleted or written already, and the same request again finishes it.
+  - **Flows in flight:** a start stores its flow only if, after its own awaits, the capability still holds the incarnation it is for (it asks CatalogDO) and no delete of its capability or client, nor a write keeping another incarnation, ran meanwhile; otherwise 409 (start again), with no flow and no registration kept. A callback stores tokens only after asking CatalogDO that the capability still holds its incarnation, and only if no such revocation ran while it waited, storing them in the step after that answer. So a delete, or a new URL or form, at any point of a flow leaves no tokens stored.
+  - **A write's revocation** keeps the incarnation CatalogDO holds when it runs (BrokerDO asks it, rather than taking it from the request, and asks again if another write's revocation ran while it waited for the answer), so one that arrives late never takes a newer authorization.
+  - **Deleting the client** revokes all of them: its records and unfinished flows go with its secrets, in BrokerDO's same step, and a callback exchanging a code for it at that moment stores nothing. Its registrations with authorization servers are forgotten once those revocations are done.
+- **Audited** as the operator's flows are, naming the client, or `operator` when the operator acts on the client's namespace.
+- **Where the value goes:** a `{secret}` value now also reaches AgentDO's memory for one request and leaves for the capability's server, as an operator's `cap:` secret does. Before, a client's secret reached only nest-proxy.
+- **Not built: a live agent's new capability.** A connection a client makes reaches agents spawned after it; a running agent keeps the capabilities it spawned with ([open question](../../../README.md#open-questions-and-watch-items)).
+- **Old peers:** a BrokerDO of the previous release refuses the derived records as bearers (`not a capability credential`), so a rolled-back release fails these calls closed. A CatalogDO of the previous release can't read a capability holding either form ([rollout](../../../../dev/rollout/2026-11-27-client-mcp-credentials.md)).
 
 ## Grants to its agents
 

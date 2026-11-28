@@ -136,7 +136,9 @@ External systems (docs/control-plane/api/clients/): `POST /v1/admin/clients {nam
 (`auth: "owner"` in `src/index.ts`: create, list, read, turns, inbox, interrupt, start, stop and end, children, transcript, live trace and its history,
 brokered journal, asks and answers; sandbox create, list, read, destroy, lifetime and effective policy) on its own subtree only
 (anything else answers as an unknown id, 404), with `SpawnerOverrides`, and writes its catalog namespace:
-`GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`. Its own, with a
+`GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…` · `POST|GET|DELETE
+/v1/catalog/capabilities/<client-name>/<entry>/oauth`, OAuth for a capability whose `auth` is `{authorize}` (its own client identity: the
+public `GET /v1/oauth/clients/<cli>.json` and `GET /v1/oauth/callback/<cli>`; `docs/control-plane/api/clients/#mcp-credentials`). Its own, with a
 client token only: its secrets (`src/lib/client-secrets.ts`): `PUT|DELETE /v1/clients/self/secrets/<name> {value, description?}` and
 `GET /v1/clients/self/secrets` (names and metadata, never a value; the operator's `GET /v1/admin/clients/<cli>/secrets`),
 within `secrets {max_count, max_bytes}`; bindings naming them (`inject` in its templates, overrides and `POST /v1/sandboxes`,
