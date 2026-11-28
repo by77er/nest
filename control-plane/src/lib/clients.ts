@@ -2,6 +2,7 @@
 // beyond hashing, nothing awaited but WebCrypto. Nothing here knows any one client: a grant is a
 // ceiling, checked the same way for every client.
 import { z } from "zod";
+import { Credential } from "../protocol/control";
 import { InjectHost, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT } from "./client-secrets";
 import { EgressHost, egressOutsideGrant } from "./client-egress";
 import { clientOfRef, isClientMcpAuth } from "./mcp-auth";
@@ -38,7 +39,11 @@ export const Grant = z.strictObject({
   cells: z.array(CellName).max(64).default([]),
   /** The BrokerDO secrets its agents' specs may name: the model credential, and an mcp capability's `auth` (one with none needs none). Exact. */
   credentials: z.array(z.string().min(1).max(160)).max(64).default([]),
-  /** The MCP server URLs its capabilities may name. */
+  /**
+   * Ignored since tool credentials became an app's own (docs/control-plane/api/clients/#tool-credentials-are-an-apps-own,
+   * 2026-11-28): a client's capabilities may name any https server. Still taken and stored for one release, because
+   * the previous release bounds a client's capabilities by it; the next release drops it.
+   */
   mcp_urls: z.array(McpUrlEntry).max(64).default([]),
   /**
    * The secrets it may store (`PUT /v1/clients/self/secrets/<name>`, docs/control-plane/api/clients/#secrets):
@@ -65,15 +70,8 @@ export const Grant = z.strictObject({
 export type Grant = z.output<typeof Grant>;
 
 /** Whether an MCP server URL is in the grant: an exact entry, or under a prefix entry ending in `/`. */
-export function mcpUrlAllowed(grant: Pick<Grant, "mcp_urls">, url: string): boolean {
-  let href: string;
-  try {
-    href = new URL(url).href;
-  } catch {
-    return false;
-  }
-  return grant.mcp_urls.some((e) => href === e || (e.endsWith("/") && href.startsWith(e)));
-}
+/** Why a client may name no credential of the operator's for a tool: its tools' credentials are its own. */
+const OWN_TOOLS = "a client's tools use its own credentials (its secrets, its OAuth) or none, never the operator's";
 
 /**
  * Everything an expanded spec reaches outside the grant: its credential, each mcp server and the
@@ -85,20 +83,19 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
   const creds = new Set(grant.credentials);
   if (!creds.has(spec.credential)) out.push(`credential ${spec.credential}`);
   for (const m of spec.mcp ?? []) {
-    if (!mcpUrlAllowed(grant, m.url)) out.push(`mcp url ${m.url} (${m.capability})`);
     // A server that takes no bearer (no `auth`) has no secret to cover: its caller identity is the credential.
     // A client's own record (its secret, its OAuth tokens: docs/control-plane/api/clients/#mcp-credentials)
     // needs no grant, only to be the capability's own client's: expansion derives it from the namespace.
     const own = m.auth === undefined ? null : clientOfRef(m.auth);
     if (own !== null) {
       if (own !== m.client) out.push(`credential of ${own} in a capability of ${m.client ?? "the operator"} (${m.capability})`);
-    } else if (m.auth !== undefined && !creds.has(m.auth)) out.push(`credential ${m.auth} (${m.capability})`);
-    // Its OAuth client likewise: a client's own secret (`mcp.oauth_client`) is the capability's own client's, else the grant's.
+    } else if (m.auth !== undefined) out.push(`credential ${m.auth} (${m.capability}): ${OWN_TOOLS}`);
+    // Its OAuth client likewise: a client's own secret (`mcp.oauth_client`) is the capability's own client's; an
+    // operator's is no client's to use.
     if (m.oauth?.client) {
       const ownClient = clientOfRef(m.oauth.client);
-      if (ownClient !== null) {
-        if (ownClient !== m.client) out.push(`credential of ${ownClient} in a capability of ${m.client ?? "the operator"} (${m.capability})`);
-      } else if (!creds.has(m.oauth.client)) out.push(`credential ${m.oauth.client} (${m.capability})`);
+      if (ownClient === null) out.push(`credential ${m.oauth.client} (${m.capability}): ${OWN_TOOLS}`);
+      else if (ownClient !== m.client) out.push(`credential of ${ownClient} in a capability of ${m.client ?? "the operator"} (${m.capability})`);
     }
   }
   for (const b of spec.brokered ?? []) out.push(`brokered action ${b.action} (${b.capability})`);
@@ -110,13 +107,12 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
 /** What a capability, on its own, reaches outside the grant (checked when a client writes it). */
 export function capabilityOutsideGrant(name: string, cap: Capability, grant: Grant): string[] {
   const out: string[] = [];
-  const creds = new Set(grant.credentials);
   if (cap.mcp) {
-    if (!mcpUrlAllowed(grant, cap.mcp.url)) out.push(`mcp url ${cap.mcp.url}`);
     const auth = cap.mcp.auth;
-    // A client's own form names nothing of the operator's: the record is derived from the client itself.
+    // A client's own form names nothing of the operator's: the record is derived from the client itself. Any
+    // other names an operator's credential, which no grant gives a client.
     for (const s of auth === undefined || isClientMcpAuth(auth) ? [] : typeof auth === "string" ? [auth] : [auth.oauth, ...(auth.client ? [auth.client] : [])]) {
-      if (!creds.has(s)) out.push(`credential ${s}`);
+      out.push(`credential ${s}: ${OWN_TOOLS}`);
     }
   }
   for (const e of cap.brokered ?? []) out.push(`brokered action ${e.action} (${name})`);
@@ -165,6 +161,15 @@ const REPO_OWNERS_SHAPE = z.record(z.string(), z.number().int().positive());
 export const GrantInput = z.preprocess((raw, ctx) => {
   if (!isPlainObject(raw)) return raw;
   const g = { ...raw };
+  // `credentials` names the Claude setup tokens its agents may run on, and nothing else: no grant lends an
+  // operator's tool credential (docs/control-plane/api/clients/#tool-credentials-are-an-apps-own).
+  if (Array.isArray(g.credentials)) {
+    for (const [i, c] of (g.credentials as unknown[]).entries()) {
+      if (typeof c === "string" && !Credential.safeParse(c).success) {
+        ctx.addIssue({ code: "custom", path: ["credentials", i], message: `${c} isn't a Claude setup token (a model credential): ${OWN_TOOLS}` });
+      }
+    }
+  }
   for (const k of REMOVED_GRANT_FIELDS) {
     if (!Object.hasOwn(g, k)) continue;
     if (k === "repo_owners" ? !REPO_OWNERS_SHAPE.safeParse(g[k]).success : !grantsNothing(g[k])) {

@@ -12,7 +12,7 @@ import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, EntryName, OperatorOverrides, RemovedRepoFields, type SpawnerOverrides, type Template, TemplateInput } from "./lib/spec";
 import { cellIdleTtlMs, MIN_IDLE_TTL_MS, OPERATOR_ENDER } from "./lib/lifetimes";
 import {
-  CLIENT_ID, ClientName, grantForPreviousRelease, GrantInput, grantRefusal, isAgentId, Labels, mcpUrlAllowed, newClientToken, parseClientToken,
+  CLIENT_ID, ClientName, grantForPreviousRelease, GrantInput, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
   parseLabelFilters, tokenHash,
 } from "./lib/clients";
 import type { ClientScope } from "./do/catalog";
@@ -305,7 +305,7 @@ async function oauthCapability(env: Env, raw: string) {
 
 /**
  * A client's mcp capability whose `auth` is `{authorize}` (404 for an unknown one, 409 for any other), within
- * its client's grant as it is now (`mcp_urls`: 403).
+ * its client's grant as it is now.
  */
 async function clientOAuthCapability(c: { env: Env; caller: Caller; p: { ns: string; entry: string } }) {
   const scope = await namespaceScope(c, c.p.ns);
@@ -314,7 +314,6 @@ async function clientOAuthCapability(c: { env: Env; caller: Caller; p: { ns: str
   if (!mcp) throw new NestError(ErrorCodes.NOT_FOUND, `no mcp capability ${name}`, 404);
   const auth = mcp.auth;
   if (!isClientMcpAuth(auth) || !("authorize" in auth)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name}'s auth isn't {authorize: true}`, 409);
-  if (!mcpUrlAllowed(scope.grant, mcp.url)) throw new NestError(ErrorCodes.FORBIDDEN, `${name}: ${mcp.url} is outside ${scope.client}'s grant (mcp_urls)`, 403);
   return { scope, name, url: mcp.url, scopes: auth.scopes, incarnation: auth.incarnation ?? "0", oauthClient: mcp.oauth_client };
 }
 
