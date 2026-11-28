@@ -110,12 +110,13 @@ mcp: {url: https://mcp.example.com/mcp, auth: {oauth: cap:notes, client: cap:not
   - Of `authorization_servers`, the first is used (§7.6 leaves the choice to the client). Its metadata comes from the spec's order of RFC 8414 and OIDC URLs; its `issuer` must match ([RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) §3.3); without `S256` in `code_challenge_methods_supported`, nest refuses to proceed, as the spec requires.
   - Every URL is `https` (loopback `http` only with `ALLOW_LOOPBACK_MCP=1`); redirects aren't followed; each exchange has 10 s and 64 KiB.
 - **Client identity, in the spec's order:**
-  1. The pre-registered `client`. It authenticates with `client_secret_basic`, or with `client_secret_post` when the server lists only that.
+  1. The pre-registered `client` (an API client's own: its `oauth_client`, [mcp credentials](../../../control-plane/api/clients/#mcp-credentials)). It authenticates with `client_secret_basic`, or with `client_secret_post` when the server lists only that.
   2. **nest's client ID metadata document** (an API client's flows use its own, [mcp credentials](../../../control-plane/api/clients/#mcp-credentials)), when the server advertises `client_id_metadata_document_supported` and `PUBLIC_BASE_URL` is https. The Worker serves it at `/v1/oauth/client.json`, and that URL is the client id: a public client (`none`), with the callback as its only redirect URI ([draft-ietf-oauth-client-id-metadata-document-00](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00)).
   3. [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) registration as a public client, once per authorization server, kept in BrokerDO.
   4. Otherwise the start fails and says to register a client by hand.
 
   **Why all three:** the spec makes metadata documents the SHOULD for clients with no prior relationship and registration a MAY "for backwards compatibility". Servers built against the 2025-06-18 spec offer only registration (unverified how many still do), so leaving it out would lock them out.
+- **Offline access** (built 2026-11-28): an authorization server that issues a refresh token only when asked in a parameter of its own gets it (`OFFLINE_PARAMS`, by issuer). Only Google's so far: `access_type=offline` and `prompt=consent` ([Google](https://developers.google.com/identity/protocols/oauth2/web-server)); without them its access tokens end the authorization within an hour.
 - **The flow:**
   - PKCE S256 with a 32-byte verifier ([RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636)), kept in BrokerDO's flow row and never in the URL.
   - `resource` (the metadata's `resource`) in the authorization request and in every token request ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html)), and `state` (32 random bytes).

@@ -591,6 +591,7 @@ export function checkCapability(
     if (Array.isArray(idem) && new Set(idem).size !== idem.length) return err("mcp.idempotent lists a tool twice");
     const auth = cap.mcp.auth;
     if (auth !== undefined && typeof auth !== "string" && "oauth" in auth && auth.client === auth.oauth) return err("mcp.auth: the client secret and the token record must be different names");
+    if (cap.mcp.oauth_client !== undefined && !(isClientMcpAuth(auth) && "authorize" in auth)) return err("mcp.oauth_client goes with auth {authorize: true} only");
   }
   if (cap.brokered) {
     const b = checkBrokered(cap.brokered, mcp?.allowLoopbackBrokered ?? false);

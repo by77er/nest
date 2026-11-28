@@ -10,7 +10,7 @@ import type { BrokerDO } from "../src/do/broker";
 import type { McpConnectorDO } from "../src/do/mcp-connector";
 import { connectorName, grantOf } from "../src/lib/mcp";
 import { specOutsideGrant } from "../src/lib/clients";
-import { authServerMetadataUrls, bearerChallenge, clientOfRef, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
+import { authorizeUrl, authServerMetadataUrls, bearerChallenge, clientOfRef, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
 import { adminJson, BASE, connectHost, eventually, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -383,6 +383,18 @@ describe("discovery URLs and challenges", () => {
 });
 
 // --- The catalog ---------------------------------------------------------------------------------------------
+
+describe("offline access", () => {
+  const p = { client_id: "c", redirect_uri: "https://nest.test/cb", challenge: "ch", state: "st", resource: "https://r.test/mcp", scopes: ["s"] };
+  it("asks Google for a refresh token in its own parameters, and nobody else", () => {
+    for (const issuer of ["https://accounts.google.com", "https://accounts.google.com/"]) {
+      const q = new URL(authorizeUrl({ issuer, authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth" }, p)).searchParams;
+      expect([q.get("access_type"), q.get("prompt"), q.get("resource"), q.get("code_challenge_method")]).toEqual(["offline", "consent", p.resource, "S256"]);
+    }
+    const q = new URL(authorizeUrl({ issuer: "https://as.test/x", authorization_endpoint: "https://as.test/x/authorize" }, p)).searchParams;
+    expect([q.has("access_type"), q.has("prompt")]).toEqual([false, false]);
+  });
+});
 
 describe("the oauth form of auth", () => {
   it("is accepted beside cap:<name>, refuses a client secret named like the token record, and only an oauth capability starts a flow", async () => {
@@ -883,6 +895,13 @@ describe("an API client's own mcp credentials", () => {
     const spec = (m: Record<string, unknown>) => ({ credential: "claude_oauth_token", mcp: [{ capability: "x", url: "https://rs.example/mcp", tools: null, idempotent: {}, trusted: false, ...m }] }) as unknown as Parameters<typeof specOutsideGrant>[0];
     expect(specOutsideGrant(spec({ auth: "client-oauth:cli_A:notes:abcd1234", client: "cli_A" }), grant).filter((x) => x.includes("cli_"))).toEqual([]);
     expect(specOutsideGrant(spec({ auth: "client-oauth:cli_A:notes:abcd1234", client: "cli_B" }), grant).some((x) => x.includes("credential of cli_A"))).toBe(true);
+    // Its OAuth client (`oauth_client`) is that client's own secret too, and only the capability's own client's passes.
+    const own = grantOf("ns-cal", { ...src, auth: { authorize: true, incarnation: "abcd1234" }, oauth_client: "google" }, "cli_A", "cal");
+    expect(own.oauth).toEqual({ client: "client-secret:cli_A:google", scopes: null });
+    const withClient = (oc: string, client: string) => spec({ auth: "client-oauth:cli_A:cal:abcd1234", client, oauth: { client: oc, scopes: null } });
+    expect(specOutsideGrant(withClient("client-secret:cli_A:google", "cli_A"), grant).filter((x) => x.includes("google"))).toEqual([]);
+    expect(specOutsideGrant(withClient("client-secret:cli_B:google", "cli_A"), grant)).toContain("credential of cli_B in a capability of cli_A (x)");
+    expect(specOutsideGrant(withClient("cap:google", "cli_A"), grant)).toContain("credential cap:google (x)");
   });
 
   it("are refused in the operator's namespace, and their schema takes only a name or authorize: true", async () => {
@@ -938,6 +957,65 @@ describe("an API client's own mcp credentials", () => {
     const after = await ag.call("cal_c2", "echo", { text: "again" });
     expect(after.status).not.toBe("ok");
     expect(JSON.stringify(after)).toContain(`/v1/catalog/capabilities/<ns>/<entry>/oauth`);
+  });
+
+  it("oauth_client: a client's own pre-registered client authorizes a server with neither metadata documents nor registration, and only its own", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const a = await newClient([f.server]);
+    const b = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${a.id}`], secret: "s3cret" });
+    const put = (c: Client, mcp: Record<string, unknown>, status?: number) => asJson(c.token, `/v1/catalog/capabilities/${c.name}/cal`, {
+      method: "PUT", body: { mcp: { url: f.server, tools: ["echo"], read_only: ["echo"], when_tainted: "allow", ...mcp } },
+    }, status);
+    // Only beside {authorize}: a static bearer or no auth names no OAuth client.
+    for (const auth of [{ secret: "k" }, undefined]) {
+      expect((await put(a, { auth, oauth_client: "google" }, 400)).error.message).toContain("oauth_client goes with auth {authorize: true} only");
+    }
+    const first = await put(a, { auth: { authorize: true }, oauth_client: "google" });
+    // Not stored yet: the start says where the client puts it, its own route, never the operator's.
+    const missing = await asJson(a.token, `/v1/catalog/capabilities/${a.name}/cal/oauth`, { method: "POST" }, 409);
+    expect(missing.error.message).toContain("PUT /v1/clients/self/secrets/google");
+    await asJson(a.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand", client_secret: "s3cret" }) } });
+
+    const { start, callback, page } = await clientAuthorize(a, "cal");
+    expect(start.client).toBe("pre-registered");
+    expect(new URL(start.authorize_url).searchParams.get("client_id")).toBe("by-hand");
+    expect(new URL(start.authorize_url).searchParams.get("redirect_uri")).toBe(`${NEST}/v1/oauth/callback/${a.id}`);
+    expect(callback.status, page).toBe(200);
+    expect(f.tokenAuth.at(-1)).toBe("Basic");
+    expect(f.tokenRequests.at(-1)).not.toHaveProperty("client_secret");
+    const ref = `client-oauth:${a.id}:cal:${first.mcp.auth.incarnation}`;
+    expect(await grantRow(ref)).toMatchObject({ status: "authorized", client: JSON.stringify({ kind: "pre-registered", secret: `client-secret:${a.id}:google`, auth_methods: ["none", "client_secret_basic"] }) });
+    const ag = await clientAgent(a, "cal");
+    expect(await ag.call("cal_g1", "echo", { text: "hi" })).toMatchObject({ status: "ok" });
+
+    // The same name in another client's namespace is that client's secret, which b hasn't stored: a's is out of reach.
+    await put(b, { auth: { authorize: true }, oauth_client: "google" });
+    expect((await asJson(b.token, `/v1/catalog/capabilities/${b.name}/cal/oauth`, { method: "POST" }, 409)).error.message).toContain(`client-secret:${b.id}:google`);
+
+    // Another OAuth client is another form: a new incarnation, unauthorized, and the old tokens revoked.
+    const second = await put(a, { auth: { authorize: true }, oauth_client: "google2" });
+    expect(second.mcp.auth.incarnation).not.toBe(first.mcp.auth.incarnation);
+    expect(await grantRow(ref)).toBeUndefined();
+    expect((await asJson(a.token, `/v1/catalog/capabilities/${a.name}/cal/oauth`)).status).toBe("unauthorized");
+    // The same one again keeps it.
+    expect((await put(a, { auth: { authorize: true }, oauth_client: "google2" })).mcp.auth.incarnation).toBe(second.mcp.auth.incarnation);
+  });
+
+  it("a start whose pre-registered client isn't its owner's is refused, whoever builds the input", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const a = await newClient([f.server]);
+    const b = await newClient([f.server]);
+    const cap = await asJson(a.token, `/v1/catalog/capabilities/${a.name}/x`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true } } } });
+    const auth = { oauth: `client-oauth:${a.id}:x:${cap.mcp.auth.incarnation}` };
+    for (const client of [`client-secret:${b.id}:google`, "cap:operators-client"]) {
+      await expect(Promise.resolve().then(() => broker().oauthStart({ owner: { id: a.id, name: a.name }, capability: `${a.name}/x`, url: f.server, auth: { ...auth, client } })))
+        .rejects.toThrow(/isn't a client of/);
+    }
+    await expect(Promise.resolve().then(() => broker().oauthStart({ capability: "x", url: f.server, auth: { oauth: "cap:x", client: `client-secret:${a.id}:google` } })))
+      .rejects.toThrow(/isn't a client of the operator's/);
   });
 
   it("{secret}: the client's own secret is the bearer, and the same form in another client's namespace reaches only that client's", async () => {

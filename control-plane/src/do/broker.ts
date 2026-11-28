@@ -212,8 +212,12 @@ export class BrokerDO extends DurableObject<Env> {
    * docs/control-plane/api/clients/#mcp-credentials): as `oauthStart`, its tokens kept under the record
    * derived from the client and the entry, never one it names.
    */
-  async clientOAuthStart(input: { client: string; clientName: string; capability: string; entry: string; incarnation: string; url: string; scopes?: string[]; capScopes?: string[]; caller?: string }): Promise<StartAnswer> {
-    const auth = { oauth: clientOAuthRef(input.client, input.entry, input.incarnation), ...(input.capScopes ? { scopes: input.capScopes } : {}) };
+  async clientOAuthStart(input: { client: string; clientName: string; capability: string; entry: string; incarnation: string; url: string; scopes?: string[]; capScopes?: string[]; oauthClient?: string; caller?: string }): Promise<StartAnswer> {
+    // `oauthClient` names the client's own secret (`mcp.oauth_client`): its key is derived here, never taken.
+    const auth = {
+      oauth: clientOAuthRef(input.client, input.entry, input.incarnation), ...(input.capScopes ? { scopes: input.capScopes } : {}),
+      ...(input.oauthClient ? { client: clientSecretKey(input.client, input.oauthClient) } : {}),
+    };
     return await this.oauth.start({
       owner: { id: input.client, name: input.clientName }, capability: input.capability, url: input.url, auth, ...(input.scopes ? { scopes: input.scopes } : {}),
     }, input.caller ?? input.client);

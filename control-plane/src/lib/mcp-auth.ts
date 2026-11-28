@@ -436,7 +436,17 @@ export async function registerClient(as: AuthServer, redirectUri: string, client
 
 // --- Authorization and token requests -------------------------------------------------------------------
 
-export function authorizeUrl(as: Pick<AuthServer, "authorization_endpoint">, p: {
+/**
+ * Authorization servers that issue a refresh token only when the request asks for offline access in a
+ * parameter of their own, by issuer. Google's (https://developers.google.com/identity/protocols/oauth2/web-server):
+ * `access_type=offline` for a refresh token, and `prompt=consent` so an authorization done again gets one too
+ * (Google gives one at the first consent only). Without them every access token ends the authorization within an hour.
+ */
+export const OFFLINE_PARAMS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "https://accounts.google.com": { access_type: "offline", prompt: "consent" },
+};
+
+export function authorizeUrl(as: Pick<AuthServer, "authorization_endpoint" | "issuer">, p: {
   client_id: string; redirect_uri: string; challenge: string; state: string; resource: string; scopes: string[] | null;
 }): string {
   const u = new URL(as.authorization_endpoint);
@@ -448,6 +458,7 @@ export function authorizeUrl(as: Pick<AuthServer, "authorization_endpoint">, p: 
   u.searchParams.set("state", p.state);
   u.searchParams.set("resource", p.resource);
   if (p.scopes?.length) u.searchParams.set("scope", p.scopes.join(" "));
+  for (const [k, v] of Object.entries(OFFLINE_PARAMS[as.issuer.replace(/\/$/, "")] ?? {})) u.searchParams.set(k, v);
   return u.href;
 }
 
@@ -640,7 +651,10 @@ export class OAuthStore {
     switch (c.kind) {
       case "pre-registered": {
         const v = this.d.secret(c.secret);
-        if (v === null) throw new NestError(ErrorCodes.FORBIDDEN, `OAuth: no pre-registered client stored as ${c.secret} (PUT /v1/admin/secrets/${c.secret})`, 409);
+        if (v === null) {
+          const own = c.secret.startsWith(CLIENT_SECRET_PREFIX) ? `PUT /v1/clients/self/secrets/${c.secret.slice(c.secret.indexOf(":", CLIENT_SECRET_PREFIX.length) + 1)}` : `PUT /v1/admin/secrets/${c.secret}`;
+          throw new NestError(ErrorCodes.FORBIDDEN, `OAuth: no pre-registered client stored as ${c.secret} (${own})`, 409);
+        }
         return parseClient(v, as ?? { auth_methods: c.auth_methods });
       }
       case "metadata":
@@ -666,6 +680,10 @@ export class OAuthStore {
     const server = checkOAuthUrl(input.url, this.d.allowLoopback, "the server URL");
     // A client's record only through its own identity, and only its own record (BrokerDO derives both).
     if ((clientOfRef(input.auth.oauth) ?? undefined) !== input.owner?.id) throw oauthError(`${input.auth.oauth} isn't a record of ${input.owner?.id ?? "the operator"}`, 403);
+    // So is a pre-registered client: the operator's (`cap:`) for the operator's flows, a client's own secret for its own.
+    if (input.auth.client !== undefined && (clientOfRef(input.auth.client) ?? undefined) !== input.owner?.id) {
+      throw oauthError(`${input.auth.client} isn't a client of ${input.owner?.id ?? "the operator"}'s`, 403);
+    }
     const found = await discover(server, this.d.allowLoopback);
     const { redirect_uri, client_id } = oauthUrls(this.d.publicBaseUrl, input.owner?.id);
     let client: ClientRef;

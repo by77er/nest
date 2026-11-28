@@ -5,6 +5,7 @@
 import { z } from "zod";
 import type { ToolContent, ToolDef } from "../protocol/control";
 import { CapRef, ClientOAuthAuth, ClientSecretAuth, clientMcpRef, isClientMcpAuth, OAuthAuth, type OAuthGrant } from "./mcp-auth";
+import { ClientSecretName, clientSecretKey } from "./client-secrets";
 import { argsDigest, gated } from "./sinks";
 import { IDENTITY_HEADER } from "./identity";
 
@@ -48,10 +49,16 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
  * results don't taint the session (and its annotations count); `when_tainted` is what a sink call from a
  * tainted session needs; `max_concurrent` and `per_minute` cap this server's calls across every agent
  * (the connector's admission; defaults `MCP_DEFAULT_MAX_CONCURRENT`, `MCP_DEFAULT_PER_MINUTE`).
+ * `oauth_client`, with a client's `{authorize}` auth only, names one of that client's own secrets holding the
+ * OAuth client it registered by hand at the authorization server (`{"client_id", "client_secret"?}`), for a
+ * server that takes neither metadata documents nor registration (docs/control-plane/api/clients/#mcp-credentials).
+ * Beside `auth`, not in it, so the previous release, reading `auth` strictly, still reads the capability (it
+ * drops the field, and its start then fails for want of a client).
  */
 export const McpSource = z.object({
   url: z.string().min(1).max(2048),
   auth: z.union([CapRef, OAuthAuth, ClientSecretAuth, ClientOAuthAuth]).optional(),
+  oauth_client: ClientSecretName.optional(),
   tools: z.array(McpToolName).max(MAX_TOOLS_PER_CAPABILITY).optional(),
   idempotent: ToolFlags.optional(),
   read_only: ToolFlags.optional(),
@@ -122,7 +129,7 @@ export function grantOf(capability: string, src: McpSource, client?: string, ent
   } else if (isClientMcpAuth(auth)) {
     if (!client || !entry) throw new Error(`${capability}: a client's own mcp credential outside a client's namespace`);
     ref = clientMcpRef(client, entry, auth);
-    if ("authorize" in auth) oauth = { client: null, scopes: auth.scopes ? [...auth.scopes] : null };
+    if ("authorize" in auth) oauth = { client: src.oauth_client ? clientSecretKey(client, src.oauth_client) : null, scopes: auth.scopes ? [...auth.scopes] : null };
   } else {
     ref = auth.oauth;
     oauth = { client: auth.client ?? null, scopes: auth.scopes ? [...auth.scopes] : null };
