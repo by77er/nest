@@ -10,7 +10,7 @@ import type { BrokerDO } from "../src/do/broker";
 import type { McpConnectorDO } from "../src/do/mcp-connector";
 import { connectorName, grantOf } from "../src/lib/mcp";
 import { specOutsideGrant } from "../src/lib/clients";
-import { authServerMetadataUrls, bearerChallenge, clientOfRef, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
+import { authorizeUrl, parseClient, authServerMetadataUrls, bearerChallenge, clientOfRef, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
 import { adminJson, BASE, connectHost, eventually, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -383,6 +383,28 @@ describe("discovery URLs and challenges", () => {
 });
 
 // --- The catalog ---------------------------------------------------------------------------------------------
+
+describe("a hand-registered client's authorize_params", () => {
+  const p = { client_id: "c", redirect_uri: "https://nest.test/cb", challenge: "ch", state: "st", resource: "https://r.test/mcp", scopes: ["s"] };
+  it("adds the client's own parameters, never in place of nest's, and names no service itself", () => {
+    const as = { authorization_endpoint: "https://as.test/x/authorize" };
+    const q = new URL(authorizeUrl(as, { ...p, extra: { access_type: "offline", prompt: "consent" } })).searchParams;
+    expect([q.get("access_type"), q.get("prompt"), q.get("client_id"), q.get("resource")]).toEqual(["offline", "consent", "c", p.resource]);
+    // Without any: nothing extra, whoever the server is.
+    const plain = new URL(authorizeUrl({ authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth" }, p)).searchParams;
+    expect([plain.has("access_type"), plain.has("prompt")]).toEqual([false, false]);
+    // A key nest sets itself can't be smuggled in, even past the parser.
+    const forged = new URL(authorizeUrl(as, { ...p, extra: { client_id: "evil", redirect_uri: "https://evil.test", state: "x" } })).searchParams;
+    expect([forged.get("client_id"), forged.get("redirect_uri"), forged.get("state")]).toEqual(["c", p.redirect_uri, "st"]);
+  });
+
+  it("the client's JSON takes only the listed keys, each a short string", () => {
+    expect(parseClient(JSON.stringify({ client_id: "c", authorize_params: { access_type: "offline", prompt: "consent" } }), null).authorize_params).toEqual({ access_type: "offline", prompt: "consent" });
+    for (const bad of [{ redirect_uri: "https://evil.test" }, { scope: "x" }, { prompt: "a\nb" }, { prompt: 1 }, "offline"]) {
+      expect(() => parseClient(JSON.stringify({ client_id: "c", authorize_params: bad }), null), JSON.stringify(bad)).toThrow(/authorize_params/);
+    }
+  });
+});
 
 describe("the oauth form of auth", () => {
   it("is accepted beside cap:<name>, refuses a client secret named like the token record, and only an oauth capability starts a flow", async () => {
@@ -883,6 +905,13 @@ describe("an API client's own mcp credentials", () => {
     const spec = (m: Record<string, unknown>) => ({ credential: "claude_oauth_token", mcp: [{ capability: "x", url: "https://rs.example/mcp", tools: null, idempotent: {}, trusted: false, ...m }] }) as unknown as Parameters<typeof specOutsideGrant>[0];
     expect(specOutsideGrant(spec({ auth: "client-oauth:cli_A:notes:abcd1234", client: "cli_A" }), grant).filter((x) => x.includes("cli_"))).toEqual([]);
     expect(specOutsideGrant(spec({ auth: "client-oauth:cli_A:notes:abcd1234", client: "cli_B" }), grant).some((x) => x.includes("credential of cli_A"))).toBe(true);
+    // Its OAuth client (`oauth_client`) is that client's own secret too, and only the capability's own client's passes.
+    const own = grantOf("ns-cal", { ...src, auth: { authorize: true, incarnation: "abcd1234" }, oauth_client: "google" }, "cli_A", "cal");
+    expect(own.oauth).toEqual({ client: "client-secret:cli_A:google", scopes: null });
+    const withClient = (oc: string, client: string) => spec({ auth: "client-oauth:cli_A:cal:abcd1234", client, oauth: { client: oc, scopes: null } });
+    expect(specOutsideGrant(withClient("client-secret:cli_A:google", "cli_A"), grant).filter((x) => x.includes("google"))).toEqual([]);
+    expect(specOutsideGrant(withClient("client-secret:cli_B:google", "cli_A"), grant)).toContain("credential of cli_B in a capability of cli_A (x)");
+    expect(specOutsideGrant(withClient("cap:google", "cli_A"), grant)).toContain("credential cap:google (x)");
   });
 
   it("are refused in the operator's namespace, and their schema takes only a name or authorize: true", async () => {
@@ -940,6 +969,78 @@ describe("an API client's own mcp credentials", () => {
     expect(JSON.stringify(after)).toContain(`/v1/catalog/capabilities/<ns>/<entry>/oauth`);
   });
 
+  it("oauth_client: a client's own pre-registered client authorizes a server with neither metadata documents nor registration, and only its own", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const a = await newClient([f.server]);
+    const b = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${a.id}`], secret: "s3cret" });
+    const put = (c: Client, mcp: Record<string, unknown>, status?: number) => asJson(c.token, `/v1/catalog/capabilities/${c.name}/cal`, {
+      method: "PUT", body: { mcp: { url: f.server, tools: ["echo"], read_only: ["echo"], when_tainted: "allow", ...mcp } },
+    }, status);
+    // Only beside {authorize}: a static bearer or no auth names no OAuth client.
+    for (const auth of [{ secret: "k" }, undefined]) {
+      expect((await put(a, { auth, oauth_client: "google" }, 400)).error.message).toContain("oauth_client goes with auth {authorize: true} only");
+    }
+    const first = await put(a, { auth: { authorize: true }, oauth_client: "google" });
+    // Not stored yet: the start says where the client puts it, its own route, never the operator's.
+    const missing = await asJson(a.token, `/v1/catalog/capabilities/${a.name}/cal/oauth`, { method: "POST" }, 409);
+    expect(missing.error.message).toContain("PUT /v1/clients/self/secrets/google");
+    await asJson(a.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand", client_secret: "s3cret", authorize_params: { access_type: "offline", prompt: "consent" } }) } });
+
+    const { start, callback, page } = await clientAuthorize(a, "cal");
+    expect(new URL(start.authorize_url).searchParams.get("access_type")).toBe("offline");
+    expect(start.client).toBe("pre-registered");
+    expect(new URL(start.authorize_url).searchParams.get("client_id")).toBe("by-hand");
+    expect(new URL(start.authorize_url).searchParams.get("redirect_uri")).toBe(`${NEST}/v1/oauth/callback/${a.id}`);
+    expect(callback.status, page).toBe(200);
+    expect(f.tokenAuth.at(-1)).toBe("Basic");
+    expect(f.tokenRequests.at(-1)).not.toHaveProperty("client_secret");
+    const ref = `client-oauth:${a.id}:cal:${first.mcp.auth.incarnation}`;
+    expect(await grantRow(ref)).toMatchObject({ status: "authorized", client: JSON.stringify({ kind: "pre-registered", secret: `client-secret:${a.id}:google`, auth_methods: ["none", "client_secret_basic"] }) });
+    const ag = await clientAgent(a, "cal");
+    expect(await ag.call("cal_g1", "echo", { text: "hi" })).toMatchObject({ status: "ok" });
+
+    // The same name in another client's namespace is that client's secret, which b hasn't stored: a's is out of reach.
+    await put(b, { auth: { authorize: true }, oauth_client: "google" });
+    expect((await asJson(b.token, `/v1/catalog/capabilities/${b.name}/cal/oauth`, { method: "POST" }, 409)).error.message).toContain(`client-secret:${b.id}:google`);
+
+    // While it is authorized, its OAuth client keeps its client_id: rotating the client secret is fine, another
+    // id, an expiry or a delete is refused (the tokens would be refreshed and revoked as another, or as none).
+    const secret = (value: unknown, extra: Record<string, unknown> = {}, status?: number) =>
+      asJson(a.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify(value), ...extra } }, status);
+    expect((await secret({ client_id: "someone-else", client_secret: "x" }, {}, 409)).error.message).toContain("rewritten with another client_id");
+    expect((await secret({ client_id: "by-hand", client_secret: "s3cret" }, { expires_at: new Date(Date.now() + 86_400_000).toISOString() }, 409)).error.message).toContain("given an expiry");
+    expect((await asJson(a.token, "/v1/clients/self/secrets/google", { method: "DELETE" }, 409)).error.message).toContain(`${a.name}/cal authorized with`);
+    await secret({ client_id: "by-hand", client_secret: "s3cret" });
+    // Another OAuth client is another form: a new incarnation, unauthorized, and the old tokens revoked at the
+    // server as the client that got them; then the old client's secret may go.
+    const rt = (await grantRow(ref)).refresh_token as string;
+    const second = await put(a, { auth: { authorize: true }, oauth_client: "google2" });
+    expect(f.revocations).toEqual([{ token: rt, hint: "refresh_token", client: "by-hand" }]);
+    await asJson(a.token, "/v1/clients/self/secrets/google", { method: "DELETE" });
+    expect(second.mcp.auth.incarnation).not.toBe(first.mcp.auth.incarnation);
+    expect(await grantRow(ref)).toBeUndefined();
+    expect((await asJson(a.token, `/v1/catalog/capabilities/${a.name}/cal/oauth`)).status).toBe("unauthorized");
+    // The same one again keeps it.
+    expect((await put(a, { auth: { authorize: true }, oauth_client: "google2" })).mcp.auth.incarnation).toBe(second.mcp.auth.incarnation);
+  });
+
+  it("a start whose pre-registered client isn't its owner's is refused, whoever builds the input", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const a = await newClient([f.server]);
+    const b = await newClient([f.server]);
+    const cap = await asJson(a.token, `/v1/catalog/capabilities/${a.name}/x`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true } } } });
+    const auth = { oauth: `client-oauth:${a.id}:x:${cap.mcp.auth.incarnation}` };
+    for (const client of [`client-secret:${b.id}:google`, "cap:operators-client"]) {
+      await expect(Promise.resolve().then(() => broker().oauthStart({ owner: { id: a.id, name: a.name }, capability: `${a.name}/x`, url: f.server, auth: { ...auth, client } })))
+        .rejects.toThrow(/isn't a client of/);
+    }
+    await expect(Promise.resolve().then(() => broker().oauthStart({ capability: "x", url: f.server, auth: { oauth: "cap:x", client: `client-secret:${a.id}:google` } })))
+      .rejects.toThrow(/isn't a client of the operator's/);
+  });
+
   it("{secret}: the client's own secret is the bearer, and the same form in another client's namespace reaches only that client's", async () => {
     const f = new FakeAuth(rand(), { cimd: true });
     fakes.set(f.id, f);
@@ -979,6 +1080,116 @@ describe("an API client's own mcp credentials", () => {
     expect(await callback).toContain("revoked while its code was being exchanged");
     expect(await entryRow(c, "late")).toBeUndefined();
     expect(f.revocations).toHaveLength(1);
+  });
+
+  it("a client deleted while its callback exchanges a code for its hand-registered client: revoked at the server as that client", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${c.id}`], secret: "s3cret" });
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand", client_secret: "s3cret" }) } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/late`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/late/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
+    f.holdExchange = false;
+    expect(await callback).toContain("revoked while its code was being exchanged");
+    expect(f.revocations).toHaveLength(1);
+    expect(f.revocations[0]!.client).toBe("by-hand");
+  });
+
+  it("a hand-registered client rewritten while its code is exchanged: the tokens are dropped and revoked as the client that got them", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${c.id}`], secret: "s3cret" });
+    const put = (id: string) => asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: id, client_secret: "s3cret" }) } });
+    await put("by-hand");
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/mid`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/mid/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    // The flow row is gone and no record exists yet: the secret guard sees nothing, so the rewrite goes through.
+    await put("someone-else");
+    f.holdExchange = false;
+    expect(await callback).toContain("changed while the code was being exchanged");
+    expect(await entryRow(c, "mid")).toBeUndefined();
+    expect(f.revocations).toHaveLength(1);
+    expect(f.revocations[0]!.client).toBe("by-hand");
+  });
+
+  it("a hand-registered client rewritten while a start awaits the catalog: no flow is stored", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand" }) } });
+    const cap = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/st`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    const flows = await runInDurableObject(broker(), async (inst: BrokerDO, st) => {
+      const d = (inst as any).oauth.d;
+      const orig = d.incarnationOf;
+      // After the client is read and before the flow is stored: the app rewrites it (no use yet, so the guard lets it).
+      d.incarnationOf = async (name: string) => {
+        await inst.writeClientSecret(c.id, "google", { value: JSON.stringify({ client_id: "someone-else" }), description: null, expires_ms: null }, { max_count: 3, max_bytes: 128 });
+        return orig(name);
+      };
+      try {
+        await expect(Promise.resolve().then(() => inst.clientOAuthStart({
+          client: c.id, clientName: c.name, capability: `${c.name}/st`, entry: "st", incarnation: cap.mcp.auth.incarnation, url: f.server, oauthClient: "google",
+        }))).rejects.toThrow(/changed while this authorization was starting/);
+      } finally {
+        d.incarnationOf = orig;
+      }
+      return st.storage.sql.exec("SELECT body FROM oauth_flows").toArray().filter((r) => String(r.body).includes(`${c.name}/st`)).length;
+    });
+    expect(flows).toBe(0);
+  });
+
+  it("a sign-in still open blocks deleting its hand-registered client; one expired doesn't", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand" }) } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/pend`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/pend/oauth`, { method: "POST" });
+    expect((await asJson(c.token, "/v1/clients/self/secrets/google", { method: "DELETE" }, 409)).error.message).toContain(`${c.name}/pend`);
+    // A value that isn't a client at all says so.
+    expect((await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: "not json" } }, 409)).error.message).toContain("isn't a valid OAuth client");
+    await runInDurableObject(broker(), (_: BrokerDO, st) => st.storage.sql.exec("UPDATE oauth_flows SET expires_ms = 1 WHERE body LIKE ?", `%${c.name}/pend%`));
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "DELETE" });
+  });
+
+  it("a hand-registered client given an expiry while its code is exchanged: the tokens are dropped and revoked as it", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${c.id}`], secret: "s3cret" });
+    const value = JSON.stringify({ client_id: "by-hand", client_secret: "s3cret" });
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/exp`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/exp/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value, expires_at: new Date(Date.now() + 86_400_000).toISOString() } });
+    f.holdExchange = false;
+    expect(await callback).toContain("changed while the code was being exchanged");
+    expect(await entryRow(c, "exp")).toBeUndefined();
+    expect(f.revocations.map((r) => r.client)).toEqual(["by-hand"]);
+  });
+
+  it("a hand-registered OAuth client stored to expire is refused at the start", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand" }), expires_at: new Date(Date.now() + 86_400_000).toISOString() } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/x`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    expect((await asJson(c.token, `/v1/catalog/capabilities/${c.name}/x/oauth`, { method: "POST" }, 409)).error.message).toContain("expires");
   });
 
   it("a capability deleted while its start awaits discovery: the start stores no flow, and one made again starts unauthorized", async () => {
@@ -1433,5 +1644,37 @@ describe("an API client's own mcp credentials", () => {
     await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
     expect(await entryRow(c, "two")).toBeUndefined();
     await eventually("the deleted client's tokens revoked at the server", () => f.revocations.length === 2);
+  });
+
+  it("deleting a client revokes tokens it got with its own hand-registered client, which goes with its secrets", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${c.id}`], secret: "s3cret" });
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand", client_secret: "s3cret" }) } });
+    // Two authorizations: every one's client is read before the first revocation's await, not only the first's.
+    const rts: string[] = [];
+    for (const entry of ["cal", "cal2"]) {
+      await asJson(c.token, `/v1/catalog/capabilities/${c.name}/${entry}`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+      expect((await clientAuthorize(c, entry)).callback.status).toBe(200);
+      rts.push((await entryRow(c, entry))!.refresh_token as string);
+    }
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
+    expect(await entryRow(c, "cal")).toBeUndefined();
+    await eventually("both revoked at the server as the hand-registered client", () => f.revocations.length === 2);
+    expect(f.revocations.map((r) => r.client)).toEqual(["by-hand", "by-hand"]);
+    expect(new Set(f.revocations.map((r) => r.token))).toEqual(new Set(rts));
+  });
+
+  it("a server that registers no client tells a client how to bring its own", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "x", f, { authorize: true });
+    const m = (await asJson(c.token, `/v1/catalog/capabilities/${c.name}/x/oauth`, { method: "POST" }, 409)).error.message as string;
+    expect(m).toContain("PUT /v1/clients/self/secrets/<name>");
+    expect(m).toContain("mcp.oauth_client");
+    expect(m).toContain(`${NEST}/v1/oauth/callback/${c.id}`);
+    expect(m).not.toContain("/v1/admin/");
   });
 });

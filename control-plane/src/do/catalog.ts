@@ -371,7 +371,9 @@ export class CatalogDO extends DurableObject<Env> {
     const auth = cap.mcp?.auth;
     if (cap.mcp && isClientMcpAuth(auth) && "authorize" in auth) {
       const prev = this.load().capabilities[name]?.mcp;
-      const held = prev?.url === cap.mcp.url && isClientMcpAuth(prev.auth) && "authorize" in prev.auth ? prev.auth.incarnation : undefined;
+      // A new OAuth client is a new form: tokens one client got are never refreshed as another's.
+      const held = prev?.url === cap.mcp.url && prev.oauth_client === cap.mcp.oauth_client && isClientMcpAuth(prev.auth) && "authorize" in prev.auth
+        ? prev.auth.incarnation : undefined;
       cap = { ...cap, mcp: { ...cap.mcp, auth: { ...auth, incarnation: held ?? newIncarnation() } } };
     }
     if (scope) {
