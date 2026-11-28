@@ -90,15 +90,20 @@ describe("grants, tokens and labels (pure)", () => {
     const within = { credential: "claude_oauth_token" };
     expect(specOutsideGrant(within, grant)).toEqual([]);
     expect(specOutsideGrant({ ...within, credential: "claude_oauth_token:worker" }, grant)).toEqual(["credential claude_oauth_token:worker"]);
-    const mcp = (url: string, auth: string, client?: string) => ({
-      capability: "x", url, auth, tools: null, idempotent: {}, trusted: false, ...(client ? { oauth: { client, scopes: null } } : {}),
+    // A capability of the client's own namespace (`client` set at expansion) whose record is nonetheless the operator's.
+    const mcp = (url: string, auth: string, oauthClient?: string) => ({
+      capability: "x", url, auth, client: "cli_A", tools: null, idempotent: {}, trusted: false, ...(oauthClient ? { oauth: { client: oauthClient, scopes: null } } : {}),
     });
     // An operator's credential is outside every grant, even one whose stored credentials list it; a server alone never is.
     const why = (c: string) => `credential ${c} (x): a client's tools use its own credentials (its secrets, its OAuth) or none, never the operator's`;
     expect(specOutsideGrant({ ...within, mcp: [mcp("https://board.example.com/mcp", "cap:board")] }, grant)).toEqual([why("cap:board")]);
     expect(specOutsideGrant({ ...within, mcp: [mcp("https://evil.example.com/mcp", "cap:github")] }, grant)).toEqual([why("cap:github")]);
     expect(specOutsideGrant({ ...within, mcp: [mcp("https://board.example.com/mcp", "cap:board", "cap:other-client")] }, grant)).toHaveLength(2);
-    expect(specOutsideGrant({ ...within, mcp: [{ capability: "x", url: "https://anywhere.example.net/mcp", tools: null, idempotent: {}, trusted: false } as never] }, grant)).toEqual([]);
+    // The client's own capability with no credential: any server.
+    expect(specOutsideGrant({ ...within, mcp: [{ capability: "x", url: "https://anywhere.example.net/mcp", client: "cli_A", tools: null, idempotent: {}, trusted: false } as never] }, grant)).toEqual([]);
+    // The operator's MCP capability (no `client`), even one with no credential and a URL its stored mcp_urls lists: never a client's.
+    expect(specOutsideGrant({ ...within, mcp: [{ capability: "ops", url: "https://board.example.com/mcp", tools: null, idempotent: {}, trusted: false } as never] }, grant))
+      .toEqual(["mcp capability ops: the operator's; a client's tools use its own credentials (its secrets, its OAuth) or none, never the operator's"]);
     // Whatever a stored grant once said of GitHub: read, it covers none of these.
     const old = storedGrant({ ...grant, repos: ["acme/app"], read_repos: ["acme/lib"], github_push: { workflows: true }, github: { repos: ["acme/app"], permissions: { checks: "write" } } });
     for (const g of [grant, old]) {
@@ -807,7 +812,18 @@ describe("the grant bounds everything in the subtree", () => {
     // ...and on the operator's capability listed in the client's template: refused at spawn.
     const op = `opcap${rand()}`;
     await adminJson(`/v1/admin/capabilities/${op}`, { method: "PUT", body: { mcp: { url: "https://board.example.com/mcp", auth: `cap:${op}` } } });
-    await asJson(c.token, `/v1/catalog/templates/${c.name}/borrow`, { method: "PUT", body: basic({ capabilities: ["nest", op] }) }, 403);
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/borrow`, { method: "PUT", body: basic({ capabilities: ["nest", op] }) }, 403)).error.message)
+      .toContain(`mcp capability ${op}: the operator's`);
+    // One with no credential at all is the operator's too: its connector and budget are shared with the operator's agents.
+    const bare = `opbare${rand()}`;
+    await adminJson(`/v1/admin/capabilities/${bare}`, { method: "PUT", body: { mcp: { url: "https://board.example.com/mcp" } } });
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/borrow2`, { method: "PUT", body: basic({ capabilities: ["nest", bare] }) }, 403)).error.message)
+      .toContain(`mcp capability ${bare}: the operator's`);
+    // The operator spawning into the client's subtree from its own template with one: refused the same way.
+    const opTpl = `optpl${rand()}`;
+    await adminJson(`/v1/admin/templates/${opTpl}`, { method: "PUT", body: basic({ capabilities: ["nest", bare] }) });
+    const spawned = await adminJson("/v1/agents", { body: { template: opTpl, cell: c.cell, owner: a.agent, start: false } }, 403);
+    expect(spawned.error.message).toContain(`mcp capability ${bare}: the operator's`);
     // A grant can't name one either.
     expect((await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token", `cap:${op}`], max_agents: 10 } } }, 400)).error.message)
       .toContain("isn't a Claude setup token");

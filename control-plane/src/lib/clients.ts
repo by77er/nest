@@ -37,7 +37,7 @@ const McpUrlEntry = z.string().min(1).max(2048).refine((u) => {
 export const Grant = z.strictObject({
   /** Where its agents and sandboxes may run. */
   cells: z.array(CellName).max(64).default([]),
-  /** The BrokerDO secrets its agents' specs may name: the model credential, and an mcp capability's `auth` (one with none needs none). Exact. */
+  /** The model credentials (Claude setup tokens) its agents may run on, exactly; never a tool's (docs/control-plane/api/clients/#tool-credentials-are-an-apps-own). */
   credentials: z.array(z.string().min(1).max(160)).max(64).default([]),
   /**
    * Ignored since tool credentials became an app's own (docs/control-plane/api/clients/#tool-credentials-are-an-apps-own,
@@ -69,7 +69,6 @@ export const Grant = z.strictObject({
 });
 export type Grant = z.output<typeof Grant>;
 
-/** Whether an MCP server URL is in the grant: an exact entry, or under a prefix entry ending in `/`. */
 /** Why a client may name no credential of the operator's for a tool: its tools' credentials are its own. */
 const OWN_TOOLS = "a client's tools use its own credentials (its secrets, its OAuth) or none, never the operator's";
 
@@ -83,6 +82,13 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
   const creds = new Set(grant.credentials);
   if (!creds.has(spec.credential)) out.push(`credential ${spec.credential}`);
   for (const m of spec.mcp ?? []) {
+    // An operator's MCP capability is the operator's: its connector, its admission budget and its server's trust are
+    // shared with the operator's own agents, and `mcp_urls` no longer stands between a client and its URL. A client's
+    // tools are its own capabilities, so one of the operator's in a client's spec is outside every grant.
+    if (m.client === undefined) {
+      out.push(`mcp capability ${m.capability}: the operator's; ${OWN_TOOLS}`);
+      continue;
+    }
     // A server that takes no bearer (no `auth`) has no secret to cover: its caller identity is the credential.
     // A client's own record (its secret, its OAuth tokens: docs/control-plane/api/clients/#mcp-credentials)
     // needs no grant, only to be the capability's own client's: expansion derives it from the namespace.
