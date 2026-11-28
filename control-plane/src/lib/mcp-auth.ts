@@ -717,8 +717,11 @@ export class OAuthStore {
         }
       }
     } else {
+      const store = input.owner
+        ? `store it with PUT /v1/clients/self/secrets/<name> {"value": "{\\"client_id\\": …}"}, named as the capability's mcp.oauth_client`
+        : `store it with PUT /v1/admin/secrets/cap:<name> {"value": "{\\"client_id\\": …}"}, named as auth.client`;
       throw oauthError(`${found.as.issuer} supports neither client ID metadata documents (for an https PUBLIC_BASE_URL) nor registration: `
-        + `register a client there and store it with PUT /v1/admin/secrets/cap:<name> {"value": "{\\"client_id\\": …}"}, named as auth.client`, 409);
+        + `register a client there (its redirect URI ${redirect_uri}) and ${store}`, 409);
     }
     const scopes = input.scopes ?? input.auth.scopes ?? found.scopes;
     const { verifier, challenge } = await pkcePair();
@@ -784,7 +787,7 @@ export class OAuthStore {
     // (it may have been on its way back while the write landed).
     if (!held || this.revocationsOf(flow) !== revokedBefore || this.overtakenByWrite(flow.ref, writesBefore)) {
       // Revoked meanwhile: these tokens are never stored, and are revoked at the server where it can be.
-      const r = await this.revokeAtServer({ issuer: flow.issuer, client: flow.client, refresh_token: a.refresh_token, access_token: a.access_token });
+      const r = await this.revokeAtServer({ issuer: flow.issuer, client, refresh_token: a.refresh_token, access_token: a.access_token });
       return refuse(`${flow.capability}'s authorization was revoked while its code was being exchanged; the new tokens were dropped (at the server: ${r.server})`, flow);
     }
     const now = Date.now();
@@ -856,9 +859,11 @@ export class OAuthStore {
     for (const f of this.d.sql.exec<{ state: string; body: string }>("SELECT state, body FROM oauth_flows").toArray()) {
       if ((JSON.parse(f.body) as { capability?: string }).capability === capability) this.d.sql.exec("DELETE FROM oauth_flows WHERE state = ?", f.state);
     }
+    // Each record's client, read now: a pre-registered client is a secret its owner's deletion takes with it.
+    const clients = rows.map((row) => this.clientNow(row.client));
     const out: { ref: string; issuer: string; server: ServerRevocation }[] = [];
-    for (const row of rows) {
-      const { server, reason } = await this.revokeAtServer(row);
+    for (const [i, row] of rows.entries()) {
+      const { server, reason } = await this.revokeAtServer({ ...row, client: clients[i]! });
       this.d.audit({ event: "oauth_revoked", capability, ref: row.ref, issuer: row.issuer, caller, reason: reason ? `${server}: ${reason.slice(0, 200)}` : server });
       out.push({ ref: row.ref, issuer: row.issuer, server });
     }
@@ -886,9 +891,12 @@ export class OAuthStore {
       const flow = JSON.parse(f.body) as { ref?: string };
       if (typeof flow.ref === "string" && owned(flow.ref)) this.d.sql.exec("DELETE FROM oauth_flows WHERE state = ?", f.state);
     }
+    // Each record's client, read in this same first step: a deleted client's secrets (its pre-registered
+    // clients among them) go right after this call returns, before any revocation below authenticates.
+    const clients = rows.map((row) => this.clientNow(row.client));
     const out: { ref: string; issuer: string; server: ServerRevocation }[] = [];
-    for (const row of rows) {
-      const { server, reason } = await this.revokeAtServer(row);
+    for (const [i, row] of rows.entries()) {
+      const { server, reason } = await this.revokeAtServer({ ...row, client: clients[i]! });
       this.d.audit({ event: "oauth_revoked", capability: row.capability, ref: row.ref, issuer: row.issuer, caller, reason: reason ? `${server}: ${reason.slice(0, 200)}` : server });
       out.push({ ref: row.ref, issuer: row.issuer, server });
     }
@@ -944,13 +952,23 @@ export class OAuthStore {
    * as the client that got it. `unsupported`: the server lists no revocation endpoint; `failed`: its
    * metadata or the request failed (the tokens may live on there); `no_tokens`: nothing to revoke.
    */
-  private async revokeAtServer(t: { issuer: string; client: ClientRef; refresh_token: string | null; access_token: string | null }): Promise<{ server: ServerRevocation; reason?: string }> {
+  /** A record's client as it is now, or why it can't be read (a revocation then reports `failed`). */
+  private clientNow(c: ClientRef): OAuthClient | Error {
+    try {
+      return this.client(c, null);
+    } catch (e) {
+      return e instanceof Error ? e : new Error(String(e));
+    }
+  }
+
+  private async revokeAtServer(t: { issuer: string; client: OAuthClient | Error; refresh_token: string | null; access_token: string | null }): Promise<{ server: ServerRevocation; reason?: string }> {
     const token = t.refresh_token ?? t.access_token;
     if (token === null) return { server: "no_tokens" };
     try {
+      if (t.client instanceof Error) throw t.client;
       const as = await authServerMetadata(new URL(t.issuer), this.d.allowLoopback);
       if (!as.revocation_endpoint) return { server: "unsupported" };
-      const r = await revokeToken(as.revocation_endpoint, this.client(t.client, as), token, t.refresh_token !== null ? "refresh_token" : "access_token");
+      const r = await revokeToken(as.revocation_endpoint, t.client, token, t.refresh_token !== null ? "refresh_token" : "access_token");
       return r.ok ? { server: "revoked" } : { server: "failed", reason: r.why };
     } catch (e) {
       return { server: "failed", reason: e instanceof NestError ? e.detail : String(e) };

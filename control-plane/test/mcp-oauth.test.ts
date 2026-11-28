@@ -994,8 +994,11 @@ describe("an API client's own mcp credentials", () => {
     await put(b, { auth: { authorize: true }, oauth_client: "google" });
     expect((await asJson(b.token, `/v1/catalog/capabilities/${b.name}/cal/oauth`, { method: "POST" }, 409)).error.message).toContain(`client-secret:${b.id}:google`);
 
-    // Another OAuth client is another form: a new incarnation, unauthorized, and the old tokens revoked.
+    // Another OAuth client is another form: a new incarnation, unauthorized, and the old tokens revoked at the
+    // server as the client that got them, even once the app has deleted that client's secret.
+    const rt = (await grantRow(ref)).refresh_token as string;
     const second = await put(a, { auth: { authorize: true }, oauth_client: "google2" });
+    expect(f.revocations).toEqual([{ token: rt, hint: "refresh_token", client: "by-hand" }]);
     expect(second.mcp.auth.incarnation).not.toBe(first.mcp.auth.incarnation);
     expect(await grantRow(ref)).toBeUndefined();
     expect((await asJson(a.token, `/v1/catalog/capabilities/${a.name}/cal/oauth`)).status).toBe("unauthorized");
@@ -1511,5 +1514,32 @@ describe("an API client's own mcp credentials", () => {
     await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
     expect(await entryRow(c, "two")).toBeUndefined();
     await eventually("the deleted client's tokens revoked at the server", () => f.revocations.length === 2);
+  });
+
+  it("deleting a client revokes tokens it got with its own hand-registered client, which goes with its secrets", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${c.id}`], secret: "s3cret" });
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand", client_secret: "s3cret" }) } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/cal`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    expect((await clientAuthorize(c, "cal")).callback.status).toBe(200);
+    const rt = (await entryRow(c, "cal"))!.refresh_token as string;
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
+    expect(await entryRow(c, "cal")).toBeUndefined();
+    await eventually("revoked at the server as the hand-registered client", () => f.revocations.length === 1);
+    expect(f.revocations).toEqual([{ token: rt, hint: "refresh_token", client: "by-hand" }]);
+  });
+
+  it("a server that registers no client tells a client how to bring its own", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await putCap(c, "x", f, { authorize: true });
+    const m = (await asJson(c.token, `/v1/catalog/capabilities/${c.name}/x/oauth`, { method: "POST" }, 409)).error.message as string;
+    expect(m).toContain("PUT /v1/clients/self/secrets/<name>");
+    expect(m).toContain("mcp.oauth_client");
+    expect(m).toContain(`${NEST}/v1/oauth/callback/${c.id}`);
+    expect(m).not.toContain("/v1/admin/");
   });
 });
