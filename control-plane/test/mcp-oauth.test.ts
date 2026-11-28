@@ -1149,6 +1149,40 @@ describe("an API client's own mcp credentials", () => {
     expect(flows).toBe(0);
   });
 
+  it("a sign-in still open blocks deleting its hand-registered client; one expired doesn't", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand" }) } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/pend`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/pend/oauth`, { method: "POST" });
+    expect((await asJson(c.token, "/v1/clients/self/secrets/google", { method: "DELETE" }, 409)).error.message).toContain(`${c.name}/pend`);
+    // A value that isn't a client at all says so.
+    expect((await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: "not json" } }, 409)).error.message).toContain("isn't a valid OAuth client");
+    await runInDurableObject(broker(), (_: BrokerDO, st) => st.storage.sql.exec("UPDATE oauth_flows SET expires_ms = 1 WHERE body LIKE ?", `%${c.name}/pend%`));
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "DELETE" });
+  });
+
+  it("a hand-registered client given an expiry while its code is exchanged: the tokens are dropped and revoked as it", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${c.id}`], secret: "s3cret" });
+    const value = JSON.stringify({ client_id: "by-hand", client_secret: "s3cret" });
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value } });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/exp`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/exp/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value, expires_at: new Date(Date.now() + 86_400_000).toISOString() } });
+    f.holdExchange = false;
+    expect(await callback).toContain("changed while the code was being exchanged");
+    expect(await entryRow(c, "exp")).toBeUndefined();
+    expect(f.revocations.map((r) => r.client)).toEqual(["by-hand"]);
+  });
+
   it("a hand-registered OAuth client stored to expire is refused at the start", async () => {
     const f = new FakeAuth(rand(), { cimd: false, registration: false });
     fakes.set(f.id, f);
@@ -1618,13 +1652,18 @@ describe("an API client's own mcp credentials", () => {
     const c = await newClient([f.server]);
     f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${c.id}`], secret: "s3cret" });
     await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand", client_secret: "s3cret" }) } });
-    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/cal`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
-    expect((await clientAuthorize(c, "cal")).callback.status).toBe(200);
-    const rt = (await entryRow(c, "cal"))!.refresh_token as string;
+    // Two authorizations: every one's client is read before the first revocation's await, not only the first's.
+    const rts: string[] = [];
+    for (const entry of ["cal", "cal2"]) {
+      await asJson(c.token, `/v1/catalog/capabilities/${c.name}/${entry}`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+      expect((await clientAuthorize(c, entry)).callback.status).toBe(200);
+      rts.push((await entryRow(c, entry))!.refresh_token as string);
+    }
     await adminJson(`/v1/admin/clients/${c.id}`, { method: "DELETE" });
     expect(await entryRow(c, "cal")).toBeUndefined();
-    await eventually("revoked at the server as the hand-registered client", () => f.revocations.length === 1);
-    expect(f.revocations).toEqual([{ token: rt, hint: "refresh_token", client: "by-hand" }]);
+    await eventually("both revoked at the server as the hand-registered client", () => f.revocations.length === 2);
+    expect(f.revocations.map((r) => r.client)).toEqual(["by-hand", "by-hand"]);
+    expect(new Set(f.revocations.map((r) => r.token))).toEqual(new Set(rts));
   });
 
   it("a server that registers no client tells a client how to bring its own", async () => {

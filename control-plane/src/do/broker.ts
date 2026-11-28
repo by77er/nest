@@ -532,7 +532,8 @@ export class BrokerDO extends DurableObject<Env> {
     };
     const was = idOf(this.secret(key)?.value);
     if (next && next.expires_ms === null && was !== null && idOf(next.value) === was) return;
-    const what = next === null ? "deleted" : next.expires_ms !== null ? "given an expiry" : "rewritten with another client_id";
+    const unreadable = next !== null && idOf(next.value) === null;
+    const what = next === null ? "deleted" : next.expires_ms !== null ? "given an expiry" : unreadable ? "rewritten with a value that isn't a valid OAuth client" : "rewritten with another client_id";
     throw new NestError(ErrorCodes.INVALID_MESSAGE, `${name} is the OAuth client ${uses.join(", ")} authorized with, so it can't be ${what}: `
       + `revoke ${uses.length > 1 ? "those" : "that"} first (DELETE /v1/catalog/capabilities/<ns>/<entry>/oauth, or delete the capability)`, 409);
   }

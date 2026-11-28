@@ -401,6 +401,10 @@ export interface OAuthClient {
  * server that wants one of its own: a service's way to ask for a refresh token (e.g. `access_type=offline` and
  * `prompt=consent`), a sign-in hint. The app that registered the client knows its service; nest names none. Never
  * one nest sets itself (the client, redirect, PKCE, state, resource and scope), so none of those can be replaced.
+ * An allowlist, not a denylist: `request`, `request_uri`, `response_mode` and the like would let a server act on
+ * parameters nest never checked. Parameter names, not services: OpenID Connect's `prompt` and `login_hint`, and
+ * `access_type`, `include_granted_scopes` and `hd`, which servers use for a refresh token, incremental consent and
+ * a domain hint. Another goes in with a change here that says what it does and why it can't override nest's.
  */
 export const AUTHORIZE_PARAM_KEYS: readonly string[] = ["access_type", "prompt", "include_granted_scopes", "login_hint", "hd"];
 const AUTHORIZE_PARAM_VALUE = /^[A-Za-z0-9 ._@:+-]{1,128}$/;
@@ -705,7 +709,7 @@ export class OAuthStore {
     let extra: Record<string, string> | undefined;
     if (input.auth.client) {
       // An OAuth client outlives its authorizations' refresh tokens: one stored to expire would strand them.
-      if (this.d.secretExpires?.(input.auth.client) != null) throw oauthError(`the OAuth client stored as ${input.auth.client} expires: store it without an expiry`, 409);
+      if (input.auth.client.startsWith(CLIENT_SECRET_PREFIX) && this.d.secretExpires?.(input.auth.client) != null) throw oauthError(`the OAuth client stored as ${input.auth.client} expires: store it without an expiry`, 409);
       client = { kind: "pre-registered", secret: input.auth.client, auth_methods: found.as.auth_methods };
       const pre = this.client(client, found.as);
       id = pre.client_id;
@@ -945,7 +949,8 @@ export class OAuthStore {
     for (const r of this.d.sql.exec<{ capability: string; client: string }>("SELECT capability, client FROM oauth_grants").toArray()) {
       if (isIt(JSON.parse(r.client))) out.add(r.capability);
     }
-    for (const f of this.d.sql.exec<{ body: string }>("SELECT body FROM oauth_flows").toArray()) {
+    // An expired flow can't complete (its callback refuses the state), so it holds nothing.
+    for (const f of this.d.sql.exec<{ body: string }>("SELECT body FROM oauth_flows WHERE expires_ms > ?", Date.now()).toArray()) {
       const flow = JSON.parse(f.body) as { capability?: string; client?: unknown };
       if (isIt(flow.client) && typeof flow.capability === "string") out.add(flow.capability);
     }
@@ -1003,7 +1008,8 @@ export class OAuthStore {
    */
   /** Whether the hand-registered client `c` names is still stored, unexpired, as client `id`. */
   private sameClient(c: Extract<ClientRef, { kind: "pre-registered" }>, id: string): boolean {
-    if (this.d.secretExpires?.(c.secret) != null) return false;
+    // An expiry counts against a client's own secret only, which its guard keeps from getting one; the operator's are theirs.
+    if (c.secret.startsWith(CLIENT_SECRET_PREFIX) && this.d.secretExpires?.(c.secret) != null) return false;
     const now = this.clientNow(c);
     return !(now instanceof Error) && now.client_id === id;
   }
