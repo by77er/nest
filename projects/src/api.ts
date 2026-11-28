@@ -12,7 +12,7 @@ import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSID
 import { prNumberOf } from "./prs";
 import { attachableRepos, repoAttachable } from "./installations";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, problems, PutSecret, Settings as SettingsBody, Spec, UpdateReviewer, UpdateRoutine, UpdateTask } from "./requests";
+import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, GUILD, MAX_LINKS, Network, problems, PutSecret, Settings as SettingsBody, Spec, UpdateReviewer, UpdateRoutine, UpdateTask } from "./requests";
 import type { RepoBinding } from "./do/directory";
 import type { ProjectSettings, Settings } from "./do/project";
 import { githubFor, PERMISSIONS } from "./github";
@@ -278,6 +278,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   const route = rest[0] === "secrets" && rest.length === 2 ? `${m} secrets/:name`
     : rest[0] === "secret-requests" && rest.length === 3 ? `${m} secret-requests/:id/${rest[2]}`
     : rest[0] === "memory" && rest.length === 2 ? `${m} memory/:key`
+    : rest[0] === "links" && rest.length === 2 ? `${m} links/:guild`
     : rest[0] === "reviewers" && rest.length === 2 ? `${m} reviewers/:reviewer`
     : rest[0] === "reviews" && rest.length === 4 && /^[1-9][0-9]{0,9}$/.test(rest[1]!) && /^[0-9a-f]{40}$/.test(rest[2]!) ? `${m} reviews/:pr/:sha/${rest[3]}`
     : rest[0] === "stops" && (rest.length === 2 || rest.length === 3) && /^agt_[A-Za-z0-9]{1,64}$/.test(rest[1]!) ? `${m} ${["stops", ":agent", ...rest.slice(2)].join("/")}`
@@ -630,6 +631,14 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       return done(await p.stopRun(rest[1]!));
     case "GET proposals":
       return done(await p.proposals());
+    // The Discord servers the project is linked to (README.md#linked-servers-discord): only here, behind Access.
+    case "GET links":
+      return json({ links: await directory(env).links(pid), max: MAX_LINKS });
+    case "PUT links/:guild":
+      return done(await directory(env).link(pid, rest[1]!));
+    case "DELETE links/:guild":
+      if (!GUILD.test(rest[1]!)) return err(400, "a Discord server's id is its number: 1 to 25 digits, without a leading zero");
+      return done(await directory(env).unlink(pid, rest[1]!));
     case "POST proposals/:proposal/accept":
       return done(await p.acceptProposal(rest[1]!));
     case "POST proposals/:proposal/decline": {

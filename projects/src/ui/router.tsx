@@ -129,7 +129,7 @@ const routines = createRoute({
   component: RoutinesPage,
 });
 // The project (the parent's loader) is the form; its workflows setting and live workers read the secrets' answer.
-const settings = createRoute({ getParentRoute: () => project, path: "settings", loader: viewReads((id) => [reads.secrets(id)]), component: SettingsPage });
+const settings = createRoute({ getParentRoute: () => project, path: "settings", loader: viewReads((id) => [reads.secrets(id), reads.links(id)]), component: SettingsPage });
 const network = createRoute({ getParentRoute: () => project, path: "network", loader: viewReads((id) => [reads.network(id)]), component: NetworkPage });
 // The queue, and whether proposals wait (which changes what an empty queue says).
 const triage = createRoute({ getParentRoute: () => project, path: "triage", loader: viewReads((id) => [reads.issues(id), reads.proposals(id)]), component: TriagePage });

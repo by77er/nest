@@ -1,10 +1,11 @@
 // DirectoryDO, one instance (README.md#pieces): the projects, repo → project, agent → {project, role,
 // task, pr}, the nest events and GitHub deliveries already handled (deduplicated by id), the catalog
-// sync's state, and the GitHub App's id an older release recorded.
+// sync's state, the GitHub App's id an older release recorded, and which Discord servers each project is
+// linked to (README.md#linked-servers-discord).
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { CreateProject, REPO } from "../requests";
+import { CreateProject, GUILD, MAX_LINKS, REPO } from "../requests";
 import { fail, migrate, ok, type Result } from "../sql";
 import { type OutboxPolicy, outboxStep, verdict } from "../outbox";
 import { type CreateSpec, finishProject } from "../creation";
@@ -38,7 +39,7 @@ export interface AgentRoute {
 /** How long a handled event's id is kept for deduplication (nest retries for far less). */
 const SEEN_KEEP_MS = 7 * 24 * 3600 * 1000;
 
-const MIGRATIONS = [
+export const MIGRATIONS = [
   [
     "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, repo TEXT NOT NULL UNIQUE, created_ms INTEGER NOT NULL)",
     "CREATE TABLE agents (agent TEXT PRIMARY KEY, project TEXT, role TEXT, task TEXT, pr INTEGER, recorded_ms INTEGER NOT NULL)",
@@ -106,7 +107,21 @@ const MIGRATIONS = [
     `CREATE TRIGGER projects_repo_gen AFTER UPDATE OF repo_id ON projects WHEN OLD.repo_id IS NOT NEW.repo_id
       BEGIN UPDATE projects SET repo_gen = repo_gen + 1 WHERE id = NEW.id; END`,
   ],
+  [
+    // The Discord servers (guilds) the owner linked each project to (README.md#linked-servers-discord): the linked
+    // client's agents of that guild read its board and propose tasks. A project's removal takes its links with it,
+    // whichever code (or release) removes it.
+    "CREATE TABLE links (guild TEXT NOT NULL, project TEXT NOT NULL, created_ms INTEGER NOT NULL, PRIMARY KEY (guild, project))",
+    "CREATE INDEX links_project ON links (project)",
+    "CREATE TRIGGER projects_links AFTER DELETE ON projects BEGIN DELETE FROM links WHERE project = OLD.id; END",
+  ],
 ] as const;
+
+/** A project's link to a Discord server (README.md#linked-servers-discord). */
+export interface Link {
+  guild: string;
+  created_ms: number;
+}
 
 /** A project's repo binding (README.md#the-repos-binding), as the Admin page shows it. */
 export interface RepoBinding {
@@ -525,6 +540,48 @@ export class DirectoryDO extends DurableObject<Env> {
   async lastSync(): Promise<SyncState | null> {
     const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'last'").toArray()[0];
     return row ? JSON.parse(row.v) : null;
+  }
+
+  // --- linked servers (README.md#linked-servers-discord) ---------------------------------------------------
+
+  /** The Discord servers a project is linked to, oldest first. */
+  async links(project: string): Promise<Link[]> {
+    return this.sql.exec<{ guild: string; created_ms: number }>("SELECT guild, created_ms FROM links WHERE project = ? ORDER BY created_ms, guild", project)
+      .toArray().map((r) => ({ guild: r.guild, created_ms: r.created_ms }));
+  }
+
+  /** The owner links a ready project to a Discord server: once (a second link is the first), at most MAX_LINKS per project. */
+  async link(project: string, guild: string): Promise<Result<Link>> {
+    if (!GUILD.test(guild)) return fail(400, "a Discord server's id is its number: 1 to 25 digits, without a leading zero");
+    const p = await this.getProject(project);
+    if (!p || p.state !== "ready") return fail(404, "unknown project");
+    const had = this.sql.exec<{ created_ms: number }>("SELECT created_ms FROM links WHERE guild = ? AND project = ?", guild, project).toArray()[0];
+    if (had) return ok({ guild, created_ms: had.created_ms });
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM links WHERE project = ?", project).one().n >= MAX_LINKS) {
+      return fail(409, `a project is linked to at most ${MAX_LINKS} Discord servers: remove one first`);
+    }
+    const created_ms = Date.now();
+    this.sql.exec("INSERT INTO links (guild, project, created_ms) VALUES (?, ?, ?)", guild, project, created_ms);
+    return ok({ guild, created_ms });
+  }
+
+  /** The owner removes a link: that server's agents reach the project no longer, from their next call. */
+  async unlink(project: string, guild: string): Promise<Result<{ removed: string }>> {
+    return this.sql.exec("DELETE FROM links WHERE guild = ? AND project = ?", guild, project).rowsWritten > 0
+      ? ok({ removed: guild })
+      : fail(404, `the project isn't linked to ${guild}`);
+  }
+
+  /** The ready projects linked to a Discord server, by name: all a linked client's agent of that server may know of. */
+  async linkedProjects(guild: string): Promise<{ id: string; name: string; repo: string }[]> {
+    return this.sql.exec<{ id: string; name: string; repo: string }>(
+      "SELECT p.id, p.name, p.repo FROM links l JOIN projects p ON p.id = l.project WHERE l.guild = ? AND p.pending IS NULL ORDER BY p.name, p.id", guild,
+    ).toArray().map((r) => ({ id: r.id, name: r.name, repo: r.repo }));
+  }
+
+  /** Whether a ready project is linked to a Discord server: the only way a linked client's agent reaches it. */
+  async isLinked(guild: string, project: string): Promise<boolean> {
+    return this.sql.exec("SELECT 1 FROM links l JOIN projects p ON p.id = l.project WHERE l.guild = ? AND l.project = ? AND p.pending IS NULL", guild, project).toArray().length > 0;
   }
 }
 

@@ -26,6 +26,7 @@ export const keys = {
   proposals: (id: string) => ["projects", id, "proposals"] as const,
   memory: (id: string) => ["projects", id, "memory"] as const,
   issues: (id: string) => ["projects", id, "issues"] as const,
+  links: (id: string) => ["projects", id, "links"] as const,
   syncState: ["admin", "sync-state"] as const,
   bindings: ["admin", "bindings"] as const,
   attachableRepos: ["repos"] as const,
@@ -63,6 +64,8 @@ export const reads = {
   runs: (id: string) => queryOptions({ queryKey: keys.runs(id), queryFn: () => api.routineRuns(id), refetchInterval: POLL.routines }),
   proposals: (id: string) => queryOptions({ queryKey: keys.proposals(id), queryFn: () => api.proposals(id), refetchInterval: POLL.routines }),
   memory: (id: string) => queryOptions({ queryKey: keys.memory(id), queryFn: () => api.memory(id), refetchInterval: POLL.routines }),
+  // Only the owner changes them, from this page: not polled.
+  links: (id: string) => queryOptions({ queryKey: keys.links(id), queryFn: () => api.links(id) }),
   syncState: () => queryOptions({ queryKey: keys.syncState, queryFn: api.syncState }),
   bindings: () => queryOptions({ queryKey: keys.bindings, queryFn: api.bindings }),
 };
@@ -694,5 +697,29 @@ export function useDeleteNote(id: string) {
     mutationFn: (key: string) => api.deleteNote(id, key),
     meta: { failure: "The note wasn't deleted" },
     onSettled: () => qc.invalidateQueries({ queryKey: keys.memory(id) }),
+  });
+}
+
+// --- linked Discord servers (README.md#linked-servers-discord) --------------------------------------------
+
+export const useLinks = (id: string) => useRead(reads.links(id));
+
+/** Link a Discord server: its refusal is shown by the form. */
+export function useLink(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (guild: string) => api.link(id, guild),
+    meta: { inline: true },
+    onSettled: () => qc.invalidateQueries({ queryKey: keys.links(id) }),
+  });
+}
+
+/** Remove a link: that server's agents reach the project no longer. */
+export function useUnlink(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (guild: string) => api.unlink(id, guild),
+    meta: { failure: "The Discord server wasn't removed" },
+    onSettled: () => qc.invalidateQueries({ queryKey: keys.links(id) }),
   });
 }

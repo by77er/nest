@@ -187,6 +187,14 @@ export const UpdateReviewer = z.strictObject(Object.fromEntries(Object.entries(R
 export const problems = (e: z.ZodError): string => e.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ");
 /** Declining a routine's proposed task: an optional reason, kept on it. */
 export const DeclineProposal = z.strictObject({ reason: z.string().max(500).optional() });
+/**
+ * A Discord server's (guild's) id, as `PUT /api/projects/:id/links/:guild` takes it and the Discord bot labels its
+ * agents (README.md#linked-servers-discord): a snowflake, 1 to 25 digits, without a leading zero (so one server has
+ * one spelling).
+ */
+export const GUILD = /^[1-9][0-9]{0,24}$/;
+/** The Discord servers one project may be linked to. */
+export const MAX_LINKS = 20;
 
 export type CreateProjectBody = z.input<typeof CreateProject>;
 export type SettingsBody = z.input<typeof Settings>;

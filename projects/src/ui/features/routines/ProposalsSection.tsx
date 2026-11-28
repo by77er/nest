@@ -1,5 +1,6 @@
-// The tasks routines proposed, waiting for the owner (README.md#routines): each with its title, its
-// routine, run and when, and its body as plain text (an agent wrote it after reading anyone's text, so
+// The tasks routines and linked Discord servers proposed, waiting for the owner (README.md#routines,
+// README.md#linked-servers-discord): each with its title, where it came from (its routine and run, or its
+// server and agent) and when, and its body as plain text (an agent wrote it after reading anyone's text, so
 // nothing in it is rendered as markup or followed), its first lines with "Show more" for the rest, as
 // Triage shows an issue. Accept makes a draft task on the board; Decline, at the right edge as on Triage,
 // drops it with an optional reason. Shown on the Routines page and, when there are any, on Triage under
@@ -12,7 +13,7 @@ import { useId, useRef, useState } from "react";
 import { useProposals, useTriageProposal } from "../../api/queries";
 import type { Proposal } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
+import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, Token, weight } from "../../layout";
 import { preview } from "../triage/TriagePage";
 import { UntrustedBadge } from "./Untrusted";
 
@@ -48,7 +49,22 @@ function ProposalCard({ projectId, p }: { projectId: string; p: Proposal }) {
         </Text>
         <MetaRow>
           <UntrustedBadge what={`the proposed task “${p.title}”`} />
-          <MetaItem>From the routine {p.routine_name} (run {p.run})</MetaItem>
+          {/* Ids as ids (mono, each on one line), as Settings shows a server's; a server's agent a fact of its own, so a
+              narrow card breaks between them, not inside one. */}
+          {p.guild ? (
+            <>
+              <MetaItem>
+                From the Discord server <Token nowrap>{p.guild}</Token>
+              </MetaItem>
+              <MetaItem>
+                agent <Token nowrap>{p.run}</Token>
+              </MetaItem>
+            </>
+          ) : (
+            <MetaItem>
+              From the routine {p.routine_name} (run <Token nowrap>{p.run}</Token>)
+            </MetaItem>
+          )}
           <MetaItem title={exact(p.created_ms)}>{ago(p.created_ms)}</MetaItem>
         </MetaRow>
         {body && (
@@ -94,12 +110,12 @@ export function ProposalsSection({ projectId, quietWhenEmpty = false }: { projec
         <ErrorState title="The proposed tasks couldn't be loaded" error={proposals.error} onRetry={() => void proposals.refetch()} />
       ) : proposals.data.length === 0 ? (
         <Panel>
-          <EmptyState icon={IconInbox} title="Nothing proposed" description="Tasks a routine proposes wait here for you to accept or decline." />
+          <EmptyState icon={IconInbox} title="Nothing proposed" description="Tasks a routine or a linked Discord server proposes wait here for you to accept or decline." />
         </Panel>
       ) : (
         <Stack gap="md">
           <Text fz="sm" c="dimmed">
-            Routines propose these from what their agents read. Check each before you accept it: accepted, it's a draft on the board for you or the manager to spec.
+            Routines and linked Discord servers propose these from what their agents read. Check each before you accept it: accepted, it's a draft on the board for you or the manager to spec.
           </Text>
           <Stack gap="md" role="list" aria-label="Proposed tasks">
             {shown.map((p) => (

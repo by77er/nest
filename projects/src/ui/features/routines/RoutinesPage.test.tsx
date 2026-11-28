@@ -145,8 +145,8 @@ describe("the Routines page", () => {
   it("a proposed task's text is plain text; Accept makes it a draft, Decline drops it", async () => {
     const api = new FakeApi();
     api.proposals = [
-      { id: "prp_a", routine: "rtn_a", routine_name: "Spontaneous review", run: "run_a", title: "Fix the race", body: "<b>bold</b> and [a link](javascript:alert(1))", state: "untriaged", task: null, reason: null, created_ms: 1 },
-      { id: "prp_b", routine: "rtn_a", routine_name: "Spontaneous review", run: "run_a", title: "Meh", body: "", state: "untriaged", task: null, reason: null, created_ms: 2 },
+      { id: "prp_a", routine: "rtn_a", routine_name: "Spontaneous review", run: "run_a", guild: null, source: "routine:rtn_a/run_a", title: "Fix the race", body: "<b>bold</b> and [a link](javascript:alert(1))", state: "untriaged", task: null, reason: null, created_ms: 1 },
+      { id: "prp_b", routine: "rtn_a", routine_name: "Spontaneous review", run: "run_a", guild: null, source: "routine:rtn_a/run_a", title: "Meh", body: "", state: "untriaged", task: null, reason: null, created_ms: 2 },
     ];
     const { user } = renderApp("/projects/prj_one/routines", api);
     const card = await screen.findByText("Fix the race").then((h) => h.closest("[data-proposal]") as HTMLElement);
@@ -206,8 +206,8 @@ describe("the Routines page", () => {
     const api = new FakeApi();
     const long = Array.from({ length: 12 }, (_, k) => `Line ${k + 1} of the body.`).join("\n");
     api.proposals = [
-      { id: "prp_long", routine: "rtn_a", routine_name: "R", run: "run_a", title: "Long", body: long, state: "untriaged", task: null, reason: null, created_ms: 1 },
-      ...Array.from({ length: 11 }, (_, k) => ({ id: `prp_p${k}`, routine: "rtn_a", routine_name: "R", run: "run_a", title: `P${k}`, body: "b", state: "untriaged" as const, task: null, reason: null, created_ms: 2 + k })),
+      { id: "prp_long", routine: "rtn_a", routine_name: "R", run: "run_a", guild: null, source: "routine:rtn_a/run_a", title: "Long", body: long, state: "untriaged", task: null, reason: null, created_ms: 1 },
+      ...Array.from({ length: 11 }, (_, k) => ({ id: `prp_p${k}`, routine: "rtn_a", routine_name: "R", run: "run_a", guild: null, source: "routine:rtn_a/run_a", title: `P${k}`, body: "b", state: "untriaged" as const, task: null, reason: null, created_ms: 2 + k })),
     ];
     api.routines = [routine({ id: "rtn_a", name: "R" })];
     api.runs = Array.from({ length: 13 }, (_, k) => run({ routine: "rtn_a", n: 13 - k }));

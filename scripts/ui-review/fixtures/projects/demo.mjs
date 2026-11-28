@@ -507,8 +507,10 @@ const RICH = [
       triggers: { timer: { kind: "daily", time: "07:30", tz: "Europe/London" }, tasks_done: null, prs_merged: null }, next_timer_ms: now + 9 * 3_600_000, runs: 0 }),
   ];
   const proposals = noRoutines || variant === "triage-empty" ? [] : [
-    { id: "prp_a1b2", routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", title: "Handle a missing thumbnail in the gadget list", body: "src/routes/gadgets.ts:84 reads `thumb.url` without checking that the thumbnail exists; a gadget created without an image renders a broken list row.\n\nFix: fall back to the placeholder, and add a test for a gadget with no image.", state: "untriaged", task: null, reason: null, created_ms: now - 3 * 3_600_000 },
-    { id: "prp_c3d4", routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", title: "Close the export stream on a client abort", body: "src/export/csv.ts keeps writing after the client disconnects (no `signal` check), so an aborted export runs to the end.", state: "untriaged", task: null, reason: null, created_ms: now - 3 * 3_600_000 + 60_000 },
+    { id: "prp_a1b2", routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", guild: null, source: "routine:rtn_review/run_rv2b7d", title: "Handle a missing thumbnail in the gadget list", body: "src/routes/gadgets.ts:84 reads `thumb.url` without checking that the thumbnail exists; a gadget created without an image renders a broken list row.\n\nFix: fall back to the placeholder, and add a test for a gadget with no image.", state: "untriaged", task: null, reason: null, created_ms: now - 3 * 3_600_000 },
+    { id: "prp_c3d4", routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", guild: null, source: "routine:rtn_review/run_rv2b7d", title: "Close the export stream on a client abort", body: "src/export/csv.ts keeps writing after the client disconnects (no `signal` check), so an aborted export runs to the end.", state: "untriaged", task: null, reason: null, created_ms: now - 3 * 3_600_000 + 60_000 },
+    // A linked Discord server's (README.md#linked-servers-discord), stored in the routines' shape.
+    { id: "prp_e5f6", routine: "discord:1093847561234567890", routine_name: "Discord server 1093847561234567890", run: "agt_dsc4m9", guild: "1093847561234567890", source: "discord:1093847561234567890/agt_dsc4m9", title: "Show the gadget's owner on its card", body: "Asked for in #feedback: the list doesn't say who made each gadget, so people ping the wrong person about it.", state: "untriaged", task: null, reason: null, created_ms: now - 2 * 3_600_000 },
   ];
   const notes = noRoutines ? [] : [
     { key: "conventions-testing", text: "Tests sit next to their module (foo.ts, foo.test.ts). Integration tests use the staging fixture bucket; never the live one.", source: "routine:Dreaming (run_dr8m1c)", tainted: true, created_ms: now - 6 * DAY, updated_ms: now - 2 * 3_600_000 },
@@ -520,7 +522,7 @@ const RICH = [
     const para = (k) => `Paragraph ${k}: reviewed src/very/long/path/module${k}.ts and found the cache key ignores the locale; https://example.com/${"p".repeat(90)} needs a fix and a test.`;
     const longText = (n) => Array.from({ length: n }, (_, k) => para(k + 1)).join("\n\n");
     for (let k = 0; k < 40; k++) runs.push(rrun(`run_lg${String(k).padStart(4, "0")}`, k % 2 ? "rtn_review" : "rtn_dream", 10 + k, k % 3 ? "timer" : "manual", { summary: k === 0 ? longText(30) : `Run ${k}: short report.`, created: k === 0 ? Array.from({ length: 12 }, (_, j) => ({ kind: "memory_write", key: `note-key-${j}-with-a-fairly-long-name` })) : [] }));
-    for (let k = 0; k < 15; k++) proposals.push({ id: `prp_lg${k}`, routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", title: k === 0 ? "A_very_long_unbroken_proposal_title_" + "q".repeat(120) : `Proposal ${k}: a long-ish title about fixing the export pipeline when the client aborts mid-stream`, body: longText(k % 2 ? 2 : 25), state: "untriaged", task: null, reason: null, created_ms: now - k * 3_600_000 });
+    for (let k = 0; k < 15; k++) proposals.push({ id: `prp_lg${k}`, routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", guild: null, source: "routine:rtn_review/run_rv2b7d", title: k === 0 ? "A_very_long_unbroken_proposal_title_" + "q".repeat(120) : `Proposal ${k}: a long-ish title about fixing the export pipeline when the client aborts mid-stream`, body: longText(k % 2 ? 2 : 25), state: "untriaged", task: null, reason: null, created_ms: now - k * 3_600_000 });
     for (let k = 0; k < 100; k++) notes.push({ key: `note-${k}-${"k".repeat(k % 5 * 8)}`, text: k % 7 === 0 ? longText(4) : `Note ${k}: a convention the agents follow.`, source: k % 3 ? "manager" : "routine:Dreaming (run_dr8m1c)", tainted: k % 3 === 0, created_ms: now - k * DAY, updated_ms: now - k * 3_600_000 });
   }
   // Proposals wait for triage with the issues: the one "Needs you" item counts both, as old as the oldest.
@@ -592,9 +594,15 @@ const RICH = [
       // Ended past its automatic restarts (README.md#the-manager-lifecycle): the owner's Restart.
       ? { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited), 4 times within an hour: restart it when you're ready." }
       : { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null },
-      "/routines": { routines, max_routine_runs: 1, live: noRoutines ? 0 : 1 }, "/routine-runs": runs, "/proposals": proposals, "/memory": notes };
+      "/routines": { routines, max_routine_runs: 1, live: noRoutines ? 0 : 1 }, "/routine-runs": runs, "/proposals": proposals, "/memory": notes,
+      // The Discord servers linked in Settings (README.md#linked-servers-discord).
+      "/links": { links: variant === "links-empty" ? [] : variant === "links-full" ? Array.from({ length: 20 }, (_, k) => ({ guild: String(1093847561234567890n + BigInt(k * 7919)), created_ms: now - (20 - k) * DAY })) : [{ guild: "1093847561234567890", created_ms: now - 5 * DAY }, { guild: "884213097645120512", created_ms: now - 2 * 3_600_000 }], max: 20 } };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
+    // Linking a Discord server (README.md#linked-servers-discord): taken, or refused at the cap (`links-refused`); removing one.
+    const linkTo = /^\/links\/([0-9]+)$/.exec(q);
+    if (linkTo && method === "PUT") return variant === "links-refused" ? [409, { error: "a project is linked to at most 20 Discord servers: remove one first" }] : [200, { guild: linkTo[1], created_ms: now }];
+    if (linkTo && method === "DELETE") return [200, { removed: linkTo[1] }];
     // "Needs you"'s own items without the asks (`?local=1`, README.md#asks).
     if (q === "/attention" && search.get("local") === "1") return [200, attention.filter((x) => x.kind !== "ask" && x.kind !== "asks_unavailable")];
     if (q in routes) return [200, routes[q]];

@@ -1,13 +1,15 @@
-// The MCP servers at /mcp/board, /mcp/task and /mcp/review (README.md#the-mcp-server-agents-see-only-their-own-work):
+// The MCP servers at /mcp/board, /mcp/task, /mcp/review and /mcp/routine (README.md#the-mcp-server-agents-see-only-their-own-work),
+// and /mcp/discord for a linked client's agents (README.md#linked-servers-discord):
 // MCP Streamable HTTP, one JSON-RPC message per POST, answered with JSON (no SSE, no sessions). The
 // methods nest uses (docs/interfaces/remote-mcp/): `initialize`, `notifications/initialized`,
 // `tools/list`, `tools/call`. Every request must carry a valid Nest-Identity (src/identity.ts), or it
 // gets 401/403 and no data.
 
 import { directory, type Env, project, review } from "./env";
-import { type Caller, verifyIdentity } from "./identity";
+import { type Caller, type LinkedCaller, linkedClients, verifyIdentity } from "./identity";
 import { clientIdOf } from "./nest";
-import { SERVERS, type Server, TOOLS } from "./tools";
+import { invalid } from "./schema";
+import { SERVERS, type Server, toolOf, TOOLS } from "./tools";
 
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"];
 
@@ -29,6 +31,7 @@ export async function handleMcp(request: Request, env: Env, server: Server): Pro
   try {
     verdict = await verifyIdentity(request.headers.get("nest-identity"), {
       issuer: env.NEST_CONTROL_PLANE, audience: `${env.PUBLIC_BASE_URL}/mcp/${server}`, server, client,
+      ...(server === "discord" ? { linked: linkedClients(env.LINKED_CLIENTS) } : {}),
     });
   } catch {
     // nest's keys couldn't be fetched: nothing is proven, so nothing is answered.
@@ -72,13 +75,14 @@ export async function handleMcp(request: Request, env: Env, server: Server): Pro
 
 async function call(env: Env, server: Server, caller: Caller, msg: Rpc): Promise<Response> {
   // The connector lists tools for every agent on the server; it names no agent, so it calls nothing.
-  if (caller.kind !== "agent") return new Response(null, { status: 403 });
+  if (caller.kind === "connector") return new Response(null, { status: 403 });
   const name = msg.params?.name;
   const args = msg.params?.arguments ?? {};
   if (typeof name !== "string") return rpcError(msg.id, -32602, "tools/call needs a name");
   if (typeof args !== "object" || args === null || Array.isArray(args)) return rpcError(msg.id, -32602, "arguments must be an object");
   const meta = msg.params?._meta as Record<string, unknown> | undefined;
   const callKey = typeof meta?.["nest/call"] === "string" ? (meta["nest/call"] as string) : null;
+  if (caller.kind === "linked") return linkedCall(env, caller, msg, name, args as Record<string, unknown>, callKey);
 
   const id = caller.labels.project!;
   if (!(await directory(env).getProject(id))) return toolError(msg.id, "unknown project");
@@ -87,6 +91,28 @@ async function call(env: Env, server: Server, caller: Caller, msg: Rpc): Promise
     : await project(env, id).mcpCall(server, caller, name, args as Record<string, unknown>, callKey);
   // Not this server's agent any more (a replaced manager): refused outright, not a tool's failure.
   if ("forbidden" in r && r.forbidden) return new Response(null, { status: 403 });
+  if (r.error !== null || r.result === null) return toolError(msg.id, r.error ?? "no result");
+  return answer(msg.id, { content: [{ type: "text", text: r.result }], structuredContent: JSON.parse(r.result) });
+}
+
+/**
+ * A linked client's agent's call on /mcp/discord (README.md#linked-servers-discord): scoped to the ready projects
+ * the owner linked to its guild. A project that isn't one of them, whether or not it exists, is "unknown project",
+ * so nothing says what else there is.
+ */
+async function linkedCall(env: Env, caller: LinkedCaller, msg: Rpc, name: string, args: Record<string, unknown>, callKey: string | null): Promise<Response> {
+  const def = toolOf("discord", name);
+  if (!def) return toolError(msg.id, `unknown tool ${name}`);
+  const bad = invalid(def.inputSchema, args);
+  if (bad) return toolError(msg.id, bad);
+  const dir = directory(env);
+  if (name === "list_projects") {
+    const result = JSON.stringify({ projects: await dir.linkedProjects(caller.guild) });
+    return answer(msg.id, { content: [{ type: "text", text: result }], structuredContent: JSON.parse(result) });
+  }
+  const id = args.project as string;
+  if (!(await dir.isLinked(caller.guild, id))) return toolError(msg.id, "unknown project");
+  const r = await project(env, id).linkedCall(caller, name, args, callKey);
   if (r.error !== null || r.result === null) return toolError(msg.id, r.error ?? "no result");
   return answer(msg.id, { content: [{ type: "text", text: r.result }], structuredContent: JSON.parse(r.result) });
 }

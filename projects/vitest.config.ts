@@ -61,6 +61,8 @@ export default defineConfig({
                 GITHUB_WEBHOOK_SECRET: `ghsec_${"2".repeat(40)}`,
                 // The fake GitHub's App (test/fake-nest.ts GH_APP_ID).
                 GITHUB_APP_ID: "4242",
+                // The linked client (README.md#linked-servers-discord), with a stray word that names no client.
+                LINKED_CLIENTS: "cli_bot, not-a-client",
                 GITHUB_APP_PRIVATE_KEY: appKey.privateKey,
                 TEST_GITHUB_APP_PUBLIC_KEY: appKey.publicKey,
               },

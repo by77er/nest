@@ -5,7 +5,7 @@
 import { factsOf, step, type TaskEvent } from "../../tasks";
 import type { AttachableRepos, Issue, SecretRequest, SecretsAnswer } from "../api/types";
 import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
-import type { Note, Proposal, RepoBinding, RereadBinding, Routine, RoutineRun } from "../api/types";
+import type { Link, Note, Proposal, RepoBinding, RereadBinding, Routine, RoutineRun } from "../api/types";
 import { PRESETS } from "../../routines";
 import { CODE_REVIEW, MAX_REVIEWERS } from "../../reviewers";
 import type { Reviewer } from "../api/types";
@@ -110,6 +110,8 @@ export class FakeApi {
   runs: RoutineRun[] = [];
   proposals: Proposal[] = [];
   notes: Note[] = [];
+  /** The Discord servers the project is linked to (README.md#linked-servers-discord), as the Worker keeps them. */
+  links: Link[] = [];
   readonly writes: Write[] = [];
   /** Every GET's path, in order. */
   readonly reads: string[] = [];
@@ -240,6 +242,24 @@ export class FakeApi {
     if (parts[2] === "secret-requests" && parts[4] === "done") {
       this.secretRequests = this.secretRequests.filter((r) => r.id !== parts[3]);
       return json({ done: parts[3] });
+    }
+    if (parts[2] === "links") {
+      if (!parts[3] && m === "GET") return json({ links: this.links, max: 20 });
+      const guild = decodeURIComponent(parts[3] ?? "");
+      if (!/^[1-9][0-9]{0,24}$/.test(guild)) return json({ error: "a Discord server's id is its number: 1 to 25 digits, without a leading zero" }, 400);
+      if (m === "PUT") {
+        const had = this.links.find((l) => l.guild === guild);
+        if (had) return json(had);
+        if (this.links.length >= 20) return json({ error: "a project is linked to at most 20 Discord servers: remove one first" }, 409);
+        const l = { guild, created_ms: now };
+        this.links.push(l);
+        return json(l);
+      }
+      if (m === "DELETE") {
+        if (!this.links.some((l) => l.guild === guild)) return json({ error: `the project isn't linked to ${guild}` }, 404);
+        this.links = this.links.filter((l) => l.guild !== guild);
+        return json({ removed: guild });
+      }
     }
     if (parts[2] === "memory" && parts[3] && m === "DELETE") {
       const key = decodeURIComponent(parts[3]);

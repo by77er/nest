@@ -9,12 +9,23 @@ import { MAX_REVIEWERS } from "./reviewers";
 import { MAX_ROUTINES } from "./routines";
 import { TASK_STATES } from "./tasks";
 
-export const SERVERS = ["board", "task", "review", "routine"] as const;
+export const SERVERS = ["board", "task", "review", "routine", "discord"] as const;
 export type Server = (typeof SERVERS)[number];
 export type Role = "manager" | "worker" | "reviewer" | "routine";
 
-/** The role whose agents a server serves. */
-export const ROLE_OF: Record<Server, Role> = { board: "manager", task: "worker", review: "reviewer", routine: "routine" };
+/**
+ * The role whose agents a server serves: one of the app's own, or `linked` for `/mcp/discord`, whose callers
+ * are another client's agents, a client listed in `LINKED_CLIENTS` (README.md#linked-servers-discord).
+ */
+export const ROLE_OF: Record<Server, Role | "linked"> = { board: "manager", task: "worker", review: "reviewer", routine: "routine", discord: "linked" };
+
+/** How many of one Discord server's proposals may wait in a project's triage at once (README.md#linked-servers-discord). */
+export const MAX_LINKED_PROPOSALS = 10;
+/**
+ * How many proposals of every linked Discord server together may wait in a project's triage: below the project's
+ * MAX_UNTRIAGED_PROPOSALS (50), so routines keep room (README.md#linked-servers-discord).
+ */
+export const MAX_LINKED_PROPOSALS_ALL = 25;
 
 export interface ToolDef {
   name: string;
@@ -130,6 +141,9 @@ const REVIEWERS: ToolDef[] = [
     idempotent: true,
   },
 ];
+
+/** A project's id, on /mcp/discord: the caller names one of the projects linked to its guild. */
+const projectId = { type: "string", pattern: "^prj_[a-z0-9]+$", maxLength: 64, description: "The project's id (prj_…), as list_projects gives it." };
 
 export const TOOLS: Record<Server, readonly ToolDef[]> = {
   board: [
@@ -262,6 +276,24 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     },
     ...MEMORY_READ,
     ...MEMORY_WRITE,
+  ],
+  // Another client's agents, the Discord bot's (README.md#linked-servers-discord): every call is scoped to the
+  // projects the owner linked to the caller's guild. They read boards and propose tasks; nothing else.
+  discord: [
+    { name: "list_projects", description: "The projects linked to your Discord server: each one's id, name and GitHub repo.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    { name: "list_tasks", description: "A linked project's board: every task in board order with its state, assignee and PRs.", inputSchema: obj({ project: projectId }, ["project"]), readOnly: true, idempotent: true },
+    { name: "get_task", description: "One task of a linked project: its body, spec and history (not the names of secrets its worker asked for, nor the owner's PR comments to it).", inputSchema: obj({ project: projectId, task: taskId }, ["project", "task"]), readOnly: true, idempotent: true },
+    {
+      name: "recent_activity",
+      description: "What happened on a linked project lately: task PRs merged, tasks done, and reviews with their verdicts and summaries, newest first.",
+      inputSchema: obj({ project: projectId, days: { type: "integer", minimum: 1, maximum: 30, description: "How far back, in days (7 if not given)." } }, ["project"]),
+      readOnly: true, idempotent: true,
+    },
+    {
+      name: "propose_task",
+      description: `Propose a task to a linked project's owner: it goes to their triage queue, marked as from your Discord server. The owner accepts or declines it; nothing is assigned or started. At most ${MAX_LINKED_PROPOSALS} of your server's proposals wait in a project at once.`,
+      inputSchema: obj({ project: projectId, title: str("A short title.", 200), body: str("What is wanted and why: the problem, why it matters, what would fix it.", 20000) }, ["project", "title", "body"]),
+    },
   ],
 };
 
