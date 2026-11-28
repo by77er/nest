@@ -392,7 +392,18 @@ export interface OAuthClient {
   client_secret?: string;
   /** `none`, `client_secret_basic` or `client_secret_post`. */
   auth_method: string;
+  /** A hand-registered client's extra authorization request parameters (`AUTHORIZE_PARAM_KEYS`). */
+  authorize_params?: Record<string, string>;
 }
+
+/**
+ * The extra authorization request parameters a hand-registered client's JSON may carry (`authorize_params`), for a
+ * server that wants one of its own: a service's way to ask for a refresh token (e.g. `access_type=offline` and
+ * `prompt=consent`), a sign-in hint. The app that registered the client knows its service; nest names none. Never
+ * one nest sets itself (the client, redirect, PKCE, state, resource and scope), so none of those can be replaced.
+ */
+export const AUTHORIZE_PARAM_KEYS: readonly string[] = ["access_type", "prompt", "include_granted_scopes", "login_hint", "hd"];
+const AUTHORIZE_PARAM_VALUE = /^[A-Za-z0-9 ._@:+-]{1,128}$/;
 
 /** A pre-registered client's stored JSON; the method defaults to what the AS supports. */
 export function parseClient(json: string, as: Pick<AuthServer, "auth_methods"> | null): OAuthClient {
@@ -405,7 +416,17 @@ export function parseClient(json: string, as: Pick<AuthServer, "auth_methods"> |
   if (!isObj(v) || typeof v.client_id !== "string" || !v.client_id) throw new NestError(ErrorCodes.FORBIDDEN, "the client secret has no client_id", 409);
   const secret = typeof v.client_secret === "string" && v.client_secret ? v.client_secret : undefined;
   const stated = typeof v.token_endpoint_auth_method === "string" ? v.token_endpoint_auth_method : undefined;
-  return { client_id: v.client_id, ...(secret ? { client_secret: secret } : {}), auth_method: stated ?? defaultMethod(!!secret, as?.auth_methods ?? null) };
+  let params: Record<string, string> | undefined;
+  if (v.authorize_params !== undefined) {
+    const p = v.authorize_params;
+    const bad = !isObj(p) ? "isn't an object" : Object.entries(p).find(([k, x]) => !AUTHORIZE_PARAM_KEYS.includes(k) || typeof x !== "string" || !AUTHORIZE_PARAM_VALUE.test(x));
+    if (bad) throw new NestError(ErrorCodes.FORBIDDEN, `the client's authorize_params ${typeof bad === "string" ? bad : `has ${bad[0]}`}: keys are ${AUTHORIZE_PARAM_KEYS.join(", ")}, each a short string`, 409);
+    params = { ...(p as Record<string, string>) };
+  }
+  return {
+    client_id: v.client_id, ...(secret ? { client_secret: secret } : {}), auth_method: stated ?? defaultMethod(!!secret, as?.auth_methods ?? null),
+    ...(params && Object.keys(params).length ? { authorize_params: params } : {}),
+  };
 }
 
 /** A confidential client uses `client_secret_basic` unless the AS lists only `client_secret_post` (RFC 8414 §2's default is basic). */
@@ -436,20 +457,12 @@ export async function registerClient(as: AuthServer, redirectUri: string, client
 
 // --- Authorization and token requests -------------------------------------------------------------------
 
-/**
- * Authorization servers that issue a refresh token only when the request asks for offline access in a
- * parameter of their own, by issuer. Google's (https://developers.google.com/identity/protocols/oauth2/web-server):
- * `access_type=offline` for a refresh token, and `prompt=consent` so an authorization done again gets one too
- * (Google gives one at the first consent only). Without them every access token ends the authorization within an hour.
- */
-export const OFFLINE_PARAMS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
-  "https://accounts.google.com": { access_type: "offline", prompt: "consent" },
-};
-
-export function authorizeUrl(as: Pick<AuthServer, "authorization_endpoint" | "issuer">, p: {
-  client_id: string; redirect_uri: string; challenge: string; state: string; resource: string; scopes: string[] | null;
+export function authorizeUrl(as: Pick<AuthServer, "authorization_endpoint">, p: {
+  client_id: string; redirect_uri: string; challenge: string; state: string; resource: string; scopes: string[] | null; extra?: Record<string, string>;
 }): string {
   const u = new URL(as.authorization_endpoint);
+  // A hand-registered client's own parameters first, then nest's: none of nest's can be replaced.
+  for (const [k, v] of Object.entries(p.extra ?? {})) if (AUTHORIZE_PARAM_KEYS.includes(k)) u.searchParams.set(k, v);
   u.searchParams.set("response_type", "code");
   u.searchParams.set("client_id", p.client_id);
   u.searchParams.set("redirect_uri", p.redirect_uri);
@@ -458,7 +471,6 @@ export function authorizeUrl(as: Pick<AuthServer, "authorization_endpoint" | "is
   u.searchParams.set("state", p.state);
   u.searchParams.set("resource", p.resource);
   if (p.scopes?.length) u.searchParams.set("scope", p.scopes.join(" "));
-  for (const [k, v] of Object.entries(OFFLINE_PARAMS[as.issuer.replace(/\/$/, "")] ?? {})) u.searchParams.set(k, v);
   return u.href;
 }
 
@@ -690,11 +702,14 @@ export class OAuthStore {
     const { redirect_uri, client_id } = oauthUrls(this.d.publicBaseUrl, input.owner?.id);
     let client: ClientRef;
     let id: string;
+    let extra: Record<string, string> | undefined;
     if (input.auth.client) {
       // An OAuth client outlives its authorizations' refresh tokens: one stored to expire would strand them.
       if (this.d.secretExpires?.(input.auth.client) != null) throw oauthError(`the OAuth client stored as ${input.auth.client} expires: store it without an expiry`, 409);
       client = { kind: "pre-registered", secret: input.auth.client, auth_methods: found.as.auth_methods };
-      id = this.client(client, found.as).client_id;
+      const pre = this.client(client, found.as);
+      id = pre.client_id;
+      extra = pre.authorize_params;
     } else if (found.as.cimd && canUseMetadataDocument(this.d.publicBaseUrl, this.d.allowLoopback)) {
       client = { kind: "metadata", client_id };
       id = client_id;
@@ -744,11 +759,16 @@ export class OAuthStore {
     if (this.revocationsOf(flow) !== revokedBefore || this.overtakenByWrite(flow.ref, writesBefore)) {
       throw oauthError(`${input.capability}'s authorization was revoked while this one was starting: start again`, 409);
     }
+    // A hand-registered client read again in this step: one rewritten (another client_id), deleted or given an expiry
+    // across the awaits above would make the flow's URL and its exchange disagree, or strand its tokens.
+    if (client.kind === "pre-registered" && !this.sameClient(client, id)) {
+      throw oauthError(`the OAuth client stored as ${client.secret} changed while this authorization was starting: start again`, 409);
+    }
     this.d.sql.exec("DELETE FROM oauth_flows WHERE expires_ms <= ?", now);
     this.d.sql.exec("INSERT INTO oauth_flows (state, body, expires_ms) VALUES (?, ?, ?)", state, JSON.stringify(flow), now + OAUTH_FLOW_TTL_MS);
     this.d.audit({ event: "oauth_start", capability: input.capability, ref: input.auth.oauth, resource: found.resource, issuer: found.as.issuer, client: id, scope: scopes?.join(" ") ?? null, caller });
     return {
-      authorize_url: authorizeUrl(found.as, { client_id: id, redirect_uri, challenge, state, resource: found.resource, scopes }),
+      authorize_url: authorizeUrl(found.as, { client_id: id, redirect_uri, challenge, state, resource: found.resource, scopes, ...(extra ? { extra } : {}) }),
       expires_ms: now + OAUTH_FLOW_TTL_MS, capability: input.capability, resource: found.resource, issuer: found.as.issuer, client: client.kind, scopes,
     };
   }
@@ -793,6 +813,13 @@ export class OAuthStore {
       // Revoked meanwhile: these tokens are never stored, and are revoked at the server where it can be.
       const r = await this.revokeAtServer({ issuer: flow.issuer, client, refresh_token: a.refresh_token, access_token: a.access_token });
       return refuse(`${flow.capability}'s authorization was revoked while its code was being exchanged; the new tokens were dropped (at the server: ${r.server})`, flow);
+    }
+    // The secret guard can't see a flow whose row is already taken: a hand-registered client rewritten, deleted or
+    // given an expiry while the code was exchanged is caught here, in the step that stores. Tokens got as a client
+    // that is no longer stored as such are never kept: revoked as the client that got them, and refused.
+    if (flow.client.kind === "pre-registered" && !this.sameClient(flow.client, client.client_id)) {
+      const r = await this.revokeAtServer({ issuer: flow.issuer, client, refresh_token: a.refresh_token, access_token: a.access_token });
+      return refuse(`the OAuth client stored as ${flow.client.secret} changed while the code was being exchanged; the new tokens were dropped (at the server: ${r.server})`, flow);
     }
     const now = Date.now();
     const generation = (this.grant(flow.ref)?.generation ?? 0) + 1;
@@ -974,6 +1001,13 @@ export class OAuthStore {
    * as the client that got it. `unsupported`: the server lists no revocation endpoint; `failed`: its
    * metadata or the request failed (the tokens may live on there); `no_tokens`: nothing to revoke.
    */
+  /** Whether the hand-registered client `c` names is still stored, unexpired, as client `id`. */
+  private sameClient(c: Extract<ClientRef, { kind: "pre-registered" }>, id: string): boolean {
+    if (this.d.secretExpires?.(c.secret) != null) return false;
+    const now = this.clientNow(c);
+    return !(now instanceof Error) && now.client_id === id;
+  }
+
   /** A record's client as it is now, or why it can't be read (a revocation then reports `failed`). */
   private clientNow(c: ClientRef): OAuthClient | Error {
     try {

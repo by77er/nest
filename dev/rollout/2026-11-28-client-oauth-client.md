@@ -1,6 +1,6 @@
 # A client's own hand-registered OAuth client (2026-11-28)
 
-**What:** an API client's `{authorize}` mcp capability may name `oauth_client`, one of its own secrets holding a client it registered at the authorization server by hand (Google's MCP servers take neither metadata documents nor registration). Google's authorization requests also ask for offline access (`access_type=offline`, `prompt=consent`).
+**What:** an API client's `{authorize}` mcp capability may name `oauth_client`, one of its own secrets holding a client it registered at the authorization server by hand (Google's MCP servers take neither metadata documents nor registration). Its JSON may carry `authorize_params` (a server's own authorization parameters, such as Google's `access_type=offline` and `prompt=consent` for a refresh token), which the app supplies: nest names no service.
 
 **Not a one-way deploy:** no Durable Object class changes; a `wrangler rollback` is safe, with the gaps below.
 
@@ -13,4 +13,4 @@
 - **The secret guard is this release's:** the previous release lets a client delete or rewrite a secret its authorizations use, which strands their tokens at the server as above.
 - **Agent specs:** a spawn by the previous release expands the capability without the field (`oauth.client: null`), so it passes, and agents run as before: a spec's `oauth.client` isn't read at runtime (the token record's client is).
 - **A capability rewritten while rolled back:** the write drops `oauth_client` but keeps the incarnation (same URL and form, as that release sees it), so the authorization goes on working. After the roll-forward, the app's next write with `oauth_client` is a new form: a new incarnation, the old authorization revoked, and the person authorizes again.
-- **Google's refresh tokens:** an authorization the previous release starts asks for no offline access. For Google it lasts an hour.
+- **`authorize_params`:** the previous release ignores them. An authorization it starts asks Google for no offline access, so it lasts an hour.

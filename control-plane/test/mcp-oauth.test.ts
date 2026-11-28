@@ -10,7 +10,7 @@ import type { BrokerDO } from "../src/do/broker";
 import type { McpConnectorDO } from "../src/do/mcp-connector";
 import { connectorName, grantOf } from "../src/lib/mcp";
 import { specOutsideGrant } from "../src/lib/clients";
-import { authorizeUrl, authServerMetadataUrls, bearerChallenge, clientOfRef, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
+import { authorizeUrl, parseClient, authServerMetadataUrls, bearerChallenge, clientOfRef, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
 import { adminJson, BASE, connectHost, eventually, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -384,15 +384,25 @@ describe("discovery URLs and challenges", () => {
 
 // --- The catalog ---------------------------------------------------------------------------------------------
 
-describe("offline access", () => {
+describe("a hand-registered client's authorize_params", () => {
   const p = { client_id: "c", redirect_uri: "https://nest.test/cb", challenge: "ch", state: "st", resource: "https://r.test/mcp", scopes: ["s"] };
-  it("asks Google for a refresh token in its own parameters, and nobody else", () => {
-    for (const issuer of ["https://accounts.google.com", "https://accounts.google.com/"]) {
-      const q = new URL(authorizeUrl({ issuer, authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth" }, p)).searchParams;
-      expect([q.get("access_type"), q.get("prompt"), q.get("resource"), q.get("code_challenge_method")]).toEqual(["offline", "consent", p.resource, "S256"]);
+  it("adds the client's own parameters, never in place of nest's, and names no service itself", () => {
+    const as = { authorization_endpoint: "https://as.test/x/authorize" };
+    const q = new URL(authorizeUrl(as, { ...p, extra: { access_type: "offline", prompt: "consent" } })).searchParams;
+    expect([q.get("access_type"), q.get("prompt"), q.get("client_id"), q.get("resource")]).toEqual(["offline", "consent", "c", p.resource]);
+    // Without any: nothing extra, whoever the server is.
+    const plain = new URL(authorizeUrl({ authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth" }, p)).searchParams;
+    expect([plain.has("access_type"), plain.has("prompt")]).toEqual([false, false]);
+    // A key nest sets itself can't be smuggled in, even past the parser.
+    const forged = new URL(authorizeUrl(as, { ...p, extra: { client_id: "evil", redirect_uri: "https://evil.test", state: "x" } })).searchParams;
+    expect([forged.get("client_id"), forged.get("redirect_uri"), forged.get("state")]).toEqual(["c", p.redirect_uri, "st"]);
+  });
+
+  it("the client's JSON takes only the listed keys, each a short string", () => {
+    expect(parseClient(JSON.stringify({ client_id: "c", authorize_params: { access_type: "offline", prompt: "consent" } }), null).authorize_params).toEqual({ access_type: "offline", prompt: "consent" });
+    for (const bad of [{ redirect_uri: "https://evil.test" }, { scope: "x" }, { prompt: "a\nb" }, { prompt: 1 }, "offline"]) {
+      expect(() => parseClient(JSON.stringify({ client_id: "c", authorize_params: bad }), null), JSON.stringify(bad)).toThrow(/authorize_params/);
     }
-    const q = new URL(authorizeUrl({ issuer: "https://as.test/x", authorization_endpoint: "https://as.test/x/authorize" }, p)).searchParams;
-    expect([q.has("access_type"), q.has("prompt")]).toEqual([false, false]);
   });
 });
 
@@ -976,9 +986,10 @@ describe("an API client's own mcp credentials", () => {
     // Not stored yet: the start says where the client puts it, its own route, never the operator's.
     const missing = await asJson(a.token, `/v1/catalog/capabilities/${a.name}/cal/oauth`, { method: "POST" }, 409);
     expect(missing.error.message).toContain("PUT /v1/clients/self/secrets/google");
-    await asJson(a.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand", client_secret: "s3cret" }) } });
+    await asJson(a.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand", client_secret: "s3cret", authorize_params: { access_type: "offline", prompt: "consent" } }) } });
 
     const { start, callback, page } = await clientAuthorize(a, "cal");
+    expect(new URL(start.authorize_url).searchParams.get("access_type")).toBe("offline");
     expect(start.client).toBe("pre-registered");
     expect(new URL(start.authorize_url).searchParams.get("client_id")).toBe("by-hand");
     expect(new URL(start.authorize_url).searchParams.get("redirect_uri")).toBe(`${NEST}/v1/oauth/callback/${a.id}`);
@@ -1088,6 +1099,54 @@ describe("an API client's own mcp credentials", () => {
     expect(await callback).toContain("revoked while its code was being exchanged");
     expect(f.revocations).toHaveLength(1);
     expect(f.revocations[0]!.client).toBe("by-hand");
+  });
+
+  it("a hand-registered client rewritten while its code is exchanged: the tokens are dropped and revoked as the client that got them", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false, revocation: true });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    f.clients.set("by-hand", { redirect_uris: [`${NEST}/v1/oauth/callback/${c.id}`], secret: "s3cret" });
+    const put = (id: string) => asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: id, client_secret: "s3cret" }) } });
+    await put("by-hand");
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/mid`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    const start = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/mid/oauth`, { method: "POST" });
+    const back = (await fetch(start.authorize_url, { redirect: "manual" })).headers.get("location")!;
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    // The flow row is gone and no record exists yet: the secret guard sees nothing, so the rewrite goes through.
+    await put("someone-else");
+    f.holdExchange = false;
+    expect(await callback).toContain("changed while the code was being exchanged");
+    expect(await entryRow(c, "mid")).toBeUndefined();
+    expect(f.revocations).toHaveLength(1);
+    expect(f.revocations[0]!.client).toBe("by-hand");
+  });
+
+  it("a hand-registered client rewritten while a start awaits the catalog: no flow is stored", async () => {
+    const f = new FakeAuth(rand(), { cimd: false, registration: false });
+    fakes.set(f.id, f);
+    const c = await newClient([f.server]);
+    await asJson(c.token, "/v1/clients/self/secrets/google", { method: "PUT", body: { value: JSON.stringify({ client_id: "by-hand" }) } });
+    const cap = await asJson(c.token, `/v1/catalog/capabilities/${c.name}/st`, { method: "PUT", body: { mcp: { url: f.server, auth: { authorize: true }, oauth_client: "google" } } });
+    const flows = await runInDurableObject(broker(), async (inst: BrokerDO, st) => {
+      const d = (inst as any).oauth.d;
+      const orig = d.incarnationOf;
+      // After the client is read and before the flow is stored: the app rewrites it (no use yet, so the guard lets it).
+      d.incarnationOf = async (name: string) => {
+        await inst.writeClientSecret(c.id, "google", { value: JSON.stringify({ client_id: "someone-else" }), description: null, expires_ms: null }, { max_count: 3, max_bytes: 128 });
+        return orig(name);
+      };
+      try {
+        await expect(Promise.resolve().then(() => inst.clientOAuthStart({
+          client: c.id, clientName: c.name, capability: `${c.name}/st`, entry: "st", incarnation: cap.mcp.auth.incarnation, url: f.server, oauthClient: "google",
+        }))).rejects.toThrow(/changed while this authorization was starting/);
+      } finally {
+        d.incarnationOf = orig;
+      }
+      return st.storage.sql.exec("SELECT body FROM oauth_flows").toArray().filter((r) => String(r.body).includes(`${c.name}/st`)).length;
+    });
+    expect(flows).toBe(0);
   });
 
   it("a hand-registered OAuth client stored to expire is refused at the start", async () => {
