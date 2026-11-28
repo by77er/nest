@@ -50,7 +50,7 @@ const flags = (f: z.output<typeof ToolFlags> | undefined): Record<string, boolea
  * tainted session needs; `max_concurrent` and `per_minute` cap this server's calls across every agent
  * (the connector's admission; defaults `MCP_DEFAULT_MAX_CONCURRENT`, `MCP_DEFAULT_PER_MINUTE`).
  * `oauth_client`, with a client's `{authorize}` auth only, names one of that client's own secrets holding the
- * OAuth client it registered by hand at the authorization server (`{"client_id", "client_secret"?}`), for a
+ * OAuth client it registered by hand at the authorization server (`{"client_id", "client_secret"?, "token_endpoint_auth_method"?}`), for a
  * server that takes neither metadata documents nor registration (docs/control-plane/api/clients/#mcp-credentials).
  * Beside `auth`, not in it, so the previous release, reading `auth` strictly, still reads the capability (it
  * drops the field, and its start then fails for want of a client).

@@ -573,6 +573,8 @@ export interface StoreDeps {
   sql: SqlStorage;
   /** A BrokerDO secret's value (a pre-registered client's JSON). */
   secret(name: string): string | null;
+  /** When a BrokerDO secret expires (null: never, or no such secret). */
+  secretExpires?(name: string): number | null;
   audit(r: OAuthAudit): void;
   publicBaseUrl: string;
   allowLoopback: boolean;
@@ -689,6 +691,8 @@ export class OAuthStore {
     let client: ClientRef;
     let id: string;
     if (input.auth.client) {
+      // An OAuth client outlives its authorizations' refresh tokens: one stored to expire would strand them.
+      if (this.d.secretExpires?.(input.auth.client) != null) throw oauthError(`the OAuth client stored as ${input.auth.client} expires: store it without an expiry`, 409);
       client = { kind: "pre-registered", secret: input.auth.client, auth_methods: found.as.auth_methods };
       id = this.client(client, found.as).client_id;
     } else if (found.as.cimd && canUseMetadataDocument(this.d.publicBaseUrl, this.d.allowLoopback)) {
@@ -901,6 +905,24 @@ export class OAuthStore {
       out.push({ ref: row.ref, issuer: row.issuer, server });
     }
     return out;
+  }
+
+  /**
+   * The capabilities whose authorizations, or flows in flight, authenticate as the pre-registered client stored as
+   * `key`. While there are any, its owner may rewrite it only with the same `client_id` (a rotated secret), never
+   * delete it or give it an expiry: their tokens are refreshed and revoked as that client (BrokerDO's secret writes).
+   */
+  clientSecretUses(key: string): string[] {
+    const out = new Set<string>();
+    const isIt = (c: unknown) => !!c && typeof c === "object" && (c as ClientRef).kind === "pre-registered" && (c as { secret?: unknown }).secret === key;
+    for (const r of this.d.sql.exec<{ capability: string; client: string }>("SELECT capability, client FROM oauth_grants").toArray()) {
+      if (isIt(JSON.parse(r.client))) out.add(r.capability);
+    }
+    for (const f of this.d.sql.exec<{ body: string }>("SELECT body FROM oauth_flows").toArray()) {
+      const flow = JSON.parse(f.body) as { capability?: string; client?: unknown };
+      if (isIt(flow.client) && typeof flow.capability === "string") out.add(flow.capability);
+    }
+    return [...out].sort();
   }
 
   /** Revocations per capability since this object started (memory: a reset ends any callback in flight too). */
