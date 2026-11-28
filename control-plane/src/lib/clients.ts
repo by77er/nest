@@ -93,13 +93,7 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
     if (own !== null) {
       if (own !== m.client) out.push(`credential of ${own} in a capability of ${m.client ?? "the operator"} (${m.capability})`);
     } else if (m.auth !== undefined && !creds.has(m.auth)) out.push(`credential ${m.auth} (${m.capability})`);
-    // Its OAuth client likewise: a client's own secret (`mcp.oauth_client`) is the capability's own client's, else the grant's.
-    if (m.oauth?.client) {
-      const ownClient = clientOfRef(m.oauth.client);
-      if (ownClient !== null) {
-        if (ownClient !== m.client) out.push(`credential of ${ownClient} in a capability of ${m.client ?? "the operator"} (${m.capability})`);
-      } else if (!creds.has(m.oauth.client)) out.push(`credential ${m.oauth.client} (${m.capability})`);
-    }
+    if (m.oauth?.client && !creds.has(m.oauth.client)) out.push(`credential ${m.oauth.client} (${m.capability})`);
   }
   for (const b of spec.brokered ?? []) out.push(`brokered action ${b.action} (${b.capability})`);
   out.push(...injectionsOutsideGrant(spec.inject ?? [], grant.inject_hosts ?? []));
