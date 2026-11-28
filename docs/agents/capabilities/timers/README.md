@@ -11,9 +11,9 @@
   - At least 10 s and at most 30 days ahead.
   - `every_s` (a repeating timer's interval) is 300 to 2,592,000 (5 minutes to 30 days). The floor is because each firing is a turn a brain runs, on the subscription.
   - `name` is `[a-z0-9][a-z0-9_.-]{0,62}`; `note` is at most 1,000 characters.
-  - At most 32 live timers per agent. Setting a name again replaces its timer and takes no new place.
+  - At most 32 live timers per agent, of which at most 8 repeat. Setting a name again replaces its timer and takes no new place.
   - Answers the timer `{name, at_ms, note, set_ms, every_ms?}`. Setting a repeating timer's name again without `every_s` makes it one-shot.
-- **`timer_cancel {name}`**: says whether there was one. It's the only way a repeating timer stops, short of its agent's end.
+- **`timer_cancel {name}`**: says whether there was one. It's the only way a repeating timer stops, short of its agent's end: an operator's `stop` doesn't hold against it, since each firing is new input that wakes the agent, as any inbox message does. The owner cancels it with `DELETE /v1/agents/<id>/timers/<name>`.
 - **`timer_list`**: `{timers: [{name, at_ms, note, set_ms, every_ms?}]}`, soonest first; `at_ms` is a repeating timer's next firing.
 - **From the brain only:** never from a sandbox's `nest` CLI, as for the lifecycle tools.
 
@@ -23,14 +23,14 @@
   - **During a turn:** pushed into that turn, as an inbox message is.
   - **Between turns:** a turn of its own (`input_kind: inbox`, text `Message from timer: timer "<name>" fired: <note>`), which wakes the agent: an idle brain runs it, and a detached or stopped agent's brain is started for it, exactly as for an inbox message.
   - **An ended agent's** timers are dropped at its end (rows and deadlines); one found later is dropped too.
-- **A repeating timer** says so in its input: `timer "<name>" fired (repeats every 1 day; timer_cancel stops it): <note>`. Once its input is posted, its row moves to its next firing and its deadline is armed for it, in one synchronous step. The next firing keeps the timer's cadence: one interval after the firing that was due, or, when it fired late (an outage longer than the interval), the first point of that cadence after now. Missed firings aren't made up.
+- **A repeating timer** says so in its input: `timer "<name>" fired (repeats every 1 day; timer_cancel stops it): <note>`. Once its input is posted, its row moves to its next firing and its deadline is armed for it, in one synchronous step. The next firing keeps the timer's cadence: one interval after the firing that was due, or, when it fired late (an outage longer than the interval), the first point of that cadence after now. Missed firings aren't made up, and neither are firings while the last one still waits as a queued turn (no brain could run it: no capacity, a failing start): those are skipped, the timer moving on, so an outage costs one turn rather than one per interval.
 - **Once:** the post carries the timer's id as its request id (`timer/<id>`; a repeating timer's adds the firing's time, `timer/<id>/<at_ms>`, so each firing is posted once and each is posted), so a retried alarm posts it once, and only then is its row deleted or moved on. A timer set again, or cancelled, while it fired is left as that left it (the delete and the move match the timer's id).
 - **Visible:** in the [live trace](../../../control-plane/api/#live-trace) as `timer_set {name, at_ms, note, every_ms?}`, `timer_fired {name, note, next_ms?}` and `timer_cancelled {name, by}`. An API client's agent's firing is also an [owner event](../../../control-plane/api/clients/#events-to-the-owner), `agent.timer_fired {agent, timer, note, next_ms?}`; `next_ms` is a repeating timer's next firing.
 - **The owner** lists them with `GET /v1/agents/<id>/timers` (`{timers: […]}`) and cancels one with `DELETE /v1/agents/<id>/timers/<name>` (404 if there's none). The owner is the operator, or the API client of the agent's subtree. Only the agent sets them.
 
 ## Durability
 
-- **Storage:** AgentDO's SQLite holds them (`timers`: `name`, `id`, `at_ms`, `note`, `set_ms`, and `every_ms`, null for a one-shot timer, added 2026-11-28 by `ALTER TABLE`), and each has one deadline of AgentDO's existing alarm (`Deadlines`, key `timer:<name>`). A row and its deadline are written in one synchronous step.
+- **Storage:** AgentDO's SQLite holds them (`timers`: `name`, `id`, `at_ms`, `note`, `set_ms`, and, added 2026-11-28 by `ALTER TABLE`, `every_ms` with `every_id`, the id it was set with: a row repeats only while `every_id` is its `id`, so a re-set by a release that doesn't know the columns reads as the one-shot timer it set), and each has one deadline of AgentDO's existing alarm (`Deadlines`, key `timer:<name>`). A row and its deadline are written in one synchronous step.
 - **A timer left without its deadline** (a rolled-back release dropped it, having no handler) is armed again when the agent's object starts and at every alarm run: late, never lost.
 - **No second scheduler.** A timer survives a brain restart, the brain host's loss, a deploy and the Durable Object's eviction, because nothing about it is in memory.
 

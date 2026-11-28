@@ -126,6 +126,11 @@ export class TurnQueue {
     return this.sql.exec<{ turn: string }>(`SELECT turn FROM turns WHERE status = '${TURN.queued}' ORDER BY ord LIMIT 1`).toArray()[0]?.turn;
   }
 
+  /** Whether a queued turn's request id starts with `prefix` (a repeating timer's last firing still waiting). */
+  queuedWithPrefix(prefix: string): boolean {
+    return this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' AND substr(request_id, 1, ?) = ? LIMIT 1`, prefix.length, prefix).toArray().length > 0;
+  }
+
   queuedCount(): number {
     return this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM turns WHERE status = '${TURN.queued}'`).one().n;
   }

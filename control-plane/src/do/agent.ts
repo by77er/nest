@@ -11,7 +11,7 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
 import { SYSTEM_SENDER } from "../lib/senders";
-import { everyText, nextFiring, type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX } from "../lib/timers";
+import { everyText, nextFiring, type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX, TIMERS_REPEATING_MAX } from "../lib/timers";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
 import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall, visible } from "../lib/sinks";
@@ -2893,7 +2893,8 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.load();
     this.refuseEnded(info, "timers");
     const row = this.timerStore.set(t, id);
-    if (!row) throw new NestError(ErrorCodes.FORBIDDEN, `at most ${TIMERS_MAX} timers: cancel one first (timer_list)`, 409);
+    if (row === "full") throw new NestError(ErrorCodes.FORBIDDEN, `at most ${TIMERS_MAX} timers: cancel one first (timer_list)`, 409);
+    if (row === "repeating") throw new NestError(ErrorCodes.FORBIDDEN, `at most ${TIMERS_REPEATING_MAX} repeating timers: cancel one first (timer_list)`, 409);
     const armed = this.deadlines.set(`${TIMER_DEADLINE}${t.name}`, t.at_ms);
     this.traceEmit({ type: "timer_set", name: t.name, at_ms: t.at_ms, note: t.note, ...(t.every_ms !== undefined ? { every_ms: t.every_ms } : {}) });
     await armed;
@@ -2959,7 +2960,10 @@ export class AgentDO extends DurableObject<Env> {
     }
     const every = row.every_ms;
     const firing = every === undefined ? `timer/${row.id}` : `timer/${row.id}/${row.at_ms}`;
-    await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note, every), false, firing);
+    // A repeating timer whose last firing still waits as a queued turn (no brain could run it: no capacity,
+    // a failing start) isn't posted again: it moves on, so an outage costs one turn, not one per interval.
+    const waiting = every !== undefined && this.queue.queuedWithPrefix(`inbox/timer/${row.id}/`);
+    if (!waiting) await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note, every), false, firing);
     // Re-read: only this timer moves on or goes (one set again or cancelled during the post is left as it is).
     let next: number | undefined;
     if (every === undefined) {
@@ -2970,8 +2974,10 @@ export class AgentDO extends DurableObject<Env> {
     }
     const armed = next !== undefined ? this.deadlines.set(`${TIMER_DEADLINE}${name}`, next) : null;
     const after = this.load();
-    this.traceEmit({ type: "timer_fired", name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
-    this.emit(after, `${after.agent}/${firing}`, { type: "agent.timer_fired", agent: after.agent, timer: name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
+    if (!waiting) {
+      this.traceEmit({ type: "timer_fired", name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
+      this.emit(after, `${after.agent}/${firing}`, { type: "agent.timer_fired", agent: after.agent, timer: name, note: row.note, ...(next !== undefined ? { next_ms: next } : {}) });
+    }
     await armed;
   }
 

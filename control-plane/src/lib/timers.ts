@@ -14,6 +14,8 @@ export const TIMER_MAX_MS = 30 * 86_400_000;
 export const TIMER_EVERY_MIN_MS = 300_000;
 /** ...and at most this. */
 export const TIMER_EVERY_MAX_MS = TIMER_MAX_MS;
+/** Repeating timers per agent, of its `TIMERS_MAX`: each is a turn at every interval, on the subscription. */
+export const TIMERS_REPEATING_MAX = 8;
 /** Live timers per agent (a re-set name replaces its timer and takes no new place). */
 export const TIMERS_MAX = 32;
 /** The deadline key prefix: `timer:<name>`. */
@@ -91,11 +93,16 @@ interface TimerRow extends Timer {
 export class TimerStore {
   constructor(private readonly sql: SqlStorage) {
     sql.exec("CREATE TABLE IF NOT EXISTS timers (name TEXT PRIMARY KEY, id TEXT NOT NULL, at_ms INTEGER NOT NULL, note TEXT NOT NULL, set_ms INTEGER NOT NULL)");
-    // Added with repeating timers (expand only): null is a one-shot timer, as every row before it was. The
-    // previous release doesn't read it: after a rollback a repeating timer fires once and is gone.
+    // Added with repeating timers (expand only): a repeating timer's interval, and the id it was set with. A
+    // row is repeating only while `every_id` is its `id`: the previous release's re-set of a name changes `id`
+    // (its upsert doesn't know these columns), so what it set reads as the one-shot timer it meant, never as
+    // the repeating one it replaced. Rows from before read as one-shot (both null).
     const cols = sql.exec<{ name: string }>("PRAGMA table_info(timers)").toArray().map((c) => c.name);
     if (!cols.includes("every_ms")) sql.exec("ALTER TABLE timers ADD COLUMN every_ms INTEGER");
+    if (!cols.includes("every_id")) sql.exec("ALTER TABLE timers ADD COLUMN every_id TEXT");
   }
+
+  private static readonly COLS = "name, id, at_ms, note, set_ms, CASE WHEN every_id = id THEN every_ms END AS every_ms";
 
   private static view(r: { name: string; at_ms: number; note: string; set_ms: number; every_ms: number | null }): Timer {
     return { name: r.name, at_ms: r.at_ms, note: r.note, set_ms: r.set_ms, ...(r.every_ms !== null ? { every_ms: r.every_ms } : {}) };
@@ -103,22 +110,31 @@ export class TimerStore {
 
   get(name: string): TimerRow | undefined {
     const r = this.sql.exec<{ name: string; id: string; at_ms: number; note: string; set_ms: number; every_ms: number | null }>(
-      "SELECT name, id, at_ms, note, set_ms, every_ms FROM timers WHERE name = ?", name).toArray()[0];
+      `SELECT ${TimerStore.COLS} FROM timers WHERE name = ?`, name).toArray()[0];
     return r && { ...TimerStore.view(r), id: r.id };
   }
 
   list(): Timer[] {
     return this.sql.exec<{ name: string; at_ms: number; note: string; set_ms: number; every_ms: number | null }>(
-      "SELECT name, at_ms, note, set_ms, every_ms FROM timers ORDER BY at_ms, name").toArray().map(TimerStore.view);
+      `SELECT ${TimerStore.COLS} FROM timers ORDER BY at_ms, name`).toArray().map(TimerStore.view);
   }
 
-  /** Set (or replace) `name`; refused (null) when it is new and the agent has `TIMERS_MAX` already. */
-  set(t: Timer, id: string): TimerRow | null {
+  /**
+   * Set (or replace) `name`; refused when it is new and the agent has `TIMERS_MAX` already (`full`), or it
+   * repeats and the agent's other repeating timers number `TIMERS_REPEATING_MAX` (`repeating`).
+   */
+  set(t: Timer, id: string): TimerRow | "full" | "repeating" {
     const have = this.get(t.name);
-    if (!have && this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM timers").one().n >= TIMERS_MAX) return null;
-    this.sql.exec(`INSERT INTO timers (name, id, at_ms, note, set_ms, every_ms) VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(name) DO UPDATE SET id = excluded.id, at_ms = excluded.at_ms, note = excluded.note, set_ms = excluded.set_ms, every_ms = excluded.every_ms`,
-    t.name, id, t.at_ms, t.note, t.set_ms, t.every_ms ?? null);
+    if (!have && this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM timers").one().n >= TIMERS_MAX) return "full";
+    if (t.every_ms !== undefined) {
+      const others = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM timers WHERE every_id = id AND every_ms IS NOT NULL AND name != ?", t.name).one().n;
+      if (others >= TIMERS_REPEATING_MAX) return "repeating";
+    }
+    const every = t.every_ms ?? null;
+    this.sql.exec(`INSERT INTO timers (name, id, at_ms, note, set_ms, every_ms, every_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET id = excluded.id, at_ms = excluded.at_ms, note = excluded.note, set_ms = excluded.set_ms,
+        every_ms = excluded.every_ms, every_id = excluded.every_id`,
+    t.name, id, t.at_ms, t.note, t.set_ms, every, every === null ? null : id);
     return { ...t, id };
   }
 
